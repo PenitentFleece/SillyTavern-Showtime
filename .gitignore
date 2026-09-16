@@ -1,0 +1,8 @@
+.DS_Store
+Thumbs.db
+*.log
+.cursor/
+.vscode/
+.idea/
+node_modules/
+QC.md

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Showtime · Spotify</title>
+</head>
+<body>
+  <p>Returning to SillyTavern…</p>
+  <script>
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const payload = {
+        code: params.get('code') || '',
+        state: params.get('state') || '',
+        error: params.get('error') || '',
+      };
+      try {
+        sessionStorage.setItem('showtime_composer_spotify_callback', JSON.stringify(payload));
+      } catch (err) {
+        console.warn('[Showtime] could not stash Spotify callback', err);
+      }
+      location.replace(location.origin + '/');
+    })();
+  </script>
+</body>
+</html>

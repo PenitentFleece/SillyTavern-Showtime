@@ -1,0 +1,13 @@
+{
+  "display_name": "Showtime",
+  "loading_order": 15,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "PenitentFleece",
+  "version": "0.1.1",
+  "homePage": "https://github.com/penitentfleece/SillyTavern-Showtime",
+  "auto_update": true,
+  "description": "Production desk for SillyTavern: Cast, Script, Library, Inventory, Reputation, Motivation, Composer, and Backstage."
+}

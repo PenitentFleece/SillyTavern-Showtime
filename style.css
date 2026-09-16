@@ -1,0 +1,677 @@
+/* Showtime — theme tokens and shell styles.
+   Palette: cream paper, sepia ink, art deco gold accents. */
+
+:root {
+  --st-paper:      #f4ead5;
+  --st-paper-2:    #ebdfc2;
+  --st-ink:        #2b1d0e;
+  --st-ink-soft:   #5a4429;
+  --st-sepia:      #8a6a3d;
+  --st-gold:       #c9a24a;
+  --st-gold-dim:   #8a6f2c;
+  --st-crimson:    #7a1f1f;   /* Foil / warning accent */
+  --st-curtain:    #c41e2a;
+  --st-curtain-deep: #7a0f18;
+  --st-shadow:     0 6px 18px rgba(0,0,0,.35);
+  --st-font-title: "Playfair Display", "Didot", "Bodoni MT", Georgia, serif;
+  --st-font-body:  "Cormorant Garamond", Georgia, "Times New Roman", serif;
+  --st-font-mono:  "Special Elite", "Courier New", monospace;
+  --st-margin:     8px;
+  /* Checkboxes stay cream + dark ink in every theme (readable, never white-on-white). */
+  --st-check-face: #f5f0e0;
+  --st-check-mark: #2b1d0e;
+  --st-check-svg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%232b1d0e' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.5 8.5 6.5 11.5 12.5 4.5'/%3E%3C/svg%3E");
+}
+
+.showtime-marquee {
+  position: fixed;
+  top: calc(var(--topBarBlockSize, 50px) + var(--st-margin));
+  right: var(--st-margin);
+  width: 400px;
+  max-width: calc(100vw - (2 * var(--st-margin)));
+  max-height: calc(100vh - var(--topBarBlockSize, 50px) - (2 * var(--st-margin)));
+  background: var(--st-paper);
+  color: var(--st-ink);
+  font-family: var(--st-font-body);
+  border: 1px solid var(--st-gold-dim);
+  border-radius: 4px;
+  box-shadow: var(--st-shadow);
+  /* Above chat (30), character drawer (3000), and Select Chat dimmer (4100). */
+  z-index: 4300;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-image:
+    repeating-linear-gradient(0deg, rgba(0,0,0,.015) 0 1px, transparent 1px 3px);
+  box-sizing: border-box;
+}
+
+.showtime-marquee--wide {
+  width: min(520px, calc(100vw - (2 * var(--st-margin))));
+  max-height: calc(100vh - var(--topBarBlockSize, 50px) - (2 * var(--st-margin)));
+}
+.showtime-marquee--script {
+  width: min(720px, calc(100vw - (2 * var(--st-margin))));
+  max-height: calc(100vh - var(--topBarBlockSize, 50px) - (2 * var(--st-margin)));
+}
+.showtime-marquee--mid {
+  width: min(430px, calc(100vw - (2 * var(--st-margin))));
+  max-height: calc(100vh - var(--topBarBlockSize, 50px) - (2 * var(--st-margin)));
+}
+
+.showtime-marquee.collapsed {
+  max-height: 40px;
+  width: 200px;
+}
+.showtime-marquee.collapsed .showtime-tabs,
+.showtime-marquee.collapsed .showtime-body { display: none; }
+
+.showtime-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--st-ink);
+  color: var(--st-paper);
+  padding: 6px 12px;
+  cursor: grab;
+  user-select: none;
+  border-bottom: 2px solid var(--st-gold);
+}
+.showtime-titlebar:active { cursor: grabbing; }
+
+.showtime-logo {
+  font-family: var(--st-font-title);
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  font-size: 14px;
+  color: var(--st-gold);
+}
+
+.showtime-titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.showtime-btn-collapse,
+.showtime-btn-pin {
+  background: transparent;
+  color: var(--st-paper);
+  border: 1px solid var(--st-gold-dim);
+  width: 24px;
+  height: 22px;
+  cursor: pointer;
+  font-family: var(--st-font-mono);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.showtime-btn-pin.on,
+.showtime-btn-pin:hover,
+.showtime-btn-collapse:hover {
+  border-color: var(--st-gold);
+  color: var(--st-gold);
+}
+.showtime-marquee--pinned {
+  outline: 1px solid rgba(201, 162, 74, 0.45);
+  outline-offset: 2px;
+}
+
+.showtime-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  background: var(--st-paper-2);
+  padding: 4px 4px 0;
+  border-bottom: 1px solid var(--st-gold-dim);
+}
+.showtime-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  padding: 4px 10px;
+  font-family: var(--st-font-title);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--st-ink-soft);
+  cursor: pointer;
+}
+.showtime-tab:hover { color: var(--st-ink); }
+.showtime-tab.active {
+  background: var(--st-paper);
+  border-color: var(--st-gold-dim);
+  color: var(--st-ink);
+  font-weight: 700;
+}
+.showtime-tab.showtime-tab--struck {
+  color: var(--st-crimson);
+  text-decoration: line-through;
+  text-decoration-thickness: 3px;
+  text-decoration-color: var(--st-crimson);
+  opacity: 0.72;
+  cursor: not-allowed;
+}
+.showtime-tab.showtime-tab--struck.active {
+  background: transparent;
+  border-color: transparent;
+  font-weight: 400;
+}
+.showtime-marquee--dead .showtime-logo {
+  color: var(--st-crimson);
+}
+
+/* ── House-closed curtain (no chat selected) ─────────────────────────────── */
+.showtime-curtain {
+  display: none;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  cursor: default;
+  background: var(--st-curtain-deep);
+}
+.showtime-marquee--curtain {
+  display: flex !important;
+  visibility: visible;
+  width: min(240px, calc(100vw - (2 * var(--st-margin))));
+  max-height: none;
+  height: 56px;
+  border-color: var(--st-curtain-deep);
+  background: var(--st-curtain-deep);
+  background-image: none;
+}
+.showtime-marquee--curtain .showtime-titlebar,
+.showtime-marquee--curtain .showtime-tabs,
+.showtime-marquee--curtain .showtime-body {
+  display: none !important;
+}
+.showtime-marquee--curtain .showtime-curtain {
+  display: flex;
+}
+.showtime-curtain-valance {
+  flex: 0 0 10px;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      var(--st-curtain-deep) 0 10px,
+      var(--st-curtain) 10px 20px
+    );
+  box-shadow: inset 0 -2px 0 rgba(0,0,0,0.35);
+}
+.showtime-curtain-skirt {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(255,255,255,0.12), transparent 45%),
+    radial-gradient(ellipse at 80% 0%, rgba(255,255,255,0.08), transparent 40%),
+    repeating-linear-gradient(
+      90deg,
+      var(--st-curtain) 0 18px,
+      #d42834 18px 22px,
+      var(--st-curtain) 22px 40px,
+      #a81622 40px 44px
+    );
+  box-shadow:
+    inset 0 8px 14px rgba(0,0,0,0.25),
+    inset 0 -6px 10px rgba(0,0,0,0.35);
+  clip-path: polygon(
+    0 0, 100% 0,
+    100% 72%, 96% 100%, 88% 78%, 80% 100%, 72% 78%, 64% 100%,
+    56% 78%, 48% 100%, 40% 78%, 32% 100%, 24% 78%, 16% 100%, 8% 78%, 0 100%
+  );
+}
+.showtime-curtain-label {
+  font-family: var(--st-font-title);
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: #ffe8a8;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.55);
+  pointer-events: none;
+}
+
+/* Lift animation — curtain rises to reveal the marquee */
+.showtime-marquee--curtain-lift {
+  width: 200px;
+  height: 40px;
+  max-height: 40px;
+  border-color: var(--st-gold-dim);
+  background: var(--st-paper);
+  background-image:
+    repeating-linear-gradient(0deg, rgba(0,0,0,.015) 0 1px, transparent 1px 3px);
+}
+.showtime-marquee--curtain-lift .showtime-curtain {
+  display: flex;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  animation: st-curtain-rise 0.9s cubic-bezier(0.4, 0.0, 0.2, 1) forwards;
+  pointer-events: none;
+}
+.showtime-marquee--curtain-lift .showtime-titlebar {
+  display: flex !important;
+  opacity: 0;
+  animation: st-curtain-reveal 0.45s ease 0.35s forwards;
+}
+.showtime-marquee--curtain-lift .showtime-tabs,
+.showtime-marquee--curtain-lift .showtime-body {
+  display: none !important;
+}
+@keyframes st-curtain-rise {
+  0% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  70% {
+    transform: translateY(-110%);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-120%);
+    opacity: 0;
+  }
+}
+@keyframes st-curtain-reveal {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Theme presets (Backstage → Settings) */
+html.st-theme-night {
+  --st-paper: #1c1712;
+  --st-paper-2: #241e17;
+  --st-ink: #f0e2c4;
+  --st-ink-soft: #cbb892;
+  --st-sepia: #8a7350;
+  --st-gold: #c9a24a;
+  --st-gold-dim: #a88435;
+  color-scheme: dark;
+}
+html.st-theme-night #showtime-marquee,
+html.st-theme-night .bst-modal-overlay,
+html.st-theme-night .cast-modal-backdrop,
+html.st-theme-night .inv-modal-backdrop,
+html.st-theme-night .lib-modal-backdrop,
+html.st-theme-night .mot-modal-backdrop,
+html.st-theme-night .rep-modal-backdrop,
+html.st-theme-night .cmp-modal-backdrop,
+html.st-theme-night .stm-dialog-overlay {
+  color-scheme: dark;
+}
+/* Night UI stays cream-box + dark mark — never invert the check to light/gold. */
+html.st-theme-crimson {
+  --st-paper: #f6e8df;
+  --st-paper-2: #edd7cb;
+  --st-ink: #3a1414;
+  --st-ink-soft: #6a3030;
+  --st-sepia: #8a4a3a;
+  --st-gold: #b86b3c;
+  --st-gold-dim: #8a4528;
+  --st-crimson: #7a1f1f;
+}
+
+.showtime-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+.showtime-pane {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.showtime-pane[hidden] {
+  display: none !important;
+}
+
+.showtime-pane .st-placeholder {
+  font-family: var(--st-font-mono);
+  color: var(--st-ink-soft);
+  padding: 24px 8px;
+  text-align: center;
+  border: 1px dashed var(--st-sepia);
+}
+
+/* ── Shared form controls (cream / ink — kill native bright white) ────────── */
+#showtime-marquee,
+.bst-modal-overlay,
+.bst-dialog-overlay,
+.cast-modal-backdrop,
+.inv-modal-backdrop,
+.lib-modal-backdrop,
+.mot-modal-backdrop,
+.rep-modal-backdrop,
+.cmp-modal-backdrop,
+.stm-dialog-overlay,
+.st-clapper-float {
+  accent-color: var(--st-gold-dim);
+  color-scheme: light;
+}
+
+#showtime-marquee input[type="text"],
+#showtime-marquee input[type="search"],
+#showtime-marquee input[type="number"],
+#showtime-marquee input[type="url"],
+#showtime-marquee input[type="email"],
+#showtime-marquee input[type="password"],
+#showtime-marquee input[type="datetime-local"],
+#showtime-marquee input:not([type]),
+#showtime-marquee textarea,
+#showtime-marquee select,
+.bst-modal-overlay input[type="text"],
+.bst-modal-overlay input[type="search"],
+.bst-modal-overlay input[type="number"],
+.bst-modal-overlay input[type="url"],
+.bst-modal-overlay input:not([type]),
+.bst-modal-overlay textarea,
+.bst-modal-overlay select,
+.cast-modal-backdrop input[type="text"],
+.cast-modal-backdrop input[type="search"],
+.cast-modal-backdrop input[type="number"],
+.cast-modal-backdrop input[type="url"],
+.cast-modal-backdrop input:not([type]),
+.cast-modal-backdrop textarea,
+.cast-modal-backdrop select,
+.inv-modal-backdrop input[type="text"],
+.inv-modal-backdrop input[type="search"],
+.inv-modal-backdrop input[type="number"],
+.inv-modal-backdrop input:not([type]),
+.inv-modal-backdrop textarea,
+.inv-modal-backdrop select,
+.lib-modal-backdrop input[type="text"],
+.lib-modal-backdrop input[type="search"],
+.lib-modal-backdrop input[type="number"],
+.lib-modal-backdrop input:not([type]),
+.lib-modal-backdrop textarea,
+.lib-modal-backdrop select,
+.mot-modal-backdrop input[type="text"],
+.mot-modal-backdrop input[type="search"],
+.mot-modal-backdrop input[type="number"],
+.mot-modal-backdrop input:not([type]),
+.mot-modal-backdrop textarea,
+.mot-modal-backdrop select,
+.rep-modal-backdrop input[type="text"],
+.rep-modal-backdrop input[type="search"],
+.rep-modal-backdrop input[type="number"],
+.rep-modal-backdrop input:not([type]),
+.rep-modal-backdrop textarea,
+.rep-modal-backdrop select,
+.cmp-modal-backdrop input[type="text"],
+.cmp-modal-backdrop input[type="search"],
+.cmp-modal-backdrop input[type="number"],
+.cmp-modal-backdrop input:not([type]),
+.cmp-modal-backdrop textarea,
+.cmp-modal-backdrop select,
+.stm-dialog-overlay input[type="text"],
+.stm-dialog-overlay input[type="search"],
+.stm-dialog-overlay input[type="number"],
+.stm-dialog-overlay input:not([type]),
+.stm-dialog-overlay textarea,
+.stm-dialog-overlay select {
+  background: var(--st-paper-2) !important;
+  color: var(--st-ink) !important;
+  border: 1px solid var(--st-sepia) !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  color-scheme: light;
+}
+
+#showtime-marquee input[type="text"]::placeholder,
+#showtime-marquee textarea::placeholder,
+.bst-modal-overlay input::placeholder,
+.bst-modal-overlay textarea::placeholder,
+.cast-modal-backdrop input::placeholder,
+.cast-modal-backdrop textarea::placeholder,
+.inv-modal-backdrop input::placeholder,
+.inv-modal-backdrop textarea::placeholder,
+.lib-modal-backdrop input::placeholder,
+.lib-modal-backdrop textarea::placeholder,
+.mot-modal-backdrop input::placeholder,
+.mot-modal-backdrop textarea::placeholder,
+.rep-modal-backdrop input::placeholder,
+.rep-modal-backdrop textarea::placeholder,
+.cmp-modal-backdrop input::placeholder,
+.cmp-modal-backdrop textarea::placeholder,
+.stm-dialog-overlay input::placeholder,
+.stm-dialog-overlay textarea::placeholder {
+  color: var(--st-sepia);
+  opacity: 0.85;
+}
+
+/* Kill SillyTavern's bright ::before tick (clip-path + SmartThemeCheckboxTickColor). */
+#showtime-marquee input[type="checkbox"],
+#showtime-marquee input[type="radio"],
+.bst-modal-overlay input[type="checkbox"],
+.bst-modal-overlay input[type="radio"],
+.bst-dialog-overlay input[type="checkbox"],
+.bst-dialog-overlay input[type="radio"],
+.cast-modal-backdrop input[type="checkbox"],
+.cast-modal-backdrop input[type="radio"],
+.inv-modal-backdrop input[type="checkbox"],
+.inv-modal-backdrop input[type="radio"],
+.lib-modal-backdrop input[type="checkbox"],
+.lib-modal-backdrop input[type="radio"],
+.mot-modal-backdrop input[type="checkbox"],
+.mot-modal-backdrop input[type="radio"],
+.rep-modal-backdrop input[type="checkbox"],
+.rep-modal-backdrop input[type="radio"],
+.cmp-modal-backdrop input[type="checkbox"],
+.cmp-modal-backdrop input[type="radio"],
+.stm-dialog-overlay input[type="checkbox"],
+.stm-dialog-overlay input[type="radio"] {
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  width: 15px;
+  height: 15px;
+  margin: 0 6px 0 0;
+  vertical-align: middle;
+  flex-shrink: 0;
+  background-color: var(--st-check-face) !important;
+  background-image: none !important;
+  background-repeat: no-repeat !important;
+  background-position: center !important;
+  background-size: 10px 10px !important;
+  border: 1.5px solid var(--st-check-mark) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.25);
+  cursor: pointer;
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 0;
+  accent-color: transparent;
+  filter: none !important;
+  overflow: visible !important;
+  transform: none !important;
+  outline: none !important;
+}
+#showtime-marquee input[type="radio"],
+.bst-modal-overlay input[type="radio"],
+.bst-dialog-overlay input[type="radio"],
+.cast-modal-backdrop input[type="radio"],
+.inv-modal-backdrop input[type="radio"],
+.lib-modal-backdrop input[type="radio"],
+.mot-modal-backdrop input[type="radio"],
+.rep-modal-backdrop input[type="radio"],
+.cmp-modal-backdrop input[type="radio"],
+.stm-dialog-overlay input[type="radio"] {
+  border-radius: 50%;
+  background-size: auto !important;
+}
+#showtime-marquee input[type="checkbox"],
+.bst-modal-overlay input[type="checkbox"],
+.bst-dialog-overlay input[type="checkbox"],
+.cast-modal-backdrop input[type="checkbox"],
+.inv-modal-backdrop input[type="checkbox"],
+.lib-modal-backdrop input[type="checkbox"],
+.mot-modal-backdrop input[type="checkbox"],
+.rep-modal-backdrop input[type="checkbox"],
+.cmp-modal-backdrop input[type="checkbox"],
+.stm-dialog-overlay input[type="checkbox"] {
+  border-radius: 2px;
+}
+/* Cream face + dark ink check — SVG so every surface matches Call Sheet */
+#showtime-marquee input[type="checkbox"]:checked,
+.bst-modal-overlay input[type="checkbox"]:checked,
+.bst-dialog-overlay input[type="checkbox"]:checked,
+.cast-modal-backdrop input[type="checkbox"]:checked,
+.inv-modal-backdrop input[type="checkbox"]:checked,
+.lib-modal-backdrop input[type="checkbox"]:checked,
+.mot-modal-backdrop input[type="checkbox"]:checked,
+.rep-modal-backdrop input[type="checkbox"]:checked,
+.cmp-modal-backdrop input[type="checkbox"]:checked,
+.stm-dialog-overlay input[type="checkbox"]:checked {
+  background-color: var(--st-check-face) !important;
+  border-color: var(--st-check-mark) !important;
+  background-image: var(--st-check-svg) !important;
+}
+#showtime-marquee input[type="checkbox"]::before,
+#showtime-marquee input[type="checkbox"]::after,
+#showtime-marquee input[type="checkbox"]:checked::before,
+#showtime-marquee input[type="checkbox"]:checked::after,
+.bst-modal-overlay input[type="checkbox"]::before,
+.bst-modal-overlay input[type="checkbox"]::after,
+.bst-modal-overlay input[type="checkbox"]:checked::before,
+.bst-modal-overlay input[type="checkbox"]:checked::after,
+.bst-dialog-overlay input[type="checkbox"]::before,
+.bst-dialog-overlay input[type="checkbox"]::after,
+.bst-dialog-overlay input[type="checkbox"]:checked::before,
+.bst-dialog-overlay input[type="checkbox"]:checked::after,
+.cast-modal-backdrop input[type="checkbox"]::before,
+.cast-modal-backdrop input[type="checkbox"]::after,
+.cast-modal-backdrop input[type="checkbox"]:checked::before,
+.cast-modal-backdrop input[type="checkbox"]:checked::after,
+.inv-modal-backdrop input[type="checkbox"]::before,
+.inv-modal-backdrop input[type="checkbox"]::after,
+.inv-modal-backdrop input[type="checkbox"]:checked::before,
+.inv-modal-backdrop input[type="checkbox"]:checked::after,
+.lib-modal-backdrop input[type="checkbox"]::before,
+.lib-modal-backdrop input[type="checkbox"]::after,
+.lib-modal-backdrop input[type="checkbox"]:checked::before,
+.lib-modal-backdrop input[type="checkbox"]:checked::after,
+.mot-modal-backdrop input[type="checkbox"]::before,
+.mot-modal-backdrop input[type="checkbox"]::after,
+.mot-modal-backdrop input[type="checkbox"]:checked::before,
+.mot-modal-backdrop input[type="checkbox"]:checked::after,
+.rep-modal-backdrop input[type="checkbox"]::before,
+.rep-modal-backdrop input[type="checkbox"]::after,
+.rep-modal-backdrop input[type="checkbox"]:checked::before,
+.rep-modal-backdrop input[type="checkbox"]:checked::after,
+.cmp-modal-backdrop input[type="checkbox"]::before,
+.cmp-modal-backdrop input[type="checkbox"]::after,
+.cmp-modal-backdrop input[type="checkbox"]:checked::before,
+.cmp-modal-backdrop input[type="checkbox"]:checked::after,
+.stm-dialog-overlay input[type="checkbox"]::before,
+.stm-dialog-overlay input[type="checkbox"]::after,
+.stm-dialog-overlay input[type="checkbox"]:checked::before,
+.stm-dialog-overlay input[type="checkbox"]:checked::after {
+  content: none !important;
+  display: none !important;
+  box-shadow: none !important;
+  background: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  transform: none !important;
+  clip-path: none !important;
+}
+#showtime-marquee input[type="radio"]:checked,
+.bst-modal-overlay input[type="radio"]:checked,
+.bst-dialog-overlay input[type="radio"]:checked,
+.cast-modal-backdrop input[type="radio"]:checked,
+.inv-modal-backdrop input[type="radio"]:checked,
+.lib-modal-backdrop input[type="radio"]:checked,
+.mot-modal-backdrop input[type="radio"]:checked,
+.rep-modal-backdrop input[type="radio"]:checked,
+.cmp-modal-backdrop input[type="radio"]:checked,
+.stm-dialog-overlay input[type="radio"]:checked {
+  background-color: var(--st-check-face) !important;
+  border-color: var(--st-check-mark) !important;
+  background-image: none !important;
+}
+#showtime-marquee input[type="radio"]:checked::after,
+.bst-modal-overlay input[type="radio"]:checked::after,
+.bst-dialog-overlay input[type="radio"]:checked::after,
+.cast-modal-backdrop input[type="radio"]:checked::after,
+.inv-modal-backdrop input[type="radio"]:checked::after,
+.lib-modal-backdrop input[type="radio"]:checked::after,
+.mot-modal-backdrop input[type="radio"]:checked::after,
+.rep-modal-backdrop input[type="radio"]:checked::after,
+.cmp-modal-backdrop input[type="radio"]:checked::after,
+.stm-dialog-overlay input[type="radio"]:checked::after {
+  content: '';
+  display: block !important;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--st-check-mark);
+  box-shadow: none;
+}
+#showtime-marquee input[type="checkbox"]:disabled,
+#showtime-marquee input[type="radio"]:disabled,
+.bst-modal-overlay input[type="checkbox"]:disabled,
+.bst-modal-overlay input[type="radio"]:disabled,
+.bst-dialog-overlay input[type="checkbox"]:disabled,
+.bst-dialog-overlay input[type="radio"]:disabled,
+.cast-modal-backdrop input[type="checkbox"]:disabled,
+.cast-modal-backdrop input[type="radio"]:disabled,
+.inv-modal-backdrop input[type="checkbox"]:disabled,
+.inv-modal-backdrop input[type="radio"]:disabled,
+.lib-modal-backdrop input[type="checkbox"]:disabled,
+.lib-modal-backdrop input[type="radio"]:disabled,
+.mot-modal-backdrop input[type="checkbox"]:disabled,
+.mot-modal-backdrop input[type="radio"]:disabled,
+.rep-modal-backdrop input[type="checkbox"]:disabled,
+.rep-modal-backdrop input[type="radio"]:disabled,
+.cmp-modal-backdrop input[type="checkbox"]:disabled,
+.cmp-modal-backdrop input[type="radio"]:disabled,
+.stm-dialog-overlay input[type="checkbox"]:disabled,
+.stm-dialog-overlay input[type="radio"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+#showtime-marquee input[type="color"],
+.bst-modal-overlay input[type="color"],
+.cast-modal-backdrop input[type="color"],
+.inv-modal-backdrop input[type="color"],
+.lib-modal-backdrop input[type="color"],
+.mot-modal-backdrop input[type="color"],
+.rep-modal-backdrop input[type="color"],
+.cmp-modal-backdrop input[type="color"],
+.stm-dialog-overlay input[type="color"] {
+  background: var(--st-paper-2) !important;
+  border: 1px solid var(--st-sepia) !important;
+  border-radius: 0 !important;
+  padding: 1px;
+  cursor: pointer;
+}
+
+#showtime-marquee option,
+.bst-modal-overlay option,
+.cast-modal-backdrop option,
+.inv-modal-backdrop option,
+.lib-modal-backdrop option,
+.mot-modal-backdrop option,
+.rep-modal-backdrop option,
+.cmp-modal-backdrop option,
+.stm-dialog-overlay option {
+  background: var(--st-paper);
+  color: var(--st-ink);
+}
