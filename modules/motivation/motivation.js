@@ -1,11 +1,13 @@
 // Motivation — per-character arc trees. Not skill points: desires, secrets,
 // and the beats that pay them off. Each tier unlocks against a Script scene.
 import { getContext } from '../../../../../extensions.js';
-import { eventSource, event_types, generateQuietPrompt } from '../../../../../../script.js';
+import { eventSource, event_types, stopGeneration } from '../../../../../../script.js';
 import { power_user } from '../../../../../power-user.js';
 import { Module } from '../../lib/module.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
-import { getCastMembers, getStarMember, PRIORITY_MAP, priorityMeta, formatDirectorPromptBlock, resolveCastPromptIdentity, listPersonas, isFoilOrHigher } from '../../lib/castCatalog.js';
+import { leanQuietGenerate, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
+import { parseJsonObject } from '../../lib/jsonExtract.js';
+import { getCastMembers, getStarMember, PRIORITY_MAP, priorityMeta, resolveCastPromptIdentity, listPersonas, isFoilOrHigher, getDirectorRecord, normalizePlotHook, formatPlotHookLine } from '../../lib/castCatalog.js';
 import { getSceneCards, sceneLabel, creditedScenes } from '../../lib/scriptCatalog.js';
 import {
   knowerLabel,
@@ -15,6 +17,7 @@ import {
   smokeSecretRelationPure,
   standingSubjects,
   standingToward,
+  standingInfo,
   subjectLabel,
   listPlaySecrets,
   secretsKnownToCharacter,
@@ -27,6 +30,12 @@ import {
   houseAffiliateIds,
 } from '../../lib/motivationCatalog.js';
 import { buildModal } from '../../lib/compass/dialogs.js';
+import {
+  pullBeatAsHook,
+  syncHookFromBeat,
+  markHookResolved,
+  unlinkBeat,
+} from '../../lib/plotHookBridge.js';
 
 const TIERS = [
   { id: 'trivial',  label: 'Trivial',  color: '#a89577' },
@@ -89,6 +98,9 @@ export class MotivationModule extends Module {
     this._knowModal = null;
     const relationSmoke = smokeSecretRelationPure();
     if (relationSmoke) console.warn('[Motivation] secret relation invariant:', relationSmoke);
+    this.bus?.on('cast.updated', () => {
+      if (this.container) this.render(this.container);
+    });
     if (!this._sonarBound) {
       this._sonarBound = true;
       this._lastSonarScanLen = -1;
@@ -149,6 +161,7 @@ export class MotivationModule extends Module {
     this._lastSonarScanLen = -1;
     this._sonarSecretsBusy = false;
     this._sonarBeatsBusy = false;
+    this._auditCancelled = true;
     if (this.container) await this.render(this.container);
   }
 
@@ -461,7 +474,7 @@ export class MotivationModule extends Module {
           </div>
           <div class="mot-head-meta">${scenes} credited scene${scenes === 1 ? '' : 's'} · ${secretN} secret${secretN === 1 ? '' : 's'} · ${cs.achievements.length} achievement${cs.achievements.length === 1 ? '' : 's'}${ivBit}</div>
         </div>
-        <button type="button" class="mot-btn gold" data-action="audit" title="Read the card, secrets, credited scenes, and Director notes, then draft a branching arc">Audit</button>
+          <button type="button" class="mot-btn gold" data-action="audit" title="Pick Connections, Script cards, and/or plot hooks, then draft a branching arc">Audit</button>
       </header>`;
   }
 
@@ -713,6 +726,10 @@ export class MotivationModule extends Module {
                     : (step.sceneUid ? 'Unlock and apply rewards' : 'Link a scene card first')))}">
               ${step.unlocked ? 'Unlocked' : (gate.open ? 'Locked' : 'Blocked')}
             </button>
+            <button type="button" class="mot-btn small${step.hookId ? ' gold' : ''}" data-action="to-hook"
+              title="${step.hookId ? 'Already a Director plot hook — click to refresh it' : 'Add this beat as a Director plot hook'}">
+              ${step.hookId ? 'On Cast' : 'Plot hook'}
+            </button>
             <button type="button" class="mot-icon" data-action="edit-step" title="Edit">✎</button>
             <button type="button" class="mot-icon danger" data-action="drop-step" title="Remove">✕</button>
           </div>`
@@ -773,8 +790,8 @@ export class MotivationModule extends Module {
         else this._openDrawers.delete(d.dataset.drawer);
       });
     });
-    root.querySelector('[data-action="audit"]')?.addEventListener('click', e => {
-      void this._runAudit(sel, cs, e.currentTarget);
+    root.querySelector('[data-action="audit"]')?.addEventListener('click', () => {
+      this._openAuditDialog(sel, cs);
     });
     root.querySelectorAll('[data-action="add-card"]').forEach(btn => {
       btn.addEventListener('click', () => this._openCardEditor(cs, btn.dataset.kind, null));
@@ -860,8 +877,13 @@ export class MotivationModule extends Module {
     root.querySelector('[data-action="add-step"]')?.addEventListener('click', () => this._openStepEditor(cs, null));
     root.querySelector('[data-action="clear-path"]')?.addEventListener('click', () => {
       if (!confirm('Remove every beat on this arc? Secrets and achievements stay.')) return;
+      let hooked = false;
+      for (const step of cs.steps ?? []) {
+        if (unlinkBeat(this.storage, step)) hooked = true;
+      }
       cs.steps = [];
       this.saveState();
+      if (hooked) this.bus.emit('cast.updated', {});
       this.render(this.container);
     });
     root.querySelectorAll('.mot-step').forEach(el => {
@@ -873,6 +895,10 @@ export class MotivationModule extends Module {
       });
       el.querySelector('[data-action="link-scene"]')?.addEventListener('click', () => this._openScenePicker(cs, id));
       el.querySelector('[data-action="toggle-step"]')?.addEventListener('click', () => this._toggleStep(cs, id));
+      el.querySelector('[data-action="to-hook"]')?.addEventListener('click', () => {
+        const step = (cs.steps ?? []).find(s => s.id === id);
+        if (step) this._sendBeatToHook(this.state.selectedId, step);
+      });
       el.querySelector('[data-action="edit-step"]')?.addEventListener('click', () => {
         const step = (cs.steps ?? []).find(s => s.id === id);
         if (step) this._openStepEditor(cs, step);
@@ -882,8 +908,10 @@ export class MotivationModule extends Module {
         if (!step || !confirm(`Remove “${step.title}”? Beats branching from it move up a level.`)) return;
         for (const child of cs.steps.filter(s => s.parentId === id)) child.parentId = step.parentId ?? null;
         if (step.unlocked) this._withdrawRewards(cs, step);
+        const hooked = unlinkBeat(this.storage, step);
         cs.steps = cs.steps.filter(s => s.id !== id);
         this.saveState();
+        if (hooked) this.bus.emit('cast.updated', {});
         this.render(this.container);
       });
     });
@@ -961,10 +989,12 @@ export class MotivationModule extends Module {
       step.unlocked = false;
       step.unlockedAt = 0;
       this._withdrawRewards(cs, step);
+      this._markHookResolved(step, false);
       for (const child of cs.steps.filter(s => s.parentId === id && s.unlocked)) {
         child.unlocked = false;
         child.unlockedAt = 0;
         this._withdrawRewards(cs, child);
+        this._markHookResolved(child, false);
       }
       this.saveState();
       this.render(this.container);
@@ -993,7 +1023,29 @@ export class MotivationModule extends Module {
     step.unlocked = true;
     step.unlockedAt = Date.now();
     this._applyRewards(cs, step, characterId || this.state.selectedId);
+    this._markHookResolved(step, true);
     this.saveState();
+  }
+
+  _markHookResolved(step, resolved) {
+    if (markHookResolved(this.storage, step, resolved)) this.bus.emit('cast.updated', {});
+  }
+
+  _touchHookFromBeat(characterId, step) {
+    const out = syncHookFromBeat(this.storage, characterId, step);
+    if (out.hooked) this.bus.emit('cast.updated', {});
+    return out;
+  }
+
+  _sendBeatToHook(characterId, step) {
+    const out = pullBeatAsHook(this.storage, characterId, step);
+    if (out.reason === 'no-director') {
+      alert('Cast a Director first — plot hooks live on their sheet.');
+      return;
+    }
+    this.saveState();
+    if (out.hooked) this.bus.emit('cast.updated', {});
+    this.render(this.container);
   }
 
   /** Beats eligible for auto-unlock right now: gate already open, scene linked, parent clear. */
@@ -1106,11 +1158,10 @@ JSON schema:
 - note: one short clause (<=15 words) on what happened.
 JSON:`;
       const raw = await this._withMotivationProfile(() =>
-        generateQuietPrompt({ quietPrompt: prompt, trimToSentence: false, skipWIAN: true, quietName: 'System' }));
+        leanQuietGenerate(prompt, { kind: 'filing' }));
       if (!this._chatTokenStillValid(chatToken)) return;
 
-      const match = String(raw || '').match(/\{[\s\S]*\}/);
-      const parsed = match ? JSON.parse(match[0]) : null;
+      const parsed = parseJsonObject(raw);
       if (!parsed?.detected || !parsed.secretId) return;
 
       let owner = null, secret = null;
@@ -1200,11 +1251,10 @@ JSON schema:
 - Return {"unlocks":[]} if nothing clearly paid off yet.
 JSON:`;
       const raw = await this._withMotivationProfile(() =>
-        generateQuietPrompt({ quietPrompt: prompt, trimToSentence: false, skipWIAN: true, quietName: 'System' }));
+        leanQuietGenerate(prompt, { kind: 'filing' }));
       if (!this._chatTokenStillValid(chatToken)) return;
 
-      const match = String(raw || '').match(/\{[\s\S]*\}/);
-      const parsed = match ? JSON.parse(match[0]) : null;
+      const parsed = parseJsonObject(raw);
       const unlocks = Array.isArray(parsed?.unlocks) ? parsed.unlocks : [];
       if (!unlocks.length) return;
 
@@ -1900,7 +1950,9 @@ JSON:`;
       };
       if (existing) Object.assign(existing, patch);
       else cs.steps.push({ id: uid(), sceneUid: '', unlocked: false, unlockedAt: 0, ...patch });
-      this._normalizeGate(existing ?? cs.steps[cs.steps.length - 1]);
+      const saved = existing ?? cs.steps[cs.steps.length - 1];
+      this._normalizeGate(saved);
+      this._touchHookFromBeat(this.state.selectedId, saved);
       this.saveState();
       backdrop.remove();
       this.render(this.container);
@@ -2097,7 +2149,9 @@ JSON:`;
         step.unlocked = false;
         step.unlockedAt = 0;
         this._withdrawRewards(cs, step);
+        this._markHookResolved(step, false);
       }
+      this._touchHookFromBeat(this.state.selectedId, step);
       this.saveState();
       backdrop.remove();
       this.render(this.container);
@@ -2106,7 +2160,320 @@ JSON:`;
 
   // ── audit ──────────────────────────────────────────────────────────────────
 
-  _auditContext(sel) {
+  _repDb() {
+    try { return this.storage.getChat('reputation', { personal: [], house: [] }); }
+    catch { return { personal: [], house: [] }; }
+  }
+
+  /** Personal-web node for this cast member (self bubble if they are the Star). */
+  _repNodeForCast(sel) {
+    const nodes = this._repDb().personal || [];
+    if (!sel?.id) return null;
+    const star = getStarMember(this.storage);
+    const isStar = sel.priority === 'star' || sel.id === star?.id;
+    if (isStar) {
+      return nodes.find(n => n.kind === 'self')
+        || nodes.find(n => n.characterId === sel.id)
+        || null;
+    }
+    return nodes.find(n => n.characterId === sel.id) || null;
+  }
+
+  _repNeighborIds(subject, nodes) {
+    const ids = new Set();
+    if (!subject?.id) return ids;
+    for (const id of subject.links || []) {
+      if (id && id !== subject.id) ids.add(id);
+    }
+    for (const r of subject.readings || []) {
+      if (r?.targetId && r.targetId !== subject.id) ids.add(r.targetId);
+    }
+    for (const n of nodes) {
+      if (!n?.id || n.id === subject.id) continue;
+      if ((n.links || []).includes(subject.id)) ids.add(n.id);
+      if ((n.readings || []).some(r => r?.targetId === subject.id)) ids.add(n.id);
+    }
+    return ids;
+  }
+
+  _auditConnectionRows(sel) {
+    const db = this._repDb();
+    const nodes = db.personal || [];
+    const houses = db.house || [];
+    const subject = this._repNodeForCast(sel);
+    if (!subject) return [];
+    const star = getStarMember(this.storage);
+    const isStar = !!(sel && (sel.priority === 'star' || sel.id === star?.id));
+    const seen = new Set();
+    const rows = [];
+    for (const nid of this._repNeighborIds(subject, nodes)) {
+      const n = nodes.find(x => x.id === nid);
+      if (!n) continue;
+      if (n.id === subject.id) continue;
+      if (n.characterId && n.characterId === sel.id) continue;
+      if (isStar && n.kind === 'self') continue;
+      const rec = (subject.readings || []).find(r => r.targetId === n.id)
+        || (n.readings || []).find(r => r.targetId === subject.id);
+      let standing = rec?.standing != null && Number.isFinite(Number(rec.standing))
+        ? Math.round(Number(rec.standing))
+        : null;
+      let take = String(rec?.take || '').trim();
+      let key = '';
+      let label = n.name || 'Notice';
+      if (n.category === 'group' && n.houseId) {
+        key = `house:${n.houseId}`;
+        const h = houses.find(x => x.id === n.houseId);
+        if (h) {
+          label = h.alias ? `${h.name} (${h.alias})` : (h.name || label);
+          if (!take) take = String(h.opinion || h.notes || '').trim();
+          if (standing == null && isStar && h.standing != null) {
+            standing = Math.round(Number(h.standing) || 0);
+          }
+        }
+      } else if (n.characterId) {
+        key = `cast:${n.characterId}`;
+      } else {
+        key = `node:${n.id}`;
+      }
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      if (!take) take = String(n.notes || n.description || '').trim();
+      const info = standing == null ? null : standingInfo(standing);
+      rows.push({
+        key,
+        label,
+        standing,
+        band: n.category === 'rumor' && standing == null ? 'Rumor' : (info ? info.label : 'Unfiled'),
+        take: take.slice(0, 140),
+        defaultOn: true,
+      });
+    }
+    rows.sort((a, b) => (a.label || '').localeCompare(b.label || '', undefined, { sensitivity: 'base' }));
+    return rows;
+  }
+
+  _auditSceneRows(sel) {
+    const credited = new Set(creditedScenes(this.storage, sel?.id, sel?.name).map(s => s.uid));
+    return getSceneCards(this.storage).map(s => ({
+      uid: s.uid,
+      code: s.code,
+      title: s.title,
+      summary: String(s.card?.summary || s.card?.content || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+      defaultOn: credited.has(s.uid),
+    }));
+  }
+
+  _auditHookRows(sel, { showResolved = false } = {}) {
+    const dir = getDirectorRecord(this.storage);
+    const members = getCastMembers(this.storage);
+    const hooks = (dir?.plotHooks || []).map(normalizePlotHook).filter(Boolean);
+    return hooks
+      .filter(h => showResolved || h.active)
+      .map((h, i) => {
+        const who = h.assignedTo ? (members.find(m => m.id === h.assignedTo)?.name || '') : '';
+        return {
+          id: h.id || `name:${h.name}:${i}`,
+          raw: h,
+          name: h.name,
+          description: h.description,
+          who,
+          scene: sceneLabel(this.storage, h.sceneUid),
+          active: h.active,
+          defaultOn: !h.assignedTo || h.assignedTo === sel?.id,
+        };
+      });
+  }
+
+  _auditConnRowHTML(row) {
+    const stand = row.standing == null ? '' : ` · ${row.standing}`;
+    return `<label class="mot-audit-row">
+      <input type="checkbox" data-audit="conn" value="${esc(row.key)}" ${row.defaultOn ? 'checked' : ''}>
+      <span class="mot-audit-copy">
+        <span class="mot-audit-name">${esc(row.label)}</span>
+        <span class="mot-audit-meta">${esc(row.band)}${esc(stand)}</span>
+        ${row.take ? `<span class="mot-audit-take">${esc(row.take)}</span>` : ''}
+      </span>
+    </label>`;
+  }
+
+  _auditSceneRowHTML(row, checked) {
+    const on = checked == null ? row.defaultOn : checked;
+    return `<label class="mot-audit-row">
+      <input type="checkbox" data-audit="scene" value="${esc(row.uid)}" ${on ? 'checked' : ''}>
+      <span class="mot-audit-copy">
+        <span class="mot-audit-name">${esc(row.code)} · ${esc(row.title)}</span>
+      </span>
+    </label>`;
+  }
+
+  _auditHookRowHTML(row, checked) {
+    const on = checked == null ? row.defaultOn : checked;
+    const meta = [row.who || 'unassigned', row.scene, row.active ? '' : 'resolved'].filter(Boolean).join(' · ');
+    return `<label class="mot-audit-row">
+      <input type="checkbox" data-audit="hook" value="${esc(row.id)}" ${on ? 'checked' : ''}>
+      <span class="mot-audit-copy">
+        <span class="mot-audit-name">${esc(row.name)}</span>
+        <span class="mot-audit-meta">${esc(meta)}</span>
+      </span>
+    </label>`;
+  }
+
+  _openAuditDialog(sel, cs) {
+    if (!sel) return;
+    const connRows = this._auditConnectionRows(sel);
+    const sceneRows = this._auditSceneRows(sel);
+    const hookRows = this._auditHookRows(sel, { showResolved: false });
+    this._auditHookBag = new Map(hookRows.map(r => [r.id, r.raw]));
+    const hasSteps = !!(cs.steps ?? []).length;
+    const group = (id, title, body, empty) => `
+      <div class="mot-audit-group" data-group="${id}">
+        <div class="mot-audit-group-h">
+          <span>${esc(title)}</span>
+          <span class="mot-audit-group-tools">
+            <button type="button" class="mot-btn small" data-action="audit-all" data-group="${id}" data-on="1">All</button>
+            <button type="button" class="mot-btn small" data-action="audit-all" data-group="${id}" data-on="0">None</button>
+          </span>
+        </div>
+        <div class="mot-audit-list" data-role="list-${id}">${body || `<div class="mot-hint">${esc(empty)}</div>`}</div>
+      </div>`;
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'mot-modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="mot-modal mot-modal--audit">
+        <div class="mot-modal-title">AUDIT</div>
+        <div class="mot-modal-sub">— ${esc(sel.name || 'Unnamed')} · pick sources, then run —</div>
+        <div data-role="audit-select">
+          ${group('conn', 'Connections', connRows.map(r => this._auditConnRowHTML(r)).join(''), 'No Connections filed on this character’s web yet.')}
+          ${group('scene', 'Script cards', sceneRows.map(r => this._auditSceneRowHTML(r)).join(''), 'No Script cards yet.')}
+          <div class="mot-audit-group" data-group="hook">
+            <div class="mot-audit-group-h">
+              <span>Plot hooks</span>
+              <span class="mot-audit-group-tools">
+                <label class="mot-audit-toggle"><input type="checkbox" data-role="show-resolved"> Show resolved</label>
+                <button type="button" class="mot-btn small" data-action="audit-all" data-group="hook" data-on="1">All</button>
+                <button type="button" class="mot-btn small" data-action="audit-all" data-group="hook" data-on="0">None</button>
+              </span>
+            </div>
+            <div class="mot-audit-list" data-role="list-hook">${hookRows.map(r => this._auditHookRowHTML(r)).join('') || '<div class="mot-hint">No plot hooks yet.</div>'}</div>
+          </div>
+          <div class="mot-field">
+            <label>Steer this arc</label>
+            <textarea data-field="direction" maxlength="400" rows="3" placeholder="Optional — revenge, romance, duty, a specific rival…"></textarea>
+            <div class="mot-hint">Short note for the tree’s direction. Run needs at least one source or this prompt.</div>
+          </div>
+          ${hasSteps ? `<label class="mot-audit-toggle mot-audit-extend"><input type="checkbox" data-field="extend" checked> Build onto existing arc</label>` : ''}
+        </div>
+        <div class="mot-audit-stage" data-role="audit-stage" hidden>
+          <p class="mot-audit-beat" data-role="audit-beat">Lights up…</p>
+          <div class="mot-audit-progress"><div class="mot-audit-progress-fill"></div></div>
+          <button type="button" class="mot-btn" data-action="audit-cut">■ Cut / Cancel</button>
+        </div>
+        <div class="mot-audit-status" data-role="audit-status" hidden>
+          <p data-role="audit-status-msg"></p>
+          <div class="mot-modal-actions">
+            <button type="button" class="mot-btn" data-action="audit-dismiss">Dismiss</button>
+            <button type="button" class="mot-btn gold" data-action="audit-view" hidden>View</button>
+          </div>
+        </div>
+        <div class="mot-modal-actions" data-role="audit-footer">
+          <button type="button" class="mot-btn" data-action="cancel">Close</button>
+          <button type="button" class="mot-btn gold" data-action="audit-run">Run audit</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+
+    const selectEl = backdrop.querySelector('[data-role="audit-select"]');
+    const stageEl = backdrop.querySelector('[data-role="audit-stage"]');
+    const statusEl = backdrop.querySelector('[data-role="audit-status"]');
+    const footerEl = backdrop.querySelector('[data-role="audit-footer"]');
+    const runBtn = backdrop.querySelector('[data-action="audit-run"]');
+    const viewBtn = backdrop.querySelector('[data-action="audit-view"]');
+    const statusMsg = backdrop.querySelector('[data-role="audit-status-msg"]');
+    const beatEl = backdrop.querySelector('[data-role="audit-beat"]');
+    const fillEl = backdrop.querySelector('.mot-audit-progress-fill');
+
+    const close = () => {
+      if (this._auditBusy) this._cancelAudit();
+      backdrop.remove();
+      if (this.container) this.render(this.container);
+    };
+    const setPhase = (phase) => {
+      selectEl.hidden = phase !== 'select';
+      stageEl.hidden = phase !== 'stage';
+      statusEl.hidden = phase !== 'status';
+      footerEl.hidden = phase !== 'select';
+    };
+    const syncRun = () => {
+      const anySrc = [...backdrop.querySelectorAll('[data-audit]')].some(el => el.checked);
+      const dir = (backdrop.querySelector('[data-field="direction"]')?.value || '').trim();
+      runBtn.disabled = !anySrc && !dir;
+    };
+    const collect = () => {
+      const connectionKeys = [...backdrop.querySelectorAll('[data-audit="conn"]:checked')].map(el => el.value);
+      const sceneUids = [...backdrop.querySelectorAll('[data-audit="scene"]:checked')].map(el => el.value);
+      const hookIds = [...backdrop.querySelectorAll('[data-audit="hook"]:checked')].map(el => el.value);
+      const hooks = hookIds.map(id => this._auditHookBag?.get(id)).filter(Boolean);
+      return {
+        connectionKeys,
+        sceneUids,
+        hooks,
+        direction: (backdrop.querySelector('[data-field="direction"]')?.value || '').trim().slice(0, 400),
+        extendExisting: hasSteps ? backdrop.querySelector('[data-field="extend"]')?.checked !== false : true,
+      };
+    };
+
+    backdrop.querySelector('[data-action="cancel"]')?.addEventListener('click', close);
+    backdrop.addEventListener('click', e => {
+      if (e.target === backdrop && !this._auditBusy) close();
+    });
+    backdrop.querySelector('[data-field="direction"]')?.addEventListener('input', syncRun);
+    backdrop.querySelectorAll('[data-audit]').forEach(el => el.addEventListener('change', syncRun));
+    backdrop.querySelectorAll('[data-action="audit-all"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const group = btn.dataset.group;
+        const on = btn.dataset.on === '1';
+        backdrop.querySelectorAll(`[data-audit="${group}"]`).forEach(cb => { cb.checked = on; });
+        syncRun();
+      });
+    });
+    backdrop.querySelector('[data-role="show-resolved"]')?.addEventListener('change', e => {
+      const prev = new Set([...backdrop.querySelectorAll('[data-audit="hook"]:checked')].map(el => el.value));
+      const rows = this._auditHookRows(sel, { showResolved: !!e.target.checked });
+      this._auditHookBag = new Map(rows.map(r => [r.id, r.raw]));
+      const list = backdrop.querySelector('[data-role="list-hook"]');
+      list.innerHTML = rows.map(r => this._auditHookRowHTML(r, prev.has(r.id))).join('')
+        || '<div class="mot-hint">No plot hooks yet.</div>';
+      list.querySelectorAll('[data-audit]').forEach(el => el.addEventListener('change', syncRun));
+      syncRun();
+    });
+    backdrop.querySelector('[data-action="audit-cut"]')?.addEventListener('click', () => this._cancelAudit());
+    backdrop.querySelector('[data-action="audit-dismiss"]')?.addEventListener('click', close);
+    viewBtn?.addEventListener('click', () => {
+      backdrop.remove();
+      if (this.container) this.render(this.container);
+    });
+    runBtn.addEventListener('click', () => {
+      const picks = collect();
+      if (!picks.connectionKeys.length && !picks.sceneUids.length && !picks.hooks.length && !picks.direction) return;
+      void this._runAudit(sel, cs, {
+        overlay: backdrop,
+        setPhase,
+        beatEl,
+        fillEl,
+        statusMsg,
+        viewBtn,
+      }, picks);
+    });
+    syncRun();
+  }
+
+  _cancelAudit() {
+    this._auditCancelled = true;
+    try { stopGeneration(); } catch { /* ST may not be generating */ }
+  }
+
+  _auditContext(sel, picks = {}) {
     const clip = (s, n = 500) => {
       const t = String(s || '').trim();
       return t.length > n ? `${t.slice(0, n)}…` : t;
@@ -2117,7 +2484,6 @@ JSON:`;
       characters: ctx.characters ?? [],
       personas: listPersonas(power_user),
     });
-    // Card / persona / Director fallback for roles without their own link.
     const cardBlock = identity.block;
 
     const cs = this._charState(sel.id);
@@ -2137,18 +2503,43 @@ JSON:`;
       }).join('\n')
       : 'None recorded.';
 
-    const scenes = creditedScenes(this.storage, sel.id, sel.name);
-    const sceneBlock = scenes.length
-      ? scenes.slice(-8).map(s => `- ${s.code} ${s.title}${s.card.span ? ` (${s.card.span})` : ''}: ${clip(s.card.summary || s.card.content, 160)}`).join('\n')
-      : 'No credited scenes yet.';
+    const sceneUidSet = new Set(picks.sceneUids || []);
+    const sceneBlock = sceneUidSet.size
+      ? getSceneCards(this.storage)
+        .filter(s => sceneUidSet.has(s.uid))
+        .map(s => `- ${s.code} ${s.title}${s.card?.span ? ` (${s.card.span})` : ''}: ${clip(s.card?.summary || s.card?.content, 160)}`)
+        .join('\n')
+      : '';
 
-    const dirBlock = formatDirectorPromptBlock(this.storage);
+    const connKeySet = new Set(picks.connectionKeys || []);
+    const connRows = connKeySet.size ? this._auditConnectionRows(sel).filter(r => connKeySet.has(r.key)) : [];
+    const connectionBlock = connRows.length
+      ? connRows.map(r => {
+        const stand = r.standing == null ? 'unfiled' : `${r.band} ${r.standing}`;
+        return `- ${r.label} (${stand})${r.take ? `: ${r.take}` : ''}`;
+      }).join('\n')
+      : '';
+
+    const hookBlock = (picks.hooks || []).length
+      ? picks.hooks.map(h => `- ${formatPlotHookLine(h, this.storage)}`).filter(Boolean).join('\n')
+      : '';
 
     const existing = (cs.steps ?? []).length
       ? cs.steps.map(s => `- ${s.title}${s.unlocked ? ' (unlocked)' : ''}`).join('\n')
       : 'None yet.';
 
-    return { cardBlock, secrets, achievements, sceneBlock, dirBlock, existing, priority: sel.priority };
+    return {
+      cardBlock,
+      secrets,
+      achievements,
+      sceneBlock,
+      connectionBlock,
+      hookBlock,
+      existing,
+      direction: String(picks.direction || '').trim().slice(0, 400),
+      extendExisting: picks.extendExisting !== false,
+      priority: sel.priority,
+    };
   }
 
   _isRateLimit(text) {
@@ -2195,39 +2586,60 @@ JSON:`;
     };
     const once = async (useSchema = true) => {
       const payload = useSchema ? opts : { ...opts, jsonSchema: null };
-      return String(await this._withMotivationProfile(() => generateQuietPrompt(payload)) ?? '').trim();
+      return String(await this._withMotivationProfile(() =>
+        leanQuietGenerate(payload.quietPrompt, { jsonSchema: payload.jsonSchema, kind: 'filing', responseLength: FILING_RESPONSE_LENGTH })) ?? '').trim();
     };
     let response = '';
     try {
+      if (this._auditCancelled) throw new Error('Cancelled.');
       response = await once(true);
     } catch (err) {
-      if (this._isRateLimit(err.message)) {
+      const msg = err?.message || err;
+      if (this._auditCancelled || /abort|cancel/i.test(String(msg))) throw new Error('Cancelled.');
+      if (this._isRateLimit(msg)) {
         await new Promise(r => setTimeout(r, 2500));
+        if (this._auditCancelled) throw new Error('Cancelled.');
       }
       response = await once(false);
     }
     if (this._isRateLimit(response)) {
       await new Promise(r => setTimeout(r, 2500));
+      if (this._auditCancelled) throw new Error('Cancelled.');
       response = await once();
     }
     if (this._isRateLimit(response)) {
       throw new Error('Too many requests — the model is rate-limiting. Wait a few seconds and press Audit again.');
     }
+    if (this._auditCancelled) throw new Error('Cancelled.');
     return response;
   }
 
-  async _runAudit(sel, cs, btn) {
+  async _runAudit(sel, cs, ui, picks) {
     if (this._auditBusy) return;
     this._auditBusy = true;
+    this._auditCancelled = false;
     const chatToken = this._chatToken();
-    const orig = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = '…';
+    const setBeat = (text, pct) => {
+      if (ui?.beatEl) ui.beatEl.textContent = text;
+      if (ui?.fillEl) ui.fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    };
+    ui?.setPhase?.('stage');
+    setBeat('Reading the dossier…', 12);
     try {
-      const c = this._auditContext(sel);
+      const c = this._auditContext(sel, picks);
+      const sourceBits = [
+        c.connectionBlock ? `Connections:\n${c.connectionBlock}` : '',
+        c.sceneBlock ? `Script cards:\n${c.sceneBlock}` : '',
+        c.hookBlock ? `Plot hooks:\n${c.hookBlock}` : '',
+      ].filter(Boolean).join('\n\n');
+      const extendNote = c.extendExisting
+        ? 'Build onto the existing arc when it fits. New beats may continue a listed title as parent only if they clearly follow it; otherwise open a new root (parent null).'
+        : 'Start a new root branch. Do not parent new beats under existing ones.';
+      const directionBlock = c.direction ? `DIRECTION:\n${c.direction}\n` : '';
       const prompt = `SYSTEM: Return JSON only. Do not roleplay. Do not write prose.
 
 Task: 4–8 character-arc beats for the dossier below. Wants, turns, costs. At least one fork (two beats, same parent, each with a branch label).
+${extendNote}
 
 Every beat should carry 1–2 rewards that fit the dossier. Mix kinds:
 - achievement (can also offer an item or a secret via "offers")
@@ -2237,7 +2649,7 @@ Every beat should carry 1–2 rewards that fit the dossier. Mix kinds:
 
 Prefer concrete loot and secrets on payoff beats, not empty reward arrays.
 
-${c.cardBlock}
+${directionBlock}${c.cardBlock}
 Billing: ${PRIORITY_MAP[c.priority]?.label ?? c.priority}
 
 Secrets:
@@ -2246,13 +2658,9 @@ ${c.secrets}
 Achievements:
 ${c.achievements}
 
-Credited scenes:
-${c.sceneBlock}
+${sourceBits}
 
-Director dials:
-${c.dirBlock}
-
-Existing beats (do not repeat):
+Existing beats (do not repeat titles):
 ${c.existing}
 
 Schema:
@@ -2260,14 +2668,17 @@ Schema:
 
 parent is null or another id. rewards kind: achievement|secret|item|bonus. tier: trivial|minor|notable|major|pivotal. item category: consumable|wearable|usable|misc. 1–2 rewards per beat. Achievement offers: 0–2 item or secret objects.`;
 
+      setBeat('Drafting the arc…', 40);
       const response = await this._quietAudit(prompt);
+      if (this._auditCancelled) throw new Error('Cancelled.');
       if (!this._chatTokenStillValid(chatToken)) {
-        throw new Error('Chat changed mid-audit — discarded the draft. Switch back and press Audit again.');
+        throw new Error('Chat changed mid-audit — discarded the draft. Switch back and run Audit again.');
       }
+      setBeat('Filing beats…', 78);
       const raw = salvageBeatList(response);
       if (!raw.length) {
         console.warn('[Motivation audit] raw reply:', response);
-        throw new Error('Audit came back as prose instead of beats. Try Audit again.');
+        throw new Error('Audit came back as prose instead of beats. Try Run again.');
       }
 
       const idMap = new Map();
@@ -2291,21 +2702,37 @@ parent is null or another id. rewards kind: achievement|secret|item|bonus. tier:
         added.push({ step, parentKey: parentRaw == null || parentRaw === '' ? null : String(parentRaw) });
       }
       if (!added.length) throw new Error('JSON came back but no beats had a title.');
+      if (this._auditCancelled) throw new Error('Cancelled.');
+      const existingTitles = new Map((cs.steps ?? []).map(s => [String(s.title || '').trim().toLowerCase(), s.id]));
       for (const a of added) {
-        a.step.parentId = a.parentKey ? (idMap.get(a.parentKey) ?? null) : null;
+        let parentId = a.parentKey ? (idMap.get(a.parentKey) ?? null) : null;
+        if (!parentId && a.parentKey && c.extendExisting) {
+          parentId = existingTitles.get(a.parentKey.trim().toLowerCase()) || null;
+        }
+        a.step.parentId = parentId;
       }
       cs.steps = [...(cs.steps ?? []), ...added.map(a => a.step)];
       cs.auditAt = Date.now();
+      this._focusedStep = added[0]?.step.id || this._focusedStep;
       this.saveState();
       this.bus.emit('motivation.updated', { characterId: sel.id });
-      this.render(this.container);
+      setBeat('Arc filed.', 100);
+      const n = added.length;
+      if (ui?.statusMsg) {
+        ui.statusMsg.textContent = `${n} beat${n === 1 ? '' : 's'} drafted for ${sel.name || 'this character'}.`;
+      }
+      if (ui?.viewBtn) ui.viewBtn.hidden = false;
+      ui?.setPhase?.('status');
     } catch (err) {
-      console.error('[Motivation audit]', err);
-      alert(`Audit failed: ${err.message}`);
+      const cancelled = this._auditCancelled || /cancel/i.test(err?.message || '');
+      if (!cancelled) console.error('[Motivation audit]', err);
+      if (ui?.statusMsg) {
+        ui.statusMsg.textContent = cancelled ? 'Cut.' : (err.message || String(err));
+      }
+      if (ui?.viewBtn) ui.viewBtn.hidden = true;
+      ui?.setPhase?.('status');
     } finally {
       this._auditBusy = false;
-      btn.disabled = false;
-      btn.textContent = orig;
     }
   }
 

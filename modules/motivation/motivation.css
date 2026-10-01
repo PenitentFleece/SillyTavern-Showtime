@@ -788,6 +788,7 @@ select.mot-status.on {
   gap: 2px;
   margin-top: 4px;
   justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
 .mot-rewards, .mot-reward-edit {
@@ -873,6 +874,98 @@ button.mot-scene:hover { color: var(--st-ink); border-color: var(--st-ink); }
   box-shadow: var(--st-shadow);
   color: var(--st-ink);
   font-family: var(--st-font-body);
+}
+.mot-modal--audit {
+  width: min(540px, 94vw);
+}
+.mot-audit-group {
+  margin-bottom: 10px;
+  border: 1px solid var(--st-sepia);
+  padding: 6px 8px 8px;
+}
+.mot-audit-group-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--st-font-title);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--st-sepia);
+  margin-bottom: 6px;
+}
+.mot-audit-group-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.mot-audit-list {
+  max-height: 132px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mot-audit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mot-audit-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mot-audit-name { color: var(--st-ink); }
+.mot-audit-meta {
+  font-size: 10px;
+  color: var(--st-ink-soft);
+}
+.mot-audit-take {
+  font-size: 11px;
+  color: var(--st-ink-soft);
+  font-style: italic;
+}
+.mot-audit-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--st-font-body);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--st-ink);
+  cursor: pointer;
+}
+.mot-audit-extend {
+  display: flex;
+  margin: 4px 0 8px;
+}
+.mot-audit-stage,
+.mot-audit-status {
+  padding: 8px 0 4px;
+}
+.mot-audit-beat {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.mot-audit-progress {
+  height: 6px;
+  margin-bottom: 10px;
+  background: var(--st-paper-2, #efe4cc);
+  border: 1px solid var(--st-sepia);
+}
+.mot-audit-progress-fill {
+  height: 100%;
+  width: 8%;
+  background: var(--st-gold);
+  transition: width 0.25s ease;
 }
 .mot-modal-title {
   font-family: var(--st-font-title);

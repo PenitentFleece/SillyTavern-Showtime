@@ -313,6 +313,12 @@ button.cmp-shelf-nav {
 }
 .cmp-mood-palette[hidden] { display: none; }
 .cmp-mood-palette .cmp-pill { cursor: pointer; }
+.cmp-mood-palette .cmp-pill.is-custom { border-style: dashed; }
+.cmp-mood-custom-hint {
+  flex: 1 0 100%;
+  font-size: 11px;
+  opacity: 0.7;
+}
 
 .cmp-char-pick {
   display: flex;

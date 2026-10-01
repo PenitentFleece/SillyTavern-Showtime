@@ -1,9 +1,12 @@
 // Reputation — Connections (personal web) and Affiliations (guilds / companies).
 import { getContext } from '../../../../../extensions.js';
-import { getThumbnailUrl, generateQuietPrompt } from '../../../../../../script.js';
+import { getThumbnailUrl } from '../../../../../../script.js';
 import { power_user } from '../../../../../power-user.js';
 import { Module } from '../../lib/module.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
+import { leanQuietGenerate } from '../../lib/isolatedGen.js';
+import { parseJsonObject } from '../../lib/jsonExtract.js';
+import { rafMove } from '../../lib/uiPerf.js';
 import { getStarMember, getCastMembers, priorityLabel, resolveCastPromptIdentity, formatDirectorPromptBlock, listPersonas } from '../../lib/castCatalog.js';
 import {
   listPlaySecrets,
@@ -64,17 +67,14 @@ function clamp(n) {
 
 function parseStandingTake(text) {
   const raw = String(text ?? '').trim();
-  const m = raw.match(/\{[\s\S]*\}/);
-  if (m) {
-    try {
-      const o = JSON.parse(m[0]);
-      const take = String(o.take ?? o.opinion ?? o.text ?? '').trim();
-      const standing = o.standing ?? o.value ?? o.karma;
-      return {
-        standing: Number.isFinite(Number(standing)) ? clamp(standing) : null,
-        take: take.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3).join(' '),
-      };
-    } catch { /* fall through */ }
+  const o = parseJsonObject(raw);
+  if (o) {
+    const take = String(o.take ?? o.opinion ?? o.text ?? '').trim();
+    const standing = o.standing ?? o.value ?? o.karma;
+    return {
+      standing: Number.isFinite(Number(standing)) ? clamp(standing) : null,
+      take: take.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3).join(' '),
+    };
   }
   return {
     standing: null,
@@ -110,7 +110,11 @@ export class ReputationModule extends Module {
     if (!this._motivationBound) {
       this._motivationBound = true;
       this.bus.on('motivation.updated', () => {
-        if (this.container) this.render(this.container);
+        if (!this.container) return;
+        clearTimeout(this._motRerender);
+        this._motRerender = setTimeout(() => {
+          if (this.container) this.render(this.container);
+        }, 160);
       });
     }
   }
@@ -288,6 +292,38 @@ export class ReputationModule extends Module {
     };
   }
 
+  _withWebFrame(fn) {
+    if (this._wf) return fn();
+    const star = getStarMember(this.storage);
+    const cast = getCastMembers(this.storage);
+    this._wf = {
+      star,
+      membersById: new Map(cast.map(c => [c.id, c])),
+      secrets: listPlaySecrets(this.storage),
+      houseIdsByCast: new Map(),
+      portraits: new Map(),
+      starTargetId: undefined,
+      castChars: null,
+      nodesById: null,
+      personByCast: null,
+    };
+    try {
+      return fn();
+    } finally {
+      this._wf = null;
+    }
+  }
+
+  _starMember() {
+    return this._wf ? this._wf.star : getStarMember(this.storage);
+  }
+
+  _memberById(id) {
+    if (!id) return null;
+    if (this._wf?.membersById) return this._wf.membersById.get(id) ?? null;
+    return getCastMembers(this.storage).find(c => c.id === id) ?? null;
+  }
+
   _nodePx(n, m) {
     return {
       x: m.padX + (Number(n.x) || 0.5) * m.vw,
@@ -345,7 +381,7 @@ export class ReputationModule extends Module {
       push(this._house(n.houseId), 'Affiliation');
       return tags;
     }
-    const star = getStarMember(this.storage);
+    const star = this._starMember();
     const cid = n.characterId || (n.kind === 'self' ? star?.id : '');
     if (!cid) return tags;
     for (const h of this.state.house ?? []) {
@@ -358,14 +394,30 @@ export class ReputationModule extends Module {
 
   _findPersonNode(characterId) {
     if (!characterId) return null;
-    const star = getStarMember(this.storage);
+    if (this._wf) {
+      if (!this._wf.personByCast) {
+        const map = new Map();
+        const star = this._starMember();
+        for (const n of this._nodes()) {
+          if (n.kind === 'self') {
+            if (n.characterId) map.set(n.characterId, n);
+            if (star?.id) map.set(star.id, n);
+          } else if (n.category === 'individual' && n.characterId && !map.has(n.characterId)) {
+            map.set(n.characterId, n);
+          }
+        }
+        this._wf.personByCast = map;
+      }
+      return this._wf.personByCast.get(characterId) ?? null;
+    }
+    const star = this._starMember();
     const self = this._nodes().find(n => n.kind === 'self');
     if (self && (self.characterId === characterId || star?.id === characterId)) return self;
     return this._nodes().find(n => n.category === 'individual' && n.characterId === characterId) ?? null;
   }
 
   _playSecrets() {
-    return listPlaySecrets(this.storage);
+    return this._wf?.secrets ?? listPlaySecrets(this.storage);
   }
 
   _secretCastIds() {
@@ -384,7 +436,7 @@ export class ReputationModule extends Module {
   _castIdFor(n) {
     if (!n) return '';
     if (n.characterId) return n.characterId;
-    if (n.kind === 'self') return getStarMember(this.storage)?.id || '';
+    if (n.kind === 'self') return this._starMember()?.id || '';
     return '';
   }
 
@@ -400,7 +452,7 @@ export class ReputationModule extends Module {
     if (!characterId) return { created: false };
     const existing = this._findPersonNode(characterId);
     if (existing) return { created: false, node: existing };
-    const member = getCastMembers(this.storage).find(c => c.id === characterId);
+    const member = this._memberById(characterId);
     const pos = this._orbit(this._nodes().length);
     const node = {
       id: `c_${characterId}`,
@@ -436,9 +488,15 @@ export class ReputationModule extends Module {
   }
 
   _nodeSecretCtx(n) {
-    const starId = getStarMember(this.storage)?.id || '';
-    const houseIds = characterHouseIds(this.storage, this._castIdFor(n));
-    return { starId, houseIds };
+    const starId = this._starMember()?.id || '';
+    const cid = this._castIdFor(n);
+    if (this._wf) {
+      if (!this._wf.houseIdsByCast.has(cid)) {
+        this._wf.houseIdsByCast.set(cid, characterHouseIds(this.storage, cid));
+      }
+      return { starId, houseIds: this._wf.houseIdsByCast.get(cid) };
+    }
+    return { starId, houseIds: characterHouseIds(this.storage, cid) };
   }
 
   _secretsAboutNode(n) {
@@ -563,6 +621,13 @@ export class ReputationModule extends Module {
     this._houseSnap = null;
     this._cardMode = 'view';
     this._webPan = null;
+    this._webBusy = false;
+    if (this._sizeRaf) {
+      cancelAnimationFrame(this._sizeRaf);
+      this._sizeRaf = 0;
+    }
+    clearTimeout(this._motRerender);
+    clearTimeout(this._zoomSaveT);
     if (this.container) await this.render(this.container);
   }
 
@@ -603,7 +668,7 @@ export class ReputationModule extends Module {
     this.container = container;
     this._migrate();
     const tab = this.state.tab === 'house' ? 'house' : 'personal';
-    container.innerHTML = `
+    container.innerHTML = this._withWebFrame(() => `
       <div class="rep-root">
         <div class="rep-tabs">
           <button type="button" class="rep-tab${tab === 'personal' ? ' on' : ''}" data-tab="personal">Connections</button>
@@ -611,7 +676,7 @@ export class ReputationModule extends Module {
         </div>
         ${tab === 'personal' ? this._renderPersonal() : this._renderHouse()}
       </div>
-    `;
+    `);
     container.querySelectorAll('.rep-tab').forEach(btn => {
       btn.addEventListener('click', () => {
         this.state.tab = btn.dataset.tab;
@@ -628,6 +693,11 @@ export class ReputationModule extends Module {
   }
 
   _node(id) {
+    if (!id) return null;
+    if (this._wf) {
+      if (!this._wf.nodesById) this._wf.nodesById = new Map(this._nodes().map(n => [n.id, n]));
+      return this._wf.nodesById.get(id) ?? null;
+    }
     return this._nodes().find(n => n.id === id) ?? null;
   }
 
@@ -638,6 +708,13 @@ export class ReputationModule extends Module {
 
   _castChar(id) {
     if (!id) return null;
+    if (this._wf) {
+      if (!this._wf.castChars) {
+        const chars = this.storage.getChat('cast', { characters: [] }).characters ?? [];
+        this._wf.castChars = new Map(chars.map(c => [c.id, c]));
+      }
+      return this._wf.castChars.get(id) ?? null;
+    }
     return (this.storage.getChat('cast', { characters: [] }).characters ?? []).find(c => c.id === id) ?? null;
   }
 
@@ -645,7 +722,7 @@ export class ReputationModule extends Module {
     if (!id) return '';
     const c = this._castChar(id);
     if (!c) {
-      const m = getCastMembers(this.storage).find(x => x.id === id);
+      const m = this._memberById(id);
       return m?.portrait || '';
     }
     if (c.portrait) return c.portrait;
@@ -659,12 +736,18 @@ export class ReputationModule extends Module {
 
   _portraitFor(node) {
     if (!node) return '';
+    if (this._wf?.portraits.has(node.id)) return this._wf.portraits.get(node.id);
+    let url = '';
     if (node.category === 'group' && node.houseId) {
       const house = this._house(node.houseId);
-      if (house?.badge) return house.badge;
+      if (house?.badge) url = house.badge;
     }
-    const id = node.characterId || (node.kind === 'self' ? getStarMember(this.storage)?.id : '');
-    return this._castPortrait(id);
+    if (!url) {
+      const id = node.characterId || (node.kind === 'self' ? this._starMember()?.id : '');
+      url = this._castPortrait(id);
+    }
+    if (this._wf) this._wf.portraits.set(node.id, url);
+    return url;
   }
 
   _bubbleLabel(n) {
@@ -961,6 +1044,11 @@ export class ReputationModule extends Module {
     }
     this.saveState();
     this.bus.emit('reputation.updated', { node });
+    const b = this.container?.querySelector(`.rep-bubble[data-id="${node.id}"]`);
+    if (b) {
+      this._paintMeter(b, node);
+      b.style.borderColor = this._bubbleBorderColor(node);
+    }
     this._sizeWeb();
   }
 
@@ -1254,12 +1342,20 @@ export class ReputationModule extends Module {
 
   /** Star stand-in on the web (self node, or character-linked Star). */
   _starTargetId() {
+    if (this._wf && this._wf.starTargetId !== undefined) return this._wf.starTargetId;
     const self = this._node('self');
-    if (self) return self.id;
-    const star = getStarMember(this.storage);
-    if (!star?.id) return '';
-    const hit = this._nodes().find(n => n.characterId && n.characterId === star.id);
-    return hit?.id || '';
+    let id = '';
+    if (self) {
+      id = self.id;
+    } else {
+      const star = this._starMember();
+      if (star?.id) {
+        const hit = this._nodes().find(n => n.characterId && n.characterId === star.id);
+        id = hit?.id || '';
+      }
+    }
+    if (this._wf) this._wf.starTargetId = id;
+    return id;
   }
 
   _standTowardStar(n) {
@@ -1475,26 +1571,38 @@ export class ReputationModule extends Module {
   }
 
   _sizeWeb() {
+    if (this._webBusy) return;
+    if (this._sizeRaf) return;
+    this._sizeRaf = requestAnimationFrame(() => {
+      this._sizeRaf = 0;
+      this._sizeWebNow();
+    });
+  }
+
+  _sizeWebNow() {
+    if (this._webBusy) return;
     const web = this.container?.querySelector('[data-role="web"]');
     const world = web?.querySelector('[data-role="web-world"]');
     const svg = web?.querySelector('[data-role="web-svg"]');
     if (!web || !world || !svg) return;
-    const m = this._webMetrics(web);
-    if (this._webVw && this._webVw !== m.vw && this._webPan) {
-      this._webPan.x *= m.vw / this._webVw;
-      this._webPan.y *= m.vh / this._webVh;
-    }
-    this._webVw = m.vw;
-    this._webVh = m.vh;
-    if (!this._webPan) this._webPan = this._homePan(m);
-    world.style.width = `${m.ww}px`;
-    world.style.height = `${m.wh}px`;
-    svg.setAttribute('width', String(m.ww));
-    svg.setAttribute('height', String(m.wh));
-    svg.setAttribute('viewBox', `0 0 ${m.ww} ${m.wh}`);
-    svg.innerHTML = this._svgLines(m);
-    this._paintBubbles();
-    this._applyWebView();
+    this._withWebFrame(() => {
+      const m = this._webMetrics(web);
+      if (this._webVw && this._webVw !== m.vw && this._webPan) {
+        this._webPan.x *= m.vw / this._webVw;
+        this._webPan.y *= m.vh / this._webVh;
+      }
+      this._webVw = m.vw;
+      this._webVh = m.vh;
+      if (!this._webPan) this._webPan = this._homePan(m);
+      world.style.width = `${m.ww}px`;
+      world.style.height = `${m.wh}px`;
+      svg.setAttribute('width', String(m.ww));
+      svg.setAttribute('height', String(m.wh));
+      svg.setAttribute('viewBox', `0 0 ${m.ww} ${m.wh}`);
+      this._placeBubbles(web, m);
+      svg.innerHTML = this._svgLines(m);
+      this._applyWebView();
+    });
   }
 
   _zoomValue() {
@@ -1514,38 +1622,6 @@ export class ReputationModule extends Module {
     this._webPan = p;
     world.style.transform = `translate(${p.x}px, ${p.y}px) scale(${z})`;
     if (lab) lab.textContent = `${Math.round(z * 100)}%`;
-    requestAnimationFrame(() => this._fadeWebEdges());
-  }
-
-  /** Soften bubbles/threads near the viewport rim so the web feels focused. */
-  _fadeWebEdges() {
-    const web = this.container?.querySelector('[data-role="web"]');
-    if (!web) return;
-    const rect = web.getBoundingClientRect();
-    if (rect.width < 16 || rect.height < 16) return;
-    const margin = Math.min(rect.width, rect.height) * 0.2;
-    const opacityAt = (x, y) => {
-      const dx = Math.min(x - rect.left, rect.right - x);
-      const dy = Math.min(y - rect.top, rect.bottom - y);
-      const d = Math.min(dx, dy);
-      if (d >= margin) return 1;
-      return Math.max(0.12, d / margin);
-    };
-    for (const b of web.querySelectorAll('.rep-bubble')) {
-      const br = b.getBoundingClientRect();
-      let o = opacityAt(br.left + br.width / 2, br.top + br.height / 2);
-      if (b.classList.contains('focus') || b.classList.contains('inspect')) o = Math.max(o, 0.65);
-      b.style.opacity = String(o);
-    }
-    const svg = web.querySelector('[data-role="web-svg"]');
-    if (!svg) return;
-    for (const el of svg.querySelectorAll('line, polygon')) {
-      const er = el.getBoundingClientRect();
-      if (!er.width && !er.height) continue;
-      let o = opacityAt(er.left + er.width / 2, er.top + er.height / 2);
-      if (el.classList.contains('dim')) o *= 0.55;
-      el.style.opacity = String(o);
-    }
   }
 
   /** Keeps the world covering the viewport; centres it when zoomed out past the edges. */
@@ -1570,7 +1646,7 @@ export class ReputationModule extends Module {
       this._webPan = { x: m.vw / 2 - cx * z1, y: m.vh / 2 - cy * z1 };
     }
     this.state.webZoom = z1;
-    this.saveState();
+    this._scheduleZoomSave();
     this._applyWebView();
   }
 
@@ -1580,76 +1656,109 @@ export class ReputationModule extends Module {
     const m = this._webMetrics(web);
     this.state.webZoom = 1;
     this._webPan = this._clampPan(this._homePan(m, 1), m, 1);
-    this.saveState();
+    this._scheduleZoomSave();
     this._applyWebView();
   }
 
+  _scheduleZoomSave() {
+    clearTimeout(this._zoomSaveT);
+    this._zoomSaveT = setTimeout(() => this.saveState(), 220);
+  }
+
   _paintMeter(b, n) {
-    b.querySelectorAll('.rep-meter, .rep-meter-tag').forEach(el => el.remove());
-    b.insertAdjacentHTML('afterbegin', this._meterHTML(n));
+    const st = this._standTowardStar(n);
+    let meter = b.querySelector(':scope > .rep-meter');
+    if (st.kind !== 'read') {
+      meter?.remove();
+      return;
+    }
+    const title = `Toward Star · ${st.label} · ${st.standing}`;
+    if (!meter) {
+      b.insertAdjacentHTML('afterbegin', this._meterHTML(n));
+      return;
+    }
+    meter.style.setProperty('--stand-color', st.color);
+    meter.style.setProperty('--stand-deg', `${st.deg}deg`);
+    meter.title = title;
+  }
+
+  _placeBubbles(web, m) {
+    if (!web) return;
+    m = m || this._webMetrics(web);
+    const bubbles = new Map();
+    for (const el of web.querySelectorAll('.rep-bubble')) bubbles.set(el.dataset.id, el);
+    for (const n of this._nodes()) {
+      const b = bubbles.get(n.id);
+      if (!b) continue;
+      const pt = this._nodePx(n, m);
+      b.style.left = `${pt.x}px`;
+      b.style.top = `${pt.y}px`;
+    }
   }
 
   _paintBubbles() {
     const web = this.container?.querySelector('[data-role="web"]');
     if (!web) return;
-    const m = this._webMetrics(web);
-    for (const n of this._nodes()) {
-      const b = web.querySelector(`.rep-bubble[data-id="${n.id}"]`);
-      if (!b) continue;
-      const cat = NOTICE_CAT_MAP[n.category] ?? NOTICE_CAT_MAP.individual;
-      const face = this._portraitFor(n);
-      const pt = this._nodePx(n, m);
-      const border = this._bubbleBorderColor(n);
-      b.className = this._bubbleClass(n);
-      b.style.left = `${pt.x}px`;
-      b.style.top = `${pt.y}px`;
-      b.style.borderColor = border;
-      if (n.kind === 'self' || face) b.style.background = '';
-      else b.style.background = cat.bg;
-      b.title = n.name || 'Notice';
-      this._paintMeter(b, n);
-      let disk = b.querySelector('.rep-bubble-disk');
-      if (!disk) {
-        disk = document.createElement('span');
-        disk.className = 'rep-bubble-disk';
-        b.appendChild(disk);
-      }
-      let img = disk.querySelector('.rep-bubble-face');
-      if (face) {
-        if (!img) {
-          img = document.createElement('img');
-          img.className = 'rep-bubble-face';
-          img.alt = '';
-          disk.prepend(img);
+    this._withWebFrame(() => {
+      const m = this._webMetrics(web);
+      const bubbles = new Map();
+      for (const el of web.querySelectorAll('.rep-bubble')) bubbles.set(el.dataset.id, el);
+      for (const n of this._nodes()) {
+        const b = bubbles.get(n.id);
+        if (!b) continue;
+        const cat = NOTICE_CAT_MAP[n.category] ?? NOTICE_CAT_MAP.individual;
+        const face = this._portraitFor(n);
+        const pt = this._nodePx(n, m);
+        const border = this._bubbleBorderColor(n);
+        b.className = this._bubbleClass(n);
+        b.style.left = `${pt.x}px`;
+        b.style.top = `${pt.y}px`;
+        b.style.borderColor = border;
+        if (n.kind === 'self' || face) b.style.background = '';
+        else b.style.background = cat.bg;
+        this._paintMeter(b, n);
+        let disk = b.querySelector('.rep-bubble-disk');
+        if (!disk) {
+          disk = document.createElement('span');
+          disk.className = 'rep-bubble-disk';
+          b.appendChild(disk);
         }
-        if (img.getAttribute('src') !== face) img.src = face;
-      } else if (img) {
-        img.remove();
-      }
-      let name = disk.querySelector('.rep-bubble-name');
-      if (!name) {
-        name = document.createElement('span');
-        name.className = 'rep-bubble-name';
-        disk.appendChild(name);
-      }
-      name.textContent = this._bubbleLabel(n).slice(0, 18);
-      let aff = b.querySelector('.rep-affils');
-      const tags = this._tagsFor(n);
-      if (tags.length) {
-        const html = tags.map(t =>
-          `<span class="rep-affil" title="${esc(`${t.label} — ${t.role}`)}">${esc(t.label)}</span>`).join('');
-        if (!aff) {
-          aff = document.createElement('span');
-          aff.className = 'rep-affils';
-          b.appendChild(aff);
+        let img = disk.querySelector('.rep-bubble-face');
+        if (face) {
+          if (!img) {
+            img = document.createElement('img');
+            img.className = 'rep-bubble-face';
+            img.alt = '';
+            disk.prepend(img);
+          }
+          if (img.getAttribute('src') !== face) img.src = face;
+        } else if (img) {
+          img.remove();
         }
-        aff.innerHTML = html;
-      } else if (aff) {
-        aff.remove();
+        let name = disk.querySelector('.rep-bubble-name');
+        if (!name) {
+          name = document.createElement('span');
+          name.className = 'rep-bubble-name';
+          disk.appendChild(name);
+        }
+        name.textContent = this._bubbleLabel(n).slice(0, 18);
+        let aff = b.querySelector('.rep-affils');
+        const tags = this._tagsFor(n);
+        if (tags.length) {
+          const html = tags.map(t =>
+            `<span class="rep-affil" title="${esc(`${t.label} — ${t.role}`)}">${esc(t.label)}</span>`).join('');
+          if (!aff) {
+            aff = document.createElement('span');
+            aff.className = 'rep-affils';
+            b.appendChild(aff);
+          }
+          if (aff.innerHTML !== html) aff.innerHTML = html;
+        } else if (aff) {
+          aff.remove();
+        }
+        b.title = [n.name || 'Notice', ...tags.map(t => `${t.label} — ${t.role}`)].join('\n');
       }
-      b.title = [n.name || 'Notice', ...tags.map(t => `${t.label} — ${t.role}`)].join('\n');
-    }
-    this._fadeWebEdges();
+    });
   }
 
   _fillCard() {
@@ -1681,7 +1790,7 @@ export class ReputationModule extends Module {
     this.saveState();
     this._paintBubbles();
     this._webPan = null;
-    this._sizeWeb();
+    this._sizeWebNow();
     this._fillCard();
     this._syncAuditButton();
   }
@@ -2133,7 +2242,7 @@ export class ReputationModule extends Module {
             ? `<span class="rep-saved-meta" style="color:${info.color}">${esc(info.label)} · ${standing}</span>`
             : (rumors.length ? `<span class="rep-saved-meta">via rumor</span>` : '')}
           ${r.take ? `<span class="rep-saved-take">${esc(r.take)}</span>` : ''}
-          ${rumors.length ? `<span class="rep-saved-meta">${rumors.map(x => `⌘ ${x.name}`).join(' · ')}</span>` : ''}
+          ${rumors.length ? `<span class="rep-saved-meta">${rumors.map(x => `⌘ ${esc(x.name)}`).join(' · ')}</span>` : ''}
         </div>
         ${droppable ? `<button type="button" class="rep-btn small danger" data-action="drop-reading">×</button>` : ''}
       </div>
@@ -2172,12 +2281,12 @@ export class ReputationModule extends Module {
       }, { passive: false });
       web.addEventListener('pointerdown', e => this._onPlaneDown(e, web));
     }
-    requestAnimationFrame(() => {
-      this._sizeWeb();
-      this._applyWebView();
-    });
+    requestAnimationFrame(() => this._sizeWebNow());
     if (web && typeof ResizeObserver !== 'undefined') {
-      this._webRo = new ResizeObserver(() => this._sizeWeb());
+      this._webRo = new ResizeObserver(() => {
+        if (this._webBusy) return;
+        this._sizeWeb();
+      });
       this._webRo.observe(web);
     }
   }
@@ -2410,6 +2519,7 @@ export class ReputationModule extends Module {
         });
       }
       this.saveState();
+      this.bus.emit('reputation.updated', { node });
       this._sizeWeb();
       this._fillCard();
     });
@@ -2420,6 +2530,7 @@ export class ReputationModule extends Module {
       btn.addEventListener('click', () => {
         node.readings = (node.readings ?? []).filter(r => r.targetId !== targetId);
         this.saveState();
+        this.bus.emit('reputation.updated', { node });
         this._sizeWeb();
         this._fillCard();
       });
@@ -2430,9 +2541,25 @@ export class ReputationModule extends Module {
     });
   }
 
-  _refreshWebChrome() {
-    this._paintBubbles();
-    this._sizeWeb();
+  _refreshWebChrome(dragId) {
+    const web = this.container?.querySelector('[data-role="web"]');
+    if (!web) return;
+    this._withWebFrame(() => {
+      const m = this._webMetrics(web);
+      if (dragId) {
+        const n = this._node(dragId);
+        const b = web.querySelector(`.rep-bubble[data-id="${dragId}"]`);
+        if (n && b) {
+          const pt = this._nodePx(n, m);
+          b.style.left = `${pt.x}px`;
+          b.style.top = `${pt.y}px`;
+        }
+      } else {
+        this._placeBubbles(web, m);
+      }
+      const svg = web.querySelector('[data-role="web-svg"]');
+      if (svg) svg.innerHTML = this._svgLines(m);
+    });
   }
 
   /** Drag empty plane to pan. The focused bubble stays the home position for reset. */
@@ -2445,18 +2572,18 @@ export class ReputationModule extends Module {
     const startY = e.clientY;
     web.setPointerCapture?.(e.pointerId);
     web.classList.add('panning');
-    const move = ev => {
+    const move = rafMove(ev => {
       this._webPan = this._clampPan(
         { x: base.x + (ev.clientX - startX), y: base.y + (ev.clientY - startY) },
         this._webMetrics(web),
       );
       this._applyWebView();
-    };
+    });
     const up = () => {
+      move.flush();
       web.classList.remove('panning');
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
-      this._fadeWebEdges();
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -2475,7 +2602,8 @@ export class ReputationModule extends Module {
     const orig = { x: node.x, y: node.y };
     btn.setPointerCapture?.(e.pointerId);
     btn.classList.add('dragging');
-    const move = ev => {
+    this._webBusy = true;
+    const move = rafMove(ev => {
       const rect = web.getBoundingClientRect();
       if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 4) btn.dataset.dragged = '1';
       const z = this._zoomValue();
@@ -2485,9 +2613,11 @@ export class ReputationModule extends Module {
       );
       node.x = next.x;
       node.y = next.y;
-      this._refreshWebChrome();
-    };
+      this._refreshWebChrome(node.id);
+    });
     const up = () => {
+      move.flush();
+      this._webBusy = false;
       btn.classList.remove('dragging');
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
@@ -2525,6 +2655,7 @@ export class ReputationModule extends Module {
       a.links.push(bId);
       b.links.push(aId);
     }
+    this.bus.emit('reputation.updated', { node: a });
   }
 
   _setRumorLink(node, field, id) {
@@ -2612,8 +2743,10 @@ export class ReputationModule extends Module {
 
       const prompt = `You are ${from.name}. Stay in character.\n\n${cardBlock}\n\nHouse affiliations: ${affil}\n\nCredited scenes/cards:\n${sceneBlock}\n\nRecent scene:\n${recent}\n\nSomeone asks: "What do you think of ${to.name}?"\n\nSubject:\n${targetBlock}\n\n${existing?.take ? `Your prior take: ${existing.take}\n` : ''}Answer in at most 3 sentences. No preamble, no quotes around the whole answer, no "As ${from.name}".`;
 
+      const chatToken = getContext()?.chatMetadata ?? null;
       const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
-        generateQuietPrompt({ quietPrompt: prompt, trimToSentence: true })) ?? '').trim();
+        leanQuietGenerate(prompt, { kind: 'voice', fallback: { quietPrompt: prompt, trimToSentence: true } })) ?? '').trim();
+      if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
       if (!response) throw new Error('Empty audit reply.');
       const take = response.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3).join(' ');
       from.readings ??= [];
@@ -2667,8 +2800,10 @@ export class ReputationModule extends Module {
 
       const prompt = `You are the institution "${h.name}"${h.alias ? ` (${h.alias})` : ''}. Speak as the house's collective stance, not as a single person.\n\nDuty / purpose: ${h.duty || 'unstated'}\nAuthority: ${h.authority || 'unstated'}\nApparent head: ${head?.name || 'none named'}\nKnown members:\n${roster}\n\nThe Star ({{user}}):\n${starBlock}\nName on file: ${starName}\n\nCredited scenes/cards involving the Star:\n${sceneBlock}\n\nRecent scene:\n${recent}\n\n${h.opinion ? `Prior institutional take: ${h.opinion}\nPrior standing: ${clamp(h.standing)}\n` : ''}How does this house regard the Star?\n\nReply with JSON only, no markdown:\n{"standing": <integer from -100 to 100>, "take": "<at most 3 sentences>"}\nstanding: -100 infamous/hostile toward the Star, 0 unknown/neutral, 100 celebrated/favored.`;
 
+      const chatToken = getContext()?.chatMetadata ?? null;
       const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
-        generateQuietPrompt({ quietPrompt: prompt, trimToSentence: false })) ?? '').trim();
+        leanQuietGenerate(prompt, { kind: 'voice', fallback: { quietPrompt: prompt, trimToSentence: false } })) ?? '').trim();
+      if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
       if (!response) throw new Error('Empty audit reply.');
       const parsed = parseStandingTake(response);
       if (!parsed.take && parsed.standing == null) throw new Error('Could not read the audit.');
@@ -3225,6 +3360,7 @@ export class ReputationModule extends Module {
         if (this._focusedHouseId === h.id) this._focusedHouseId = null;
         if (this._editingHouseId === h.id) this._editingHouseId = null;
         this.saveState();
+        this.bus.emit('reputation.updated', { house: h });
         this.render(this.container);
       });
       card.querySelector('[data-action="badge-file"]')?.addEventListener('change', e => {

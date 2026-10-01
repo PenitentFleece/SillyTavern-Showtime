@@ -8,6 +8,7 @@ import {
   COMPOSER_FACETS,
   MOOD_KEYS,
   canonicalizeMood,
+  collectMoodPalette,
   emptyFacets,
   flattenFacets,
   normalizeFacets,
@@ -17,6 +18,7 @@ import { sceneCode } from '../../lib/scriptCatalog.js';
 import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
 import { bindLocationCatalogPicker } from '../../lib/locationCatalog.js';
 import { getCastMembers } from '../../lib/castCatalog.js';
+import { rafMove } from '../../lib/uiPerf.js';
 
 const FACETS = COMPOSER_FACETS;
 const TAG_ROLES = [
@@ -132,6 +134,7 @@ export class ComposerModule extends Module {
       queue: { ids: [], loop: true },
       queueHistory: [],
       sceneFacets: emptyFacets(FACETS),
+      customMoods: [],
       spotify: { clientId: '', accessToken: '', refreshToken: '', expiresAt: 0, displayName: '', grantedScope: '' },
     };
   }
@@ -1009,7 +1012,7 @@ export class ComposerModule extends Module {
       ox = rect.left; oy = rect.top;
       e.preventDefault();
     });
-    window.addEventListener('mousemove', e => {
+    const paintDrag = rafMove(e => {
       if (!dragging) return;
       el.style.left = `${ox + (e.clientX - sx)}px`;
       el.style.top = `${oy + (e.clientY - sy)}px`;
@@ -1017,8 +1020,12 @@ export class ComposerModule extends Module {
       el.style.bottom = 'auto';
       clamp();
     });
+    window.addEventListener('mousemove', e => {
+      if (dragging) paintDrag(e);
+    });
     window.addEventListener('mouseup', () => {
       if (!dragging) return;
+      paintDrag.flush();
       dragging = false;
       clamp();
     });
@@ -1052,13 +1059,16 @@ export class ComposerModule extends Module {
     root.querySelector('[data-role="seek"]')?.addEventListener('input', e => {
       this._seekRatio(Number(e.target.value) / 1000);
     });
-    root.querySelector('[data-role="volume"]')?.addEventListener('input', e => {
+    const volEl = root.querySelector('[data-role="volume"]');
+    volEl?.addEventListener('input', e => {
+      // Apply live, but persist only when the drag ends — saving on every
+      // input event puts a settings write in the middle of the gesture.
       this.state.volume = clamp01(Number(e.target.value) / 100);
       if (this._muted && this.state.volume > 0) this._muted = false;
-      this.saveState();
       this._applyVolume();
       this._paintPlayer();
     });
+    volEl?.addEventListener('change', () => this.saveState());
   }
 
   _isPaused() {
@@ -1663,7 +1673,8 @@ export class ComposerModule extends Module {
     if (!state) state = params.get('state') || '';
     const raw = sessionStorage.getItem(SP_PKCE_KEY);
     const url = new URL(location.href);
-    if (url.searchParams.has('code') || url.searchParams.has('state')) {
+    // Only touch the URL for a login Showtime started — other OAuth flows own their params.
+    if (raw && (url.searchParams.has('code') || url.searchParams.has('state'))) {
       url.searchParams.delete('code');
       url.searchParams.delete('state');
       url.searchParams.delete('error');
@@ -2305,9 +2316,37 @@ export class ComposerModule extends Module {
   }
 
   _moodPaletteHTML() {
+    const { keys, custom } = this._knownMoods();
+    const builtin = new Set(MOOD_KEYS.map(k => k.toLowerCase()));
+    const pills = keys.map(k => {
+      const yours = !builtin.has(k.toLowerCase());
+      return `<button type="button" class="cmp-pill facet-mood${yours ? ' is-custom' : ''}" data-mood="${esc(k)}">${esc(k)}</button>`;
+    }).join('');
     return `<div class="cmp-mood-palette" data-role="mood-palette" hidden>
-      ${MOOD_KEYS.map(k => `<button type="button" class="cmp-pill facet-mood" data-mood="${esc(k)}">${esc(k)}</button>`).join('')}
+      ${pills}
+      ${custom.length ? '<span class="cmp-mood-custom-hint">Yours save for reuse</span>' : ''}
     </div>`;
+  }
+
+  _knownMoods() {
+    const extra = [];
+    for (const v of this.state.customMoods || []) extra.push(v);
+    for (const t of this._tracks()) {
+      for (const v of t.keywordFacets?.mood || []) extra.push(v);
+    }
+    for (const v of this.state.sceneFacets?.mood || []) extra.push(v);
+    return collectMoodPalette(extra);
+  }
+
+  _rememberCustomMoods(values = []) {
+    const next = collectMoodPalette([...(this.state.customMoods || []), ...values]).custom;
+    const prev = Array.isArray(this.state.customMoods) ? this.state.customMoods : [];
+    if (next.length === prev.length
+      && next.every((v, i) => v.toLowerCase() === String(prev[i] || '').toLowerCase())) {
+      return;
+    }
+    this.state.customMoods = next;
+    this.saveState();
   }
 
   _locationPickerHTML() {
@@ -2452,6 +2491,7 @@ export class ComposerModule extends Module {
       seen.add(key);
       out.push(v);
     }
+    if (facet === 'mood') this._rememberCustomMoods(out);
     return out;
   }
 
@@ -2974,12 +3014,25 @@ async function fetchOEmbed(url) {
   return null;
 }
 
+const scriptLoads = new Map();
+
 function loadScript(src, ready) {
-  return new Promise((resolve, reject) => {
-    if (ready()) { resolve(); return; }
+  if (ready()) return Promise.resolve();
+  // Repeat calls share one promise, so a second click can't wait for a
+  // 'load' event that already fired.
+  if (scriptLoads.has(src)) return scriptLoads.get(src);
+  const p = new Promise((resolve, reject) => {
     const existing = [...document.scripts].find(s => s.src === src);
     if (existing) {
+      // Tag added outside this loader: it may have loaded already, so poll too.
       existing.addEventListener('load', () => resolve(), { once: true });
+      const started = Date.now();
+      const tick = () => {
+        if (ready()) return resolve();
+        if (Date.now() - started > 15000) return reject(new Error(`Timed out waiting for ${src}`));
+        setTimeout(tick, 100);
+      };
+      tick();
       return;
     }
     const el = document.createElement('script');
@@ -2989,6 +3042,9 @@ function loadScript(src, ready) {
     el.onerror = () => reject(new Error(`Failed to load ${src}`));
     document.head.appendChild(el);
   });
+  scriptLoads.set(src, p);
+  p.catch(() => scriptLoads.delete(src));
+  return p;
 }
 
 function youtubeApiReady() {
@@ -3014,7 +3070,9 @@ function spotifySdkReady() {
 }
 
 function spotifyRedirectUri() {
-  return `${location.origin}/scripts/extensions/third-party/Showtime/spotify-callback.html`;
+  // Resolve from this file's real location: ST names the install folder after
+  // the repo (e.g. SillyTavern-Showtime), so a hard-coded "Showtime" path 404s.
+  return new URL('../../spotify-callback.html', import.meta.url).href;
 }
 
 function randomString(len) {

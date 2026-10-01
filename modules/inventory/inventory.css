@@ -211,7 +211,7 @@ button.inv-audit:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.inv-item-cat, .inv-item-cond {
+.inv-item-cat, .inv-item-cond, .inv-item-fill {
   font-family: var(--st-font-mono);
   font-size: 9px;
   letter-spacing: 0.08em;
@@ -219,6 +219,14 @@ button.inv-audit:disabled {
   color: #f4f1e6;
   padding: 1px 5px;
   flex-shrink: 0;
+}
+.inv-item-fill {
+  text-transform: none;
+  letter-spacing: 0.04em;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .inv-fold {
   flex-shrink: 0;
@@ -469,3 +477,34 @@ button.inv-btn:hover,
 .inv-cat-btn[data-cat="wearable"].on { background: #d4ebe3; border-color: #3d7a68; }
 .inv-cat-btn[data-cat="usable"].on { background: #d4dce8; border-color: #4a5e7a; }
 .inv-cat-btn[data-cat="misc"].on { background: #e4e0d4; border-color: #8a8474; }
+.inv-amount-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.inv-amount-row input[type="number"] {
+  width: 72px;
+  flex: 0 0 auto;
+}
+.inv-amount-row select { flex: 1; min-width: 90px; }
+.inv-amount-slash { color: #6a757c; font-family: var(--st-font-mono); }
+.inv-fill-btn {
+  flex: 1;
+  min-width: 52px;
+  border: 1px solid #8a6a3d;
+  background: rgba(255, 252, 244, 0.7);
+  color: var(--ticket-ink);
+  font-family: var(--st-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 6px 6px;
+  cursor: pointer;
+}
+.inv-fill-btn.on {
+  border-color: #7a1f1f;
+  box-shadow: inset 0 0 0 1px #7a1f1f;
+  font-weight: 700;
+  background: #f6ead0;
+}

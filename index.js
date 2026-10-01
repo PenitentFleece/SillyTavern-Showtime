@@ -7,6 +7,7 @@ import { extension_settings } from '../../../extensions.js';
 import { Storage } from './lib/storage.js';
 import { Bus } from './lib/events.js';
 import { Shell } from './lib/shell.js';
+import { keepScrollAround } from './lib/uiPerf.js';
 
 // Module imports — stubs for now, real implementations added one at a time.
 import { CastModule } from './modules/cast/cast.js';
@@ -20,12 +21,19 @@ import { BackstageModule } from './modules/backstage/backstage.js';
 
 const EXTENSION_NAME = 'Showtime';
 const SP_CALLBACK_KEY = 'showtime_composer_spotify_callback';
+const SP_PKCE_KEY = 'showtime_composer_spotify_pkce';
+
+/** True only while a Spotify login started by Showtime is waiting for its redirect. */
+function spotifyLoginPending() {
+  try { return !!sessionStorage.getItem(SP_PKCE_KEY); } catch { return false; }
+}
 
 function stripOAuthQuery() {
   try {
     const params = new URLSearchParams(location.search);
     if (!params.get('code') && !params.get('state') && !params.get('error')) return;
     if (params.get('source') === 'openrouter') return;
+    if (!spotifyLoginPending()) return;
     const url = new URL(location.href);
     for (const key of ['code', 'state', 'error', 'error_description']) url.searchParams.delete(key);
     history.replaceState({}, '', url.pathname + url.search + url.hash);
@@ -41,6 +49,7 @@ function stashSpotifyQueryIfNeeded() {
     const state = params.get('state');
     if (!code || !state) return;
     if (params.get('source') === 'openrouter') return;
+    if (!spotifyLoginPending()) return;
     sessionStorage.setItem(SP_CALLBACK_KEY, JSON.stringify({
       code,
       state,
@@ -105,6 +114,13 @@ class Showtime {
           instance.init(),
           new Promise(resolve => setTimeout(resolve, 2000)),
         ]);
+        // Full re-renders rebuild the pane; keep list scroll positions across them.
+        // Backstage and Library already restore their own scroll.
+        if (ModCls.id === 'script') {
+          keepScrollAround(instance, '_rerender', (self) => self._panel);
+        } else if (!['backstage', 'library'].includes(ModCls.id)) {
+          keepScrollAround(instance, 'render', (self, args) => args[0] || self.container);
+        }
         this.modules.set(ModCls.id, instance);
         this.shell.registerTab(ModCls, instance);
       } catch (err) {

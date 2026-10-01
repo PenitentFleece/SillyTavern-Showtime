@@ -129,6 +129,14 @@ button.rep-audit:disabled {
   touch-action: none;
 }
 .rep-web.panning { cursor: grabbing; }
+.rep-web::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 48%, transparent 44%, rgba(18, 12, 6, 0.28) 74%, rgba(18, 12, 6, 0.78) 100%);
+}
 .rep-web-world {
   position: absolute;
   left: 0;
@@ -207,6 +215,7 @@ button.rep-audit:disabled {
 }
 .rep-web-svg polygon.rep-arrow.dim { fill-opacity: 0.3; }
 .rep-bubble {
+  contain: layout style;
   appearance: none;
   -webkit-appearance: none;
   position: absolute;
@@ -1170,6 +1179,8 @@ button.rep-audit:disabled {
   padding: 20px 24px;
   width: 380px;
   max-width: 90vw;
+  max-height: 90vh;
+  overflow: auto;
   box-shadow: 0 0 40px rgba(201,162,74,.3);
   font-family: var(--st-font-body);
 }

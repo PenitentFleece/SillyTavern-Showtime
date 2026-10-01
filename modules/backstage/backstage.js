@@ -2,16 +2,18 @@
 // Interview, Peanut Gallery, Stage/Set, and Settings (migrated from Script).
 
 import { getContext, extension_settings } from '../../../../../extensions.js';
-import { getRequestHeaders, saveSettingsDebounced, generateQuietPrompt, generateRaw, eventSource, event_types, extension_prompt_types } from '../../../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types, extension_prompt_types } from '../../../../../../script.js';
 import { power_user } from '../../../../../power-user.js';
 import { Module } from '../../lib/module.js';
-import { getCastMembers, getStarMember, formatDirectorPromptBlock, resolveCastPromptIdentity, listPersonas, PRIORITIES, PRIORITY_DEFAULT_COLORS, getRoleColors, setRoleColor, resetRoleColors, applyRoleColorVars, normalizePlotHook, formatPlotHookLine } from '../../lib/castCatalog.js';
+import { getCastMembers, getStarMember, formatDirectorPromptBlock, resolveCastPromptIdentity, listPersonas, PRIORITIES, PRIORITY_DEFAULT_COLORS, getRoleColors, setRoleColor, resetRoleColors, applyRoleColorVars, normalizePlotHook, formatPlotHookLine, normalizeCastPresence } from '../../lib/castCatalog.js';
 import { getSceneCards, creditedScenes, sceneCode } from '../../lib/scriptCatalog.js';
+import { flattenFacets } from '../../lib/keywordFacets.js';
 import {
   listPlaySecrets,
   knowerLabel,
   standingSubjects,
   standingToward,
+  standingInfo,
   secretsKnownToCharacter,
   secretsAboutCharacter,
   characterHouseIds,
@@ -23,8 +25,39 @@ import {
   clipText,
   haystackLower,
   textMatchesHay,
+  playMessagesSince,
+  smokeChatTrackCuePure,
 } from '../../lib/chatTrack.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
+import { rafMove } from '../../lib/uiPerf.js';
+import { formatChatLine, clipExcerptToLines } from '../../lib/castAudit.js';
+import { parseJsonObject, parseJsonArray, smokeJsonExtractPure } from '../../lib/jsonExtract.js';
+import { leanQuietGenerate, pinnedGenerateRaw, SYSTEM_VOICE } from '../../lib/isolatedGen.js';
+import {
+  locCueHit,
+  knownPlaceRoster,
+  buildLocationDeltaPrompt,
+  parseLocationDelta,
+  applyLocationDelta,
+  dismissUnlisted,
+  forgetUnlisted,
+  dropMatchedUnlisted,
+  syncScriptLibraryUnlisted,
+} from '../../lib/compass/unlisted.js';
+import {
+  hydrateFromDirectorJson,
+  normalizePendingEvent,
+  eventPaperInner,
+  matchCast,
+  firstHookTitle,
+  eventFromLogEntry,
+  EVENT_MODES,
+  DIRECTOR_TAG_FACETS,
+  defaultDirectorSources,
+  mergeDirectorSources,
+  formatDirectorPicksBlock,
+} from '../../lib/directorEvent.js';
+import { createHookFromEvent } from '../../lib/plotHookBridge.js';
 import { getCachedLibraryBooks, listLibraryLeaves, listVisibleLibraryLeaves, clearOrphanTags } from '../../lib/libraryCatalog.js';
 import {
   ensureCompass,
@@ -37,7 +70,9 @@ import {
   setPlaceKind,
   setParent,
   setLocationTags,
+  setPlaceAliases,
   deletePlace,
+  mergePlaces,
   setOrientationNote,
   setPlaceDescription,
   setPlaceExposed,
@@ -63,29 +98,42 @@ import {
   addLink,
   removeLink,
   setLinkExternal,
+  linkWallToRoom,
   setSharedWallStyle,
   alignSuiteWalls,
   clearSuiteVisualAlign,
+  deleteInteriorSharedWall,
+  fuseSuiteRoomsAlongWall,
+  insertSuiteCornerVertices,
+  reshapeSuiteRoomFace,
+  sharedPairForSuiteEdge,
   ensureEdgeLink,
   ensureVerticalLink,
   addOpening,
   updateOpening,
   removeOpening,
   undoLastChange,
+  undoSuiteLastChange,
+  pushSuiteHistory,
+  restoreSuiteWall,
+  joinCollinearSuiteVertex,
+  simplifySuiteRoomFootprint,
+  smokeSuiteWallRestorePure,
   collectActiveLocationTags,
   moveSuiteChild,
   ensureSuiteLayout,
   divideRoom,
+  listSuiteChildren,
 } from '../../lib/compass/state.js';
 import { buildCompassInjection, pickInjectionNames, invalidateRenderCache } from '../../lib/compass/render.js';
 import { registerCompassCommands } from '../../lib/compass/commands.js';
-import { buildSetHtml, buildPlacementHtml, buildPlacementPovPreview } from '../../lib/compass/stageUi.js';
+import { buildSetHtml, buildPlacementHtml, buildPlacementPovPreview, findPlaceForTag, findPlaceByExactName } from '../../lib/compass/stageUi.js';
 import { openCellDialog, openOpeningDialog, openFurnitureDialog, openPieceDialog } from '../../lib/compass/dialogs.js';
-import { applySonarPings, listSonarPingsInPlace, summarizeSonarCheck, sonarFingerprint } from '../../lib/compass/sonar.js';
+import { applySonarPings, listSonarPingsInPlace, summarizeSonarCheck, sonarFingerprint, setSonarExcluded, pinSonarPing, smokeSonarLocationPure } from '../../lib/compass/sonar.js';
 import { auditCompass, applySafeAuditFixes, smokeCompassAuditPure } from '../../lib/compass/audit.js';
-import { COMPASS_VERSION, isVerticalOpeningType, normalizeSuitePose, isLoadableKind, normalizeCell } from '../../lib/compass/schema.js';
+import { COMPASS_VERSION, isVerticalOpeningType, normalizeSuitePose, isSuiteHostKind, isCompassPlaceKind, normalizeCell, PLACE_NEST_PARENTS, PLACE_KIND_SET } from '../../lib/compass/schema.js';
 import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
-import { bindLocationCatalogPicker, formatSceneLocation, mostPreciseGeoName, syncLocationCatalogFromCompass } from '../../lib/locationCatalog.js';
+import { bindLocationCatalogPicker, formatSceneLocation, mostPreciseGeoName, lowestLocationNames, locationKeyFromStored, smokeSceneLocationPure, syncLocationCatalogFromCompass, upsertLocationNode, GROUP_TO_COMPASS, COMPASS_TO_GROUP, findLocationNodeByName, findLocationNodeById, findLocationNodeByPlaceId, collectLocationIdentity, rewriteLocationTagNames, removeLocationNode, mergeLocationNodes, pruneGhostLocationNodes } from '../../lib/locationCatalog.js';
 import {
   defaultTrackers,
   normalizeTrackers,
@@ -100,6 +148,9 @@ import {
   getTimelinePresent,
   normalizeCalendar,
   seasonForMonth,
+  formatTimeKey,
+  shiftPartsByDays,
+  smokeCalendarShiftPure,
 } from '../../lib/calendarTime.js';
 import { buildFloatingClapperHtml, CLAPPER_CSS } from '../../lib/clapperUi.js';
 import { clampFixedElement } from '../../lib/shell.js';
@@ -111,6 +162,7 @@ import {
   pickBackground,
   resolveBackgroundSrc,
   backgroundFallbackSrc,
+  smokeBackgroundPickPure,
 } from '../../lib/backgrounds.js';
 import {
   buildEffectsHtml,
@@ -122,6 +174,8 @@ import {
   syncWeatherAudio,
   resolveSheltered,
   TEST_PRESETS,
+  smokeOverlayWxPure,
+  clampParticleIntensity,
 } from '../../lib/weatherOverlay.js';
 import {
   registerWorldIndexInjection,
@@ -132,6 +186,7 @@ import { collectReelExtras, decorateReel, importReelExtras, isReelPayload } from
 import {
   moveVertex,
   moveEdge,
+  moveEdges,
   translateFootprint,
   resetFootprintRectangle,
   edgeEndpoints,
@@ -145,6 +200,8 @@ import {
   worldToFootprintNorm,
   worldFromNorm,
   nearestFacingEdge,
+  moveFaceVerts,
+  facingEdges,
   smokeAlignSuiteContactPure,
 } from '../../lib/compass/suiteLayout.js';
 import { smokeSuiteFloorplanGlyphs } from '../../lib/compass/dialogs.js';
@@ -272,20 +329,9 @@ const SCAN_FREQ = [
   { id: 'every_n', label: 'Every N messages' },
 ];
 
-const INTRUDE = [
-  { id: 'derail', label: 'Derail', tip: 'Sharp lateral beat that can redirect the scene.' },
-  { id: 'twist', label: 'Twist', tip: 'Reframe what just happened with a coincidence or reveal.' },
-  { id: 'advance', label: 'Advance', tip: 'Nudge the current thread forward one concrete step.' },
-  { id: 'pressure', label: 'Pressure', tip: 'Raise stakes or squeeze a character without a new plotline.' },
-];
-
-const TAG_FACETS = [
-  { id: 'location', label: 'Location' },
-  { id: 'cast', label: 'Cast' },
-  { id: 'item', label: 'Item' },
-  { id: 'time', label: 'Time' },
-  { id: 'mood', label: 'Mood' },
-];
+const INTRUDE = EVENT_MODES;
+const TAG_FACETS = DIRECTOR_TAG_FACETS;
+const DEFAULT_SOURCES = defaultDirectorSources;
 
 const MODULE_LABELS = {
   cast: 'Cast',
@@ -303,21 +349,6 @@ const THEME_PRESETS = [
   { id: 'night', label: 'Night house' },
   { id: 'crimson', label: 'Crimson curtain' },
 ];
-
-const DEFAULT_SOURCES = () => ({
-  tags: true,
-  tagFacets: { location: true, cast: true, item: true, time: true, mood: true },
-  stage: true,
-  inventory: true,
-  inventoryOnPerson: true,
-  inventoryTrunk: true,
-  script: true,
-  scriptStampedLore: false,
-  library: true,
-  reputation: true,
-  motivation: true,
-  events: true,
-});
 
 function ensureShowtimeRoot() {
   if (!extension_settings.showtime) extension_settings.showtime = {};
@@ -345,7 +376,15 @@ export class BackstageModule extends Module {
     this._profiles = [];
     this._profilesLoaded = false;
     this._busy = false;
-    this._prodFolds = new Set(['director', 'events']);
+    this._prodFolds = new Set(['director', 'events', 'set-places']);
+    this._sonarFilter = '';
+    this._sonarView = 'all';
+    this._placesFold = new Set();
+    this._placesFoldUser = false;
+    this._placesEditId = '';
+    this._locTrackPrimed = false;
+    this._locLastCount = 0;
+    this._locBusy = false;
   }
 
   async init() {
@@ -387,6 +426,15 @@ export class BackstageModule extends Module {
         }, 200);
       } catch { /* ignore */ }
     });
+    this.bus?.on('backstage.openEventPaper', () => this._renderEventPaper());
+    this.bus?.on('production.forceDirectorCheck', (payload) => {
+      void this._directorCheck({
+        auto: false,
+        force: true,
+        settings: payload?.settings || null,
+        picks: payload?.picks || null,
+      });
+    });
     this._applyTheme(this._g().theme);
     applyRoleColorVars();
     this._registerInjection();
@@ -411,24 +459,11 @@ export class BackstageModule extends Module {
     if (!this._genBound) {
       this._genBound = true;
       eventSource.on(event_types.GENERATION_STARTED, () => {
-        this._directorArmed = !!(this._db().production?.directorOn && this._db().production?.pendingEvent?.text);
         this._scanChatTrackers({ persist: true });
       });
-      const clearDirector = () => {
-        if (!this._directorArmed) return;
-        this._directorArmed = false;
-        const st = this._db();
-        if (st.production?.pendingEvent) {
-          st.production.pendingEvent = null;
-          this.saveState();
-          this.bus?.emit('showtime.stateChanged');
-        }
-      };
       eventSource.on(event_types.GENERATION_ENDED, () => {
-        clearDirector();
         this._maybeAutoDirector();
       });
-      eventSource.on(event_types.GENERATION_STOPPED, clearDirector);
       // Re-pick stage background / refresh clapper after chat moves.
       const resyncStage = () => {
         try {
@@ -438,9 +473,19 @@ export class BackstageModule extends Module {
           this._syncWeatherOverlay();
         } catch { /* ignore */ }
       };
-      eventSource.on(event_types.MESSAGE_SENT, resyncStage);
+      eventSource.on(event_types.MESSAGE_SENT, () => {
+        resyncStage();
+        this._scheduleLocCadence();
+      });
       eventSource.on(event_types.MESSAGE_RECEIVED, resyncStage);
-      eventSource.on(event_types.CHAT_CHANGED, resyncStage);
+      eventSource.on(event_types.CHAT_CHANGED, () => {
+        this._locTrackPrimed = false;
+        this._locLastCount = 0;
+        clearTimeout(this._locTrackTimer);
+        resyncStage();
+        queueMicrotask(() => this._renderEventPaper());
+      });
+      eventSource.on(event_types.MESSAGE_SWIPED, () => clearTimeout(this._locTrackTimer));
     }
   }
 
@@ -468,8 +513,10 @@ export class BackstageModule extends Module {
         interviewerId: '',
         flippedNote: '',
         notePick: {},
+        noteIdx: 0,
         turns: [],
         startedAt: 0,
+        retry: null,
       },
       peanut: {
         mode: 'recent',
@@ -502,6 +549,7 @@ export class BackstageModule extends Module {
         audit: '',
         motivation: '',
         event: '',
+        interview: '',
       },
       handbookSeen: false,
     };
@@ -510,7 +558,8 @@ export class BackstageModule extends Module {
   _g() {
     const g = this.storage.getGlobal('backstage', this._defaultGlobal());
     g.theme ??= 'paper';
-    g.profiles ??= { audit: '', motivation: '', event: '' };
+    g.profiles ??= { audit: '', motivation: '', event: '', interview: '' };
+    g.profiles.interview ??= '';
     return g;
   }
 
@@ -543,6 +592,8 @@ export class BackstageModule extends Module {
     st.interview.flippedNote ??= '';
     st.interview.interviewerId ??= '';
     st.interview.startedAt ??= 0;
+    st.interview.noteIdx = this._ivNoteIdx(st.interview);
+    st.interview.retry ??= null;
     // Recover mid-session from older saves that had no `active` flag.
     if (st.interview.active == null) {
       st.interview.active = Array.isArray(st.interview.turns) && st.interview.turns.length > 0;
@@ -567,7 +618,7 @@ export class BackstageModule extends Module {
 
   async render(container) {
     this.container = container;
-    if (!this._profilesLoaded || (this._door === 'settings' && !this._profiles.length)) {
+    if (!this._profilesLoaded || ((this._door === 'settings' || this._door === 'interview' || this._door === 'gallery') && !this._profiles.length)) {
       this._profiles = await this._findProfiles();
       this._profilesLoaded = true;
     }
@@ -601,6 +652,9 @@ export class BackstageModule extends Module {
       body: container.querySelector('.bst-body')?.scrollTop ?? 0,
       iv: container.querySelector('[data-role="iv-log"]')?.scrollTop ?? 0,
       pg: container.querySelector('[data-role="pg-log"]')?.scrollTop ?? 0,
+      sonar: container.querySelector('.bst-sonar-body')?.scrollTop
+        ?? container.querySelector('.bst-sonar-list')?.scrollTop ?? 0,
+      places: container.querySelector('.bst-set-index-list')?.scrollTop ?? 0,
       parents,
     };
   }
@@ -620,6 +674,11 @@ export class BackstageModule extends Module {
       if (pg) {
         pg.scrollTop = pinPg ? pg.scrollHeight : (snap.pg || 0);
       }
+      const sonar = container.querySelector('.bst-sonar-body')
+        || container.querySelector('.bst-sonar-list');
+      if (sonar) sonar.scrollTop = snap.sonar || 0;
+      const places = container.querySelector('.bst-set-index-list');
+      if (places) places.scrollTop = snap.places || 0;
       for (const p of snap.parents || []) {
         if (p.el?.isConnected) p.el.scrollTop = p.top;
       }
@@ -713,7 +772,6 @@ export class BackstageModule extends Module {
     const p = st.production;
     const src = p.sources || DEFAULT_SOURCES();
     const facets = src.tagFacets || {};
-    const log = (p.eventLog || []).slice(-8).reverse();
     const director = this._fullCast().find(c => c.priority === 'director');
     const exportMods = Object.entries(MODULE_LABELS).map(([id, label]) =>
       `<label class="bst-check"><input type="checkbox" data-export-mod="${esc(id)}" checked> ${esc(label)}</label>`).join('');
@@ -791,10 +849,34 @@ export class BackstageModule extends Module {
           <button type="button" class="bst-btn gold" data-action="director-check" ${p.directorOn && !this._busy ? '' : 'disabled'}>${this._busy && this._door === 'production' ? 'Rolling…' : 'Run director check'}</button>
           <span class="bst-k">${p.lastCheckAt ? `last check ${new Date(p.lastCheckAt).toLocaleString()}` : 'never checked'}${p.scanFrequency === 'every_n' ? ` · ${p.msgSinceCheck || 0}/${p.scanEveryN || 4} msgs` : ''}</span>
         </div>
-        <div class="bst-chip-row">
-          ${(log.length ? log : [{ text: 'No events yet — flip the switch and run a check.' }]).map(e =>
-            `<span class="bst-chip${e.kind === 'event' ? ' on' : ''}">${esc(e.text || e)}</span>`).join('')}
-        </div>`;
+        ${(() => {
+          const pending = normalizePendingEvent(p.pendingEvent);
+          if (!pending) return '';
+          return `<div class="bst-event-floor">
+            <span>Event on the floor</span>
+            <strong>${esc(clipText(pending.text, 120))}</strong>
+            <button type="button" class="bst-btn gold" data-action="event-paper-open">Open</button>
+          </div>`;
+        })()}
+        ${(() => {
+          const usable = (p.eventLog || [])
+            .map((e, i) => ({ e, i }))
+            .filter(({ e }) => e.kind === 'event')
+            .slice(-8)
+            .reverse();
+          if (!usable.length) {
+            return `<p class="bst-hint">No events yet — flip the switch and run a check.</p>`;
+          }
+          return `<div class="bst-chip-row">
+            ${usable.map(({ e, i }) => {
+              const playable = !!(e.event || eventFromLogEntry(e) || e.uid);
+              return `<button type="button" class="bst-chip on${playable ? '' : ' is-static'}"
+                data-action="${playable ? 'event-log-open' : ''}" data-idx="${i}"
+                title="${playable ? 'Open this beat' : ''}">${esc(e.text || e)}</button>`;
+            }).join('')}
+            <button type="button" class="bst-btn" data-action="event-log-clear" title="Clear the event log">Clear log</button>
+          </div>`;
+        })()}`;
 
     const databankBody = `
         <p class="bst-hint">A <strong>Reel</strong> is a portable copy of this production — pick which tabs travel with it, then import the same file into another chat. Live data sits in this chat’s metadata (not a separate folder).</p>
@@ -886,7 +968,7 @@ export class BackstageModule extends Module {
                 <p class="bst-event-sum">${esc(String(ev.summary || ev.content || '').slice(0, 220))}</p>
                 ${credits ? `<div class="bst-k">Cast · ${esc(credits)}${(ev.credits || []).length > 4 ? '…' : ''}</div>` : ''}
                 <div class="bst-row bst-event-actions">
-                  <button type="button" class="bst-btn" data-action="event-cue" data-uid="${esc(ev.uid)}" title="Arm Director inject for next generation">Cue now</button>
+                  <button type="button" class="bst-btn" data-action="event-cue" data-uid="${esc(ev.uid)}" title="Open as a Director event card">Cue now</button>
                   <button type="button" class="bst-btn" data-action="event-pitch" data-uid="${esc(ev.uid)}" ${this._busy ? 'disabled' : ''}>Pitch cast</button>
                   <button type="button" class="bst-btn" data-action="event-jump" data-uid="${esc(ev.uid)}">Jump / skip</button>
                   <button type="button" class="bst-btn" data-action="event-pin" data-uid="${esc(ev.uid)}">${ev.pinned ? 'Unpin' : 'Pin inject'}</button>
@@ -1106,6 +1188,7 @@ JSON:`;
         text: `HOLIDAY — ${title}${when ? ` @ ${when}` : ''}`,
         at: Date.now(),
         uid: card.uid,
+        eventUid: card.uid,
       });
       if ((st.production.eventLog || []).length > 40) st.production.eventLog = st.production.eventLog.slice(-40);
       this.saveState();
@@ -1203,23 +1286,31 @@ JSON:`;
       String(card.summary || card.content || '').replace(/\s+/g, ' ').slice(0, 420),
       credits ? `Expected: ${credits}.` : '',
     ].filter(Boolean).join(' ');
-    st.production.pendingEvent = {
-      text: text.slice(0, 600),
-      tags: (card.tags || []).filter(t => t !== 'showtime-event').slice(0, 8),
-      at: Date.now(),
-      eventUid: uid,
-    };
     (st.production.eventLog ??= []).push({
       kind: 'event',
       text: `CUED — ${card.title}`,
       at: Date.now(),
+      event: {
+        text: text.slice(0, 600),
+        tags: (card.tags || []).filter(t => t !== 'showtime-event').slice(0, 8),
+        at: Date.now(),
+        eventUid: uid,
+        jumpMode: 'Cue',
+        castId: this._castIdFromEventCard(card),
+      },
+      uid,
     });
     if (st.production.queueComposer) {
       this.bus?.emit('composer.queueAudit', { reason: 'director-event', event: text });
     }
-    this.saveState();
-    this.bus?.emit('showtime.stateChanged');
-    this.render(this.container);
+    this._presentDirectorEvent({
+      text: text.slice(0, 600),
+      tags: (card.tags || []).filter(t => t !== 'showtime-event').slice(0, 8),
+      at: Date.now(),
+      eventUid: uid,
+      jumpMode: 'Cue',
+      castId: this._castIdFromEventCard(card),
+    });
   }
 
   _toggleEventPin(uid) {
@@ -1239,7 +1330,7 @@ JSON:`;
     overlay.innerHTML = `
       <div class="bst-dialog" role="dialog" aria-label="Jump to event">
         <div class="bst-dialog-h">Jump / skip → ${esc(card.title || 'Event')}</div>
-        <p class="bst-hint">Director writes a bridge into chat context for the next generation. Pick how hard to cut.</p>
+        <p class="bst-hint">Director writes a bridge, then opens it as an event card to Play, file, or dismiss. Pick how hard to cut.</p>
         <div class="bst-field"><span>Mode</span>
           <label class="bst-radio"><input type="radio" name="bst-jump-mode" value="timeskip" checked> Timeskip — generate a time jump toward this event</label>
           <label class="bst-radio"><input type="radio" name="bst-jump-mode" value="transition"> Transition — soft plot/scene handoff</label>
@@ -1250,7 +1341,7 @@ JSON:`;
           <label class="bst-check"><input type="checkbox" data-j="library" checked> Pull Library / event tags</label>
           <label class="bst-check"><input type="checkbox" data-j="cast" checked> Include credited cast</label>
           <label class="bst-check"><input type="checkbox" data-j="pin"> Pin event for Script injection</label>
-          <label class="bst-check"><input type="checkbox" data-j="cue" checked> Arm as Director cue (next gen)</label>
+          <label class="bst-check"><input type="checkbox" data-j="cue" checked> Present as Director event card</label>
           <label class="bst-check"><input type="checkbox" data-j="composer"> Queue Composer audit</label>
         </div>
         <div class="bst-row" style="margin-top:12px;justify-content:flex-end;gap:8px">
@@ -1326,25 +1417,36 @@ BRIDGE:`;
       if (opts.pin && !card.pinned) script._togglePinned(card);
 
       const st = this._db();
-      if (opts.cue !== false) {
-        st.production.pendingEvent = {
+      (st.production.eventLog ??= []).push({
+        kind: 'event',
+        text: `JUMP:${mode} — ${card.title}`,
+        at: Date.now(),
+        event: opts.cue !== false ? {
           text: `[${mode}] ${bridge}`.slice(0, 600),
           tags: [mode, ...(card.tags || [])].filter(Boolean).slice(0, 8),
           at: Date.now(),
           eventUid: uid,
           jumpMode: mode,
-        };
-      }
-      (st.production.eventLog ??= []).push({
-        kind: 'event',
-        text: `JUMP:${mode} — ${card.title}`,
-        at: Date.now(),
+          castId: this._castIdFromEventCard(card),
+        } : null,
+        uid,
       });
       if (opts.composer || st.production.queueComposer) {
         this.bus?.emit('composer.queueAudit', { reason: 'event-jump', event: bridge, mode });
       }
-      this.saveState();
-      this.bus?.emit('showtime.stateChanged');
+      if (opts.cue !== false) {
+        this._presentDirectorEvent({
+          text: `[${mode}] ${bridge}`.slice(0, 600),
+          tags: [mode, ...(card.tags || [])].filter(Boolean).slice(0, 8),
+          at: Date.now(),
+          eventUid: uid,
+          jumpMode: mode,
+          castId: this._castIdFromEventCard(card),
+        });
+      } else {
+        this.saveState();
+        this.bus?.emit('showtime.stateChanged');
+      }
     } catch (err) {
       console.error('[Backstage event jump]', err);
       alert(`Jump failed: ${err.message || err}`);
@@ -1352,6 +1454,167 @@ BRIDGE:`;
       this._busy = false;
       if (this._door === 'production' && this.container) this.render(this.container);
     }
+  }
+
+  _castIdFromEventCard(card) {
+    for (const credit of card?.credits || []) {
+      const rec = matchCast(this.storage, credit.characterId || credit.name);
+      if (rec) return rec.id;
+    }
+    return '';
+  }
+
+  _eventPaperRoot() {
+    return document.getElementById('bst-event-paper-root');
+  }
+
+  _ensureEventPaper() {
+    let root = this._eventPaperRoot();
+    if (root) return root;
+    root = document.createElement('div');
+    root.id = 'bst-event-paper-root';
+    root.className = 'bst-event-backdrop';
+    root.hidden = true;
+    root.setAttribute('aria-hidden', 'true');
+    root.innerHTML = `<div class="bst-event-paper" role="dialog" aria-label="Director event"></div>`;
+    root.addEventListener('click', (e) => {
+      if (e.target === root) {
+        this._hideEventPaper();
+        return;
+      }
+      const act = e.target.closest('[data-action]');
+      if (!act || !root.contains(act)) return;
+      const action = act.dataset.action;
+      if (action === 'event-paper-dismiss') this._dismissDirectorEvent();
+      else if (action === 'event-paper-hook') this._fileDirectorEventHook();
+      else if (action === 'event-paper-play') this._playDirectorEvent();
+    });
+    root.addEventListener('change', (e) => {
+      if (e.target?.dataset?.role !== 'event-cast') return;
+      this._setEventCast(e.target.value);
+      const play = root.querySelector('[data-action="event-paper-play"]');
+      if (play) play.disabled = !e.target.value;
+    });
+    document.body.appendChild(root);
+    return root;
+  }
+
+  _renderEventPaper() {
+    const ev = normalizePendingEvent(this._db().production?.pendingEvent);
+    const root = this._ensureEventPaper();
+    const paper = root.querySelector('.bst-event-paper');
+    if (!ev) {
+      this._hideEventPaper();
+      if (paper) paper.innerHTML = '';
+      return;
+    }
+    if (paper) paper.innerHTML = eventPaperInner(this.storage, ev);
+    root.hidden = false;
+    root.setAttribute('aria-hidden', 'false');
+  }
+
+  _hideEventPaper() {
+    const root = this._eventPaperRoot();
+    if (!root) return;
+    root.hidden = true;
+    root.setAttribute('aria-hidden', 'true');
+  }
+
+  _presentDirectorEvent(raw, { notice = true } = {}) {
+    const st = this._db();
+    const next = normalizePendingEvent(raw);
+    st.production.pendingEvent = next;
+    this.saveState();
+    this.bus?.emit('showtime.stateChanged');
+    if (notice && next) {
+      this.bus?.emit('showtime.notice', {
+        kind: 'director',
+        items: [{ text: clipText(next.text, 80), mark: '!' }],
+      });
+    }
+    this._renderEventPaper();
+    if (this._door === 'production' && this.container) this.render(this.container);
+  }
+
+  _setEventCast(castId) {
+    const st = this._db();
+    const ev = normalizePendingEvent(st.production?.pendingEvent);
+    if (!ev) return;
+    ev.castId = matchCast(this.storage, castId)?.id || '';
+    st.production.pendingEvent = ev;
+    this.saveState();
+  }
+
+  _dismissDirectorEvent() {
+    const st = this._db();
+    if (st.production) st.production.pendingEvent = null;
+    this.saveState();
+    this.bus?.emit('showtime.stateChanged');
+    this._hideEventPaper();
+    if (this._door === 'production' && this.container) this.render(this.container);
+  }
+
+  _openEventFromLog(idx) {
+    const entry = (this._db().production?.eventLog || [])[idx];
+    if (!entry) return;
+    const ev = eventFromLogEntry(entry);
+    if (ev) {
+      this._presentDirectorEvent(ev, { notice: false });
+      return;
+    }
+    const uid = String(entry.uid || entry.eventUid || '').trim();
+    if (uid) return this._cueEventNow(uid);
+  }
+
+  _clearEventLog() {
+    const st = this._db();
+    st.production.eventLog = [];
+    this.saveState();
+    this.bus?.emit('showtime.stateChanged');
+    if (this._door === 'production' && this.container) this.render(this.container);
+  }
+
+  _fileDirectorEventHook() {
+    const st = this._db();
+    const ev = normalizePendingEvent(st.production?.pendingEvent);
+    if (!ev) return;
+    const sel = this._eventPaperRoot()?.querySelector('[data-role="event-cast"]')?.value;
+    const rec = matchCast(this.storage, sel || ev.castId);
+    const result = createHookFromEvent(this.storage, {
+      name: firstHookTitle(ev.text),
+      description: ev.text,
+      assignedTo: rec?.id || ev.castId || '',
+    });
+    if (!result.hooked) {
+      alert(result.reason === 'no-director'
+        ? 'Add a Director cast card first.'
+        : 'Could not file a plot hook.');
+      return;
+    }
+    (st.production.eventLog ??= []).push({
+      kind: 'event',
+      text: `HOOK — ${result.hook.name}`,
+      at: Date.now(),
+      event: ev,
+    });
+    this.bus?.emit('cast.updated');
+    this.bus?.emit('motivation.updated');
+    this._dismissDirectorEvent();
+  }
+
+  _playDirectorEvent() {
+    const st = this._db();
+    const ev = normalizePendingEvent(st.production?.pendingEvent);
+    if (!ev) return;
+    const sel = this._eventPaperRoot()?.querySelector('[data-role="event-cast"]')?.value;
+    const rec = matchCast(this.storage, sel || ev.castId);
+    if (!rec) {
+      alert('Pick a cast member to play this event.');
+      return;
+    }
+    const text = ev.text;
+    this._dismissDirectorEvent();
+    this.bus?.emit('cast.playDirectorEvent', { castId: rec.id, text });
   }
 
   // ── Interview ──────────────────────────────────────────────────────────────
@@ -1457,9 +1720,15 @@ BRIDGE:`;
           <button type="button" class="bst-btn danger" data-action="interview-end" title="File transcript to the subject, then leave">End &amp; file</button>
         </div>
         <p class="bst-hint">Cast replies omit their name in the transcript — the whole desk is already theirs. Ending files the session under Motivation → Interviews.</p>
+        <div class="bst-row" style="margin-top:8px">
+          <label class="bst-field" style="flex:1;margin:0">
+            <span>Interview model</span>
+            <select data-g="profile-interview">${this._profileOpts(this._g().profiles.interview)}</select>
+          </label>
+        </div>
       </section>
 
-      <div class="bst-stage">
+      <div class="bst-stage bst-stage--interview">
         <div class="bst-transcript" data-role="iv-log">
           ${turns.length
             ? turns.map(t => {
@@ -1475,16 +1744,50 @@ BRIDGE:`;
             : `<div class="bst-empty">Flip a notecard or type a free question.</div>`}
         </div>
 
+        ${iv.retry?.question ? `
+        <div class="bst-iv-retry">
+          <span>Technical difficulties! Repeat the question?</span>
+          <button type="button" class="bst-btn gold" data-action="iv-retry" ${this._busy ? 'disabled' : ''}>Repeat</button>
+          <button type="button" class="bst-btn" data-action="iv-retry-dismiss">Dismiss</button>
+        </div>` : ''}
+
         <div class="bst-ask-label">Ask about…</div>
-        <div class="bst-notecards">
-          ${NOTECARDS.map(card => this._noteCardHTML(card, flipped, subject, iv)).join('')}
-        </div>
+        ${this._interviewAlbumHTML(iv, flipped, subject)}
 
         <div class="bst-row">
           <input class="bst-input" style="flex:1" data-role="iv-line" placeholder="Or type a free question…" ${subject && !this._busy ? '' : 'disabled'}>
           <button type="button" class="bst-btn gold" data-action="iv-send" ${subject && !this._busy ? '' : 'disabled'}>${this._busy ? '…' : 'Ask'}</button>
         </div>
         <p class="bst-hint">Live desk only — Connections may still pick up readings/rumors from Cast asks. Full transcript files when you End.</p>
+      </div>`;
+  }
+
+  _ivNoteIdx(iv) {
+    const n = NOTECARDS.length;
+    let i = Number(iv?.noteIdx);
+    if (!Number.isInteger(i) || i < 0 || i >= n) {
+      const fi = NOTECARDS.findIndex(c => c.id === iv?.flippedNote);
+      i = fi >= 0 ? fi : 0;
+    }
+    return i;
+  }
+
+  _interviewAlbumHTML(iv, flipped, subject) {
+    const n = NOTECARDS.length;
+    const idx = this._ivNoteIdx(iv);
+    const card = NOTECARDS[idx];
+    const openId = flipped === card.id || !flipped ? card.id : '';
+    return `
+      <div class="bst-iv-album">
+        <div class="bst-iv-album-stage">
+          ${this._noteCardHTML(card, openId, subject, iv)}
+        </div>
+        <div class="bst-iv-album-bar">
+          <button type="button" class="bst-btn bst-iv-album-nav" data-action="iv-album-step" data-dir="-1" title="Previous card">‹ Prev</button>
+          <span class="bst-iv-album-mark">${esc(card.label)} · ${idx + 1}/${n}</span>
+          <button type="button" class="bst-btn" data-action="iv-album-shuffle" title="Cycle Props → Fashion → Role → Cast">Shuffle</button>
+          <button type="button" class="bst-btn bst-iv-album-nav" data-action="iv-album-step" data-dir="1" title="Next card">Next ›</button>
+        </div>
       </div>`;
   }
 
@@ -1570,6 +1873,7 @@ BRIDGE:`;
     st.interview.turns = [];
     st.interview.flippedNote = '';
     st.interview.startedAt = 0;
+    st.interview.retry = null;
     this.saveState();
     return void this.render(this.container);
   }
@@ -1605,8 +1909,19 @@ BRIDGE:`;
                   `<option value="${esc(t.id)}" ${t.id === pick.targetId ? 'selected' : ''}>${esc(t.title)}</option>`).join('')}
               </select>
             </label>
-            <button type="button" class="bst-btn gold" data-action="note-ask" data-note="${card.id}"
-              ${disabled || !targets.length ? 'disabled' : ''}>Ask</button>
+            <label class="bst-field bst-note-about-field">
+              <span>About this…</span>
+              <textarea class="bst-note-about" data-note-about="${card.id}" rows="3"
+                placeholder="Your angle, follow-up, or extra prompt…"
+                ${disabled ? 'disabled' : ''}>${esc(pick.about || '')}</textarea>
+            </label>
+            <div class="bst-note-askrow">
+              <button type="button" class="bst-btn gold" data-action="note-ask" data-note="${card.id}"
+                ${disabled || !targets.length ? 'disabled' : ''}>Ask</button>
+              <button type="button" class="bst-btn" data-action="note-ask-about" data-note="${card.id}"
+                title="Ask the stock question, then append your About this… line"
+                ${disabled || !targets.length ? 'disabled' : ''}>About This…</button>
+            </div>
           </div>
         </div>
       </div>`;
@@ -1638,7 +1953,7 @@ BRIDGE:`;
       : 'no supporting cast yet — add cast cards that are not Star/Director';
     return `
       <h2 class="bst-pane-title">Peanut Gallery</h2>
-      <p class="bst-pane-sub">Cast-only commentary — stream chat aesthetic, never the main room. Star and Director stay off the balcony.</p>
+      <p class="bst-pane-sub">Cast-only commentary — stream chat aesthetic, never the main room. Reactions pull stamped lore, tags, and filed connections. Star and Director stay off the balcony.</p>
 
       <div class="bst-pg-toolbar">
         <button type="button" class="bst-btn${focusChat ? ' gold' : ''}" data-action="pg-toggle-focus" title="${focusChat ? 'Show Listen settings' : 'Hide settings and focus the gallery'}">${focusChat ? 'Show settings' : 'Focus gallery'}</button>
@@ -1674,6 +1989,11 @@ BRIDGE:`;
           </label>
         </div>` : ''}
         <div class="bst-row">
+          <label class="bst-field" style="flex:1;margin:0"><span>Model</span>
+            <select data-g="profile-event">${this._profileOpts(this._g().profiles.event)}</select>
+          </label>
+        </div>
+        <div class="bst-row">
           <button type="button" class="bst-btn gold" data-action="listen" ${this._busy ? 'disabled' : ''}>${this._busy && this._door === 'gallery' ? 'Listening…' : 'Listen…'}</button>
           <button type="button" class="bst-btn" data-action="pg-continue" ${this._busy || !active?.comments?.length ? 'disabled' : ''} title="Cast keep talking — roughly twice as many lines, any order">${this._busy && this._door === 'gallery' ? 'Talking…' : 'Continue'}</button>
           <span class="bst-k">${esc(voiceHint)}</span>
@@ -1706,7 +2026,7 @@ BRIDGE:`;
 
   // ── Set / Placement · Room Compass ─────────────────────────────────────────
 
-  _sonarCast() {
+  _sonarCast({ includeWrittenOut = false } = {}) {
     const castMembers = [
       getStarMember(this.storage),
       ...getCastMembers(this.storage).filter(c => c.priority !== 'director'),
@@ -1716,8 +2036,14 @@ BRIDGE:`;
       const key = m.id || m.name;
       if (seen.has(key)) return false;
       seen.add(key);
+      const presence = normalizeCastPresence(m);
+      if (!includeWrittenOut && presence === 'writtenOut') return false;
       return true;
-    }).map(m => ({ id: m.id || m.name, name: m.name }));
+    }).map(m => ({
+      id: m.id || m.name,
+      name: m.name,
+      presence: normalizeCastPresence(m),
+    }));
   }
 
   _scanChatTrackers({ persist = false } = {}) {
@@ -1725,18 +2051,161 @@ BRIDGE:`;
       const st = this._db();
       st.trackers = normalizeTrackers(st.trackers);
       const chat = getContext()?.chat || [];
-      const sonar = this._runSonar(ensureCompass(st), { persist });
-      if (sonar.key && st.trackers.scene && st.trackers.scene.lastLocationKey !== sonar.key) {
-        st.trackers.scene.lastLocationKey = sonar.key;
+      const compass = ensureCompass(st);
+      let ulChanged = false;
+      try { ulChanged = !!syncScriptLibraryUnlisted(compass, this.storage); } catch { /* ignore */ }
+      const sonar = this._runSonar(compass, { persist });
+      const locKey = locationKeyFromStored(sonar.key);
+      if (locKey && st.trackers.scene && locationKeyFromStored(st.trackers.scene.lastLocationKey) !== locKey) {
+        st.trackers.scene.lastLocationKey = locKey;
+        if (st.trackers.scene.trackStar) {
+          this._pushComposerLocation(this._sceneLocationBits(compass, compass.sonar?.lastPlaceId, locKey));
+        }
         if (persist) {
           try { this.saveState(); } catch { /* ignore */ }
         }
-      }
-      const sceneHit = applySceneCuesFromChat(st.trackers.scene, chat);
-      if (persist && sceneHit.changed) {
+      } else if (persist && ulChanged) {
         try { this.saveState(); } catch { /* ignore */ }
       }
+      const cal = normalizeCalendar(this.storage.getChat('script', {})?.settings?.calendar);
+      const sceneHit = applySceneCuesFromChat(st.trackers.scene, chat, { calendar: cal });
+      if (sceneHit.changed && sceneHit.time && Number.isFinite(Number(sceneHit.time.hour))) {
+        this._syncTimelinePresent({
+          hour: Number(sceneHit.time.hour),
+          minute: sceneHit.time.minute,
+        });
+      }
+      if (sceneHit.changed && sceneHit.date) {
+        this._syncTimelinePresent({
+          deltaDays: sceneHit.date.deltaDays,
+          hour: sceneHit.date.hour,
+          parts: sceneHit.date.parts,
+        });
+      }
+      if (persist && (sceneHit.changed || sceneHit.date)) {
+        try {
+          const snap = this._sceneClapSnapshot(st);
+          if (st.trackers.scene.date && snap.date && snap.date !== '—') {
+            st.trackers.scene.lastDateLabel = snap.date;
+          }
+          if (st.trackers.scene.time && snap.time) {
+            st.trackers.scene.lastTimeLabel = snap.time;
+          }
+          this.saveState();
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
+  }
+
+  _openPlaceFloorplanIfNeeded(st, placeId, { force = false } = {}) {
+    const id = String(placeId || '').trim();
+    if (!id) return;
+    this._compassTry(() => {
+      const compass = ensureCompass(st);
+      const place = getPlace(compass, id);
+      if (!place || !isCompassPlaceKind(place.kind)) return;
+      const emptyHost = isSuiteHostKind(place.kind) && !listSuiteChildren(compass, place.id).length;
+      if (!force && !emptyHost) return;
+      if (compass.activeRoomId !== id) loadRoom(compass, id);
+      this._compassSave(st);
+    });
+  }
+
+  _scheduleLocCadence() {
+    clearTimeout(this._locTrackTimer);
+    this._locTrackTimer = setTimeout(() => {
+      this._runLocCadence().catch(err => console.warn('[Showtime/location cadence]', err));
+    }, 1200);
+  }
+
+  async _runLocCadence() {
+    if (this._locBusy) return;
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    if (st.trackers.location?.enabled === false) return;
+    const status = st.trackers.status || {};
+    if (status.cadence === 'manual') return;
+    const chat = getContext()?.chat || [];
+    const n = chat.filter(m => m && !m.is_system).length;
+    const every = status.cadence === 'per_post' ? 1 : Math.max(1, Number(status.everyN) || 4);
+    if (!this._locTrackPrimed) {
+      this._locTrackPrimed = true;
+      this._locLastCount = n;
+      return;
+    }
+    const prev = this._locLastCount || 0;
+    if (n - prev < every) return;
+    const windowRows = playMessagesSince(chat, prev);
+    const windowText = windowRows.map(m => formatChatLine(m, 480)).filter(Boolean).join('\n');
+    this._locLastCount = n;
+    const compass = ensureCompass(st);
+    if (!locCueHit(windowText, compass)) return;
+    const scene = clipExcerptToLines(String(windowText || '').trim(), 1800);
+    if (!scene) return;
+    this._locBusy = true;
+    const chatToken = getContext()?.chatMetadata ?? null;
+    try {
+      const prompt = buildLocationDeltaPrompt(scene, knownPlaceRoster(compass));
+      const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
+        leanQuietGenerate(prompt, { kind: 'filing' })) ?? '').trim();
+      if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
+      const delta = parseLocationDelta(response);
+      if (!delta) return;
+      const applied = applyLocationDelta(compass, this.storage, delta);
+      if (applied.key && st.trackers.scene) {
+        st.trackers.scene.lastLocationKey = locationKeyFromStored(applied.key);
+      }
+      if (applied.changed) {
+        try { this.saveState(); } catch { /* ignore */ }
+      }
+      this._scanChatTrackers({ persist: true });
+      try { this._syncFloatingClapper(); } catch { /* ignore */ }
+      if (this.container && this._door === 'set') this.render(this.container);
+    } finally {
+      this._locBusy = false;
+    }
+  }
+
+  _sceneLocationBits(compass, placeId, fallback = '') {
+    const place = placeId ? getPlace(compass, placeId) : null;
+    const names = lowestLocationNames(compass, place);
+    if (names.length) return names;
+    const key = locationKeyFromStored(fallback);
+    return key ? [key] : [];
+  }
+
+  _syncTimelinePresent({ hour, deltaDays, parts: cueParts, minute } = {}) {
+    const hasHour = Number.isFinite(Number(hour));
+    const days = Math.trunc(Number(deltaDays) || 0);
+    const abs = cueParts && typeof cueParts === 'object' ? cueParts : null;
+    if (!hasHour && !days && !abs) return;
+    try {
+      const script = this.storage.getChat('script', {});
+      script.settings ??= {};
+      const present = script.settings.timelinePresent;
+      if (!present?.parts || typeof present.parts !== 'object') return;
+      const cal = normalizeCalendar(script.settings.calendar);
+      let parts = { ...present.parts };
+      if (days) parts = shiftPartsByDays(parts, days, cal);
+      if (abs) {
+        if (abs.day != null) parts.day = abs.day;
+        if (abs.monthIndex != null) parts.monthIndex = abs.monthIndex;
+        if (abs.year != null) parts.year = abs.year;
+        if (abs.seasonId) parts.seasonId = abs.seasonId;
+        if (abs.seasonPhase) parts.seasonPhase = abs.seasonPhase;
+        if (abs.scale) parts.scale = abs.scale;
+      }
+      if (hasHour) parts.hour = Number(hour);
+      if (Number.isFinite(Number(minute))) parts.minute = Math.max(0, Math.min(59, Number(minute)));
+      present.parts = parts;
+      const key = formatTimeKey(parts, cal);
+      if (key) present.key = key;
+      this.storage.saveChat();
+    } catch { /* ignore */ }
+  }
+
+  _syncTimelineHour(hour) {
+    this._syncTimelinePresent({ hour });
   }
 
   _runSonar(compass, { persist = false } = {}) {
@@ -1744,7 +2213,7 @@ BRIDGE:`;
       const before = sonarFingerprint(compass?.sonar);
       const chat = getContext()?.chat || [];
       const result = applySonarPings(compass, {
-        castMembers: this._sonarCast(),
+        castMembers: this._sonarCast({ includeWrittenOut: true }),
         storage: this.storage,
         chat,
       });
@@ -1771,16 +2240,23 @@ BRIDGE:`;
     }
   }
 
-  _pushComposerLocation(key) {
-    const loc = String(key || '').trim();
-    if (!loc) return;
+  _pushComposerLocation(keys) {
+    const list = [...new Set(
+      (Array.isArray(keys) ? keys : [keys])
+        .map(k => String(k || '').trim())
+        .filter(Boolean)
+        .map(k => locationKeyFromStored(k)),
+    )].filter(Boolean);
+    if (!list.length) return;
     const patch = (composer) => {
       if (!composer || typeof composer !== 'object') return;
       composer.sceneFacets ??= {};
-      const locs = Array.isArray(composer.sceneFacets.location)
-        ? composer.sceneFacets.location.filter(x => String(x).toLowerCase() !== loc.toLowerCase())
-        : [];
-      locs.unshift(loc);
+      let locs = Array.isArray(composer.sceneFacets.location) ? [...composer.sceneFacets.location] : [];
+      locs = locs.filter(x => !String(x || '').includes(','));
+      for (const loc of [...list].reverse()) {
+        locs = locs.filter(x => String(x).toLowerCase() !== loc.toLowerCase());
+        locs.unshift(loc);
+      }
       composer.sceneFacets.location = locs.slice(0, 8);
     };
     try {
@@ -1802,8 +2278,8 @@ BRIDGE:`;
       alert('Select a room on the suite plan, or open a room, then We’re here.');
       return;
     }
-    if (!isLoadableKind(place.kind)) {
-      alert('Pick a room or hall — a unit or building isn’t a standing location.');
+    if (!isCompassPlaceKind(place.kind)) {
+      alert('Pick a room, hall, or building exterior — a unit isn’t a standing location.');
       return;
     }
     let cellId = 'C';
@@ -1812,33 +2288,28 @@ BRIDGE:`;
       loadRoom(compass, place.id);
       this._compassSelCell = cellId;
       const focus = getPlace(compass, this._compassFocusId);
-      if (focus?.kind === 'unit' && place.parentId === focus.id) {
+      if (isSuiteHostKind(focus?.kind) && place.parentId === focus.id) {
         this._suiteHighlightChild = place.id;
       } else if (this._door === 'set' && focus?.id !== place.id && place.parentId) {
         const parent = getPlace(compass, place.parentId);
-        if (parent?.kind === 'unit' && this._compassFocusId === parent.id) {
+        if (isSuiteHostKind(parent?.kind) && this._compassFocusId === parent.id) {
           this._suiteHighlightChild = place.id;
         } else {
           this._compassFocusId = place.id;
         }
-      } else if (focus?.kind !== 'unit') {
+      } else if (!isSuiteHostKind(focus?.kind)) {
         this._compassFocusId = place.id;
       }
       const key = String((place.locationTags || []).find(t => String(t || '').trim()) || place.name || place.id).trim();
-      const label = formatSceneLocation({
-        compass,
-        storage: this.storage,
-        placeId: place.id,
-        key,
-      });
+      const rawKey = mostPreciseGeoName(compass, place) || locationKeyFromStored(key) || place.name;
       st.trackers = normalizeTrackers(st.trackers);
-      st.trackers.scene.lastLocationKey = label;
+      st.trackers.scene.lastLocationKey = rawKey;
       st.trackers.scene.lastClapAt = Date.now();
       compass.sonar = compass.sonar && typeof compass.sonar === 'object' ? compass.sonar : { pings: {} };
       compass.sonar.pings = compass.sonar.pings && typeof compass.sonar.pings === 'object'
         ? compass.sonar.pings
         : {};
-      compass.sonar.lastKey = label;
+      compass.sonar.lastKey = rawKey;
       compass.sonar.lastPlaceId = place.id;
       compass.sonar.lastAt = Date.now();
       const star = getStarMember(this.storage);
@@ -1849,12 +2320,12 @@ BRIDGE:`;
           castId: id,
           placeId: place.id,
           cell: cellId,
-          key: label,
+          key: rawKey,
           at: Date.now(),
           manual: true,
         };
       }
-      this._pushComposerLocation(mostPreciseGeoName(compass, place) || key);
+      this._pushComposerLocation(this._sceneLocationBits(compass, place.id, rawKey));
       this._compassSave(st);
     });
     this._syncStageBackground();
@@ -1872,7 +2343,7 @@ BRIDGE:`;
     if (!this._compassFocusId) this._compassFocusId = compass.activeRoomId || '';
     if (!this._compassSelCell) this._compassSelCell = 'C';
     const focus = getPlace(compass, this._compassFocusId);
-    if (focus?.kind === 'unit') {
+    if (isSuiteHostKind(focus?.kind)) {
       try {
         const { dirty } = ensureSuiteLayout(compass, focus.id);
         if (dirty) this.saveState();
@@ -1898,11 +2369,22 @@ BRIDGE:`;
       selectedEdge: this._suiteSelEdge || null,
       suiteSelEdges: this._suiteSelEdges || [],
       wallLinksOpen: !!(this._prodFolds?.has('set-wall-links')),
-      placesOpen: this._prodFolds?.has('set-places') ? true : null,
+      placesOpen: !!(this._prodFolds?.has('set-places')),
       metaOpen: !!(this._prodFolds?.has('set-focus')),
       sonarNote: sonar.key,
       sonarStatus: sonar.status,
+      sonarCast: this._sonarCast(),
+      lastOpening: this._lastOpening || null,
+      storyFocus: this._suiteStoryFocus === 'lower' ? 'lower' : 'upper',
       auditReport,
+      storage: this.storage,
+      createOpen: !!this._setCreateOpen,
+      sonarFilter: this._sonarFilter || '',
+      sonarView: this._sonarView || 'all',
+      sonarOpen: !!(this._prodFolds?.has('set-sonar')),
+      placesFold: [...(this._placesFold || [])],
+      placesFoldAuto: !this._placesFoldUser,
+      placesEditId: this._placesEditId || '',
       esc,
     });
   }
@@ -1923,7 +2405,10 @@ BRIDGE:`;
       povFacing: this._povFacing || 'N',
       sonarNote: sonar.key,
       sonarStatus: sonar.status,
+      sonarCast: this._sonarCast(),
       sonarReach,
+      sonarFilter: this._sonarFilter || '',
+      sonarView: this._sonarView || 'all',
       esc,
     });
   }
@@ -1949,27 +2434,27 @@ BRIDGE:`;
     // latest message into it — without this, listSonarPingsInPlace below
     // always reads an empty ping table and "star" never shows a position.
     this._runSonar(compass);
-    const active = getActiveRoom(compass);
-    let location = scene.lastLocationKey || '';
+    const trackerPlace = this._trackerPlace(compass, scene);
+    let location = locationKeyFromStored(scene.lastLocationKey)
+      || locationKeyFromStored(compass.sonar?.lastKey)
+      || '';
     let star = '—';
     try {
-      const tags = collectActiveLocationTags(this.storage);
-      if (!location && tags.length) location = tags[0];
-      const pings = active ? listSonarPingsInPlace(compass, active.id) : [];
+      const pings = trackerPlace ? listSonarPingsInPlace(compass, trackerPlace.id) : [];
       const starMember = getStarMember(this.storage) || getCastMembers(this.storage).find(c => c.priority === 'star');
       const starName = starMember?.name || '';
       const hit = pings.find(p => starName && String(p.name).toLowerCase() === starName.toLowerCase())
         || pings[0];
       if (hit) {
-        star = `${hit.name} @ ${hit.cell}${active ? ` · ${active.name}` : ''}`;
-        if (!location) location = active?.locationTags?.[0] || active?.name || location;
+        star = `${hit.name} @ ${hit.cell}${trackerPlace ? ` · ${trackerPlace.name}` : ''}`;
+        if (!location) location = locationKeyFromStored(trackerPlace?.locationTags?.[0] || trackerPlace?.name || location);
       } else if (starName) {
         star = starName;
       }
       location = formatSceneLocation({
         compass,
         storage: this.storage,
-        placeId: compass.sonar?.lastPlaceId || active?.id || '',
+        placeId: trackerPlace?.id || '',
         key: location,
       });
     } catch { /* ignore */ }
@@ -1997,11 +2482,26 @@ BRIDGE:`;
           ? cal.seasons.find(s => s.id === parts.seasonId || s.label.toLowerCase() === String(parts.seasonId).toLowerCase())
           : (parts.monthIndex != null ? seasonForMonth(cal, Number(parts.monthIndex) + 1) : null);
         season = seasonHit?.label || '';
-        if (scene.date) {
+      }
+      if (scene.date) {
+        const absCue = String(scene.lastDateCueSig || '').startsWith('absolute');
+        if (absCue && scene.lastDateLabel) {
+          dateLabel = scene.lastDateLabel;
+        } else if (parts) {
           dateLabel = formatSceneDate(parts, cal, scene.dateParts) || dateLabel;
         }
-        if (scene.time && parts.hour != null && Number.isFinite(Number(parts.hour))) {
-          timeLabel = formatTrackerTimeFromHour(scene.timeMode, parts.hour, cal.hoursPerDay) || timeLabel;
+      }
+      if (scene.time) {
+        let hour = null;
+        // Posted clock in chat wins over a stale Script present hour.
+        if (scene.lastTimeHour != null && Number.isFinite(Number(scene.lastTimeHour))) {
+          hour = Number(scene.lastTimeHour);
+        } else if (parts && Number.isFinite(Number(parts.hour))) {
+          hour = Number(parts.hour);
+        }
+        if (hour != null) {
+          const minute = Number(scene.lastTimeMinute) || 0;
+          timeLabel = formatTrackerTimeFromHour(scene.timeMode, hour, cal.hoursPerDay, minute) || timeLabel;
         }
       }
     } catch { /* ignore */ }
@@ -2028,7 +2528,11 @@ BRIDGE:`;
   }
 
   _compassSave(st) {
-    try { syncLocationCatalogFromCompass(this.storage, ensureCompass(st)); } catch { /* ignore */ }
+    try {
+      const compass = ensureCompass(st);
+      syncLocationCatalogFromCompass(this.storage, compass);
+      pruneGhostLocationNodes(this.storage, compass);
+    } catch { /* ignore */ }
     invalidateRenderCache();
     this.saveState();
     this.bus?.emit('showtime.stateChanged');
@@ -2050,11 +2554,7 @@ BRIDGE:`;
   _settingsHTML() {
     const g = this._g();
     const root = ensureShowtimeRoot();
-    const profileOpts = (selected) => [
-      `<option value="">— Current (default) —</option>`,
-      ...this._profiles.map(p =>
-        `<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`),
-    ].join('');
+    const profileOpts = (selected) => this._profileOpts(selected);
 
     const tabRows = Object.entries(MODULE_LABELS).map(([id, label]) => {
       const on = root.enabledModules[id] !== false;
@@ -2090,11 +2590,13 @@ BRIDGE:`;
 
       <section class="bst-section">
         <h3 class="bst-section-h">Connection profiles</h3>
-        <p class="bst-hint">Pick which SillyTavern connection profile audits, Motivation, and Director events / Peanut Gallery should use. Script Agent budgets live under Script → Configure.</p>
+        <p class="bst-hint">Pick which SillyTavern connection profile audits, Motivation, interviews, and Director events / Peanut Gallery should use. Script Agent budgets live under Script → Configure.</p>
         <div class="bst-field"><span>Audits (Cast / Inventory / Reputation)</span>
           <select data-g="profile-audit">${profileOpts(g.profiles.audit)}</select></div>
         <div class="bst-field"><span>Motivation (Audit + narrative sonar)</span>
           <select data-g="profile-motivation">${profileOpts(g.profiles.motivation)}</select></div>
+        <div class="bst-field"><span>Interview</span>
+          <select data-g="profile-interview">${profileOpts(g.profiles.interview)}</select></div>
         <div class="bst-field"><span>Director events / Peanut Gallery</span>
           <select data-g="profile-event">${profileOpts(g.profiles.event)}</select></div>
       </section>
@@ -2172,10 +2674,41 @@ BRIDGE:`;
     if (!root) return;
     root.addEventListener('click', e => this._onClick(e));
     root.addEventListener('change', e => this._onChange(e));
+    root.addEventListener('input', e => {
+      if (e.target?.dataset?.role === 'sonar-filter') {
+        this._sonarFilter = e.target.value || '';
+        this._applySonarFilter(root);
+      }
+      if (e.target?.dataset?.fx === 'particleIntensity' && e.target.type === 'range') {
+        const k = e.target.closest('.bst-field')?.querySelector('.bst-k');
+        if (k) k.textContent = `${clampParticleIntensity(e.target.value)}%`;
+      }
+    });
     this._bindFloorplanDrag(root);
     this._bindFloorplanViewport(root);
     this._bindSuiteCanvas(root);
     this._bindLocationTagPickers(root);
+    this._applySonarFilter(root);
+    root.querySelectorAll('.bst-set-fold > summary, .bst-sonar-sum, .bst-places-sum').forEach(sum => {
+      sum.addEventListener('click', (e) => {
+        if (e.target.closest('[data-action="set-open-place"], [data-action="place-open-compass"], [data-action="place-edit"], [data-action="place-edit-save"], [data-action="place-edit-cancel"], [data-action="place-edit-remove"], [data-action="place-edit-merge"], [data-action="place-unlisted-dismiss"], [data-action="set-sonar-check"], [data-action="set-toggle-create"], [data-role="place-edit-kind"], [data-role="place-edit-parent"], [data-role="place-edit-merge"]')) e.preventDefault();
+      });
+    });
+    root.querySelectorAll('details[data-role="places-fold"]').forEach(el => {
+      el.addEventListener('toggle', () => {
+        const id = el.dataset.fold;
+        if (!id) return;
+        this._placesFold ??= new Set();
+        if (!this._placesFoldUser) {
+          this._placesFoldUser = true;
+          root.querySelectorAll('details[data-role="places-fold"]').forEach(d => {
+            if (d.open && d.dataset.fold) this._placesFold.add(d.dataset.fold);
+          });
+        }
+        if (el.open) this._placesFold.add(id);
+        else this._placesFold.delete(id);
+      });
+    });
     root.querySelectorAll('details.bst-fold[data-fold]').forEach(el => {
       el.addEventListener('toggle', () => {
         const id = el.dataset.fold;
@@ -2185,6 +2718,26 @@ BRIDGE:`;
         else this._prodFolds.delete(id);
       });
     });
+  }
+
+  _applySonarFilter(root = this.container) {
+    if (!root) return;
+    const q = String(this._sonarFilter || '').trim().toLowerCase();
+    const view = this._sonarView || 'all';
+    root.querySelectorAll('.bst-sonar-cast').forEach(row => {
+      const name = (row.dataset.name || '').toLowerCase();
+      const presence = row.dataset.presence || 'inPlay';
+      const parked = row.dataset.parked === '1';
+      let on = !q || name.includes(q);
+      if (on && view === 'inPlay') on = presence === 'inPlay';
+      if (on && view === 'absent') on = presence === 'absent';
+      if (on && view === 'parked') on = parked;
+      row.hidden = !on;
+    });
+  }
+
+  _visibleSonarRows(root = this.container) {
+    return [...(root?.querySelectorAll('.bst-sonar-cast:not([hidden])') || [])];
   }
 
   _bindLocationTagPickers(root) {
@@ -2295,14 +2848,15 @@ BRIDGE:`;
       e.preventDefault();
       const start = { x: e.clientX, y: e.clientY, pan: { ...(this._fpPan || { x: 0, y: 0 }) } };
       vp.classList.add('panning');
-      const onMove = (ev) => {
+      const onMove = rafMove((ev) => {
         this._fpPan = {
           x: start.pan.x + (ev.clientX - start.x),
           y: start.pan.y + (ev.clientY - start.y),
         };
         this._fpApplyView();
-      };
+      });
       const onUp = () => {
+        onMove.flush();
         vp.classList.remove('panning');
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
@@ -2355,7 +2909,7 @@ BRIDGE:`;
 
     let dragging = null;
 
-    const onMove = (ev) => {
+    const onMove = rafMove((ev) => {
       if (!dragging) return;
       if (dragging.kind === 'child') {
         const w = clientToWorld(ev);
@@ -2385,19 +2939,39 @@ BRIDGE:`;
         return;
       }
       if (dragging.kind === 'edge') {
+        const distPx = Math.hypot(
+          (ev.clientX || 0) - (dragging.startClientX || 0),
+          (ev.clientY || 0) - (dragging.startClientY || 0),
+        );
+        if (!dragging.moved && distPx < 6) return;
         const w = clientToWorld(ev);
         dragging.moved = true;
-        const dx = w.x - dragging.startWorld.x;
-        const dy = w.y - dragging.startWorld.y;
-        const target = dragging.horiz
-          ? { x: dragging.mid.x, y: dragging.mid.y + dy }
-          : { x: dragging.mid.x + dx, y: dragging.mid.y };
-        const norm = worldToFootprintNorm(target.x, target.y, dragging.room, dragging.pose);
-        const preview = moveEdge(dragging.startFp, dragging.edge, norm.x, norm.y, stepMulFor(ev));
-        const verts = worldPolygon({ ...dragging.room, footprint: preview }, dragging.pose);
+        const extra = (this._suiteSelEdges || [])
+          .filter(e => e.placeId === dragging.childId)
+          .map(e => Number(e.edge));
+        const inSel = extra.includes(dragging.edge);
+        const moveEdges = (inSel && extra.length)
+          ? [...new Set([...extra, dragging.edge])]
+          : [dragging.edge];
+        const unit = Number(dragging.room?.footprint?.unitPerGrid) || 1;
+        const step = (ev.shiftKey || ev.altKey) ? (unit / stepMulFor(ev)) : 0;
+        const verts0 = worldPolygon(dragging.room, dragging.pose);
+        const previewVerts = moveFaceVerts(verts0, dragging.edge, w, {
+          allSelectedEdges: moveEdges,
+          step,
+        });
         const poly = dragging.g?.querySelector('.bst-suite-poly');
-        if (poly) poly.setAttribute('points', projectVerts(verts));
-        dragging.preview = preview;
+        if (poly) poly.setAttribute('points', projectVerts(previewVerts));
+        let outline = svg.querySelector('[data-role="reshape-outline"]');
+        if (!outline) {
+          outline = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+          outline.setAttribute('data-role', 'reshape-outline');
+          outline.setAttribute('class', 'bst-suite-reshape-preview');
+          svg.appendChild(outline);
+        }
+        outline.setAttribute('points', projectVerts(previewVerts));
+        dragging.worldVerts = previewVerts;
+        dragging.worldTarget = w;
         return;
       }
       if (dragging.kind === 'opening') {
@@ -2419,23 +2993,37 @@ BRIDGE:`;
           ghost.setAttribute('visibility', 'visible');
         }
       }
-    };
+    });
 
     const onUp = () => {
       if (!dragging) return;
+      onMove.flush();
       const d = dragging;
       dragging = null;
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       host.classList.remove('dragging');
+      const outline = svg.querySelector('[data-role="reshape-outline"]');
+      if (outline) outline.remove();
       const ghost = svg.querySelector('[data-role="opening-ghost"]');
       if (ghost) ghost.setAttribute('visibility', 'hidden');
       if (d.moved) this._suiteSkipClick = true;
       if (!d.moved) {
         if (d.kind === 'edge') {
           this._suiteSelEdge = { placeId: d.childId, edge: d.edge };
-          // Multi-select (max 2, same room only) for the Divide room flow —
-          // clicking a different room's wall starts a fresh pick.
+          const now = Date.now();
+          const last = this._suiteEdgeClick || {};
+          const dbl = last.placeId === d.childId && last.edge === d.edge && (now - last.at) < 450;
+          this._suiteEdgeClick = { placeId: d.childId, edge: d.edge, at: now };
+          if (dbl) {
+            const face = facingEdges(d.room, d.pose, d.edge);
+            this._suiteSelEdges = face.map(e => ({ placeId: d.childId, edge: e }));
+            this._suiteMode = 'walls';
+            this.render(this.container);
+            return;
+          }
+          // Multi-select on the same room (click to add / toggle). A click on
+          // another room starts a fresh pick. Divide still needs exactly 2.
           const existing = this._suiteSelEdges || [];
           const sameRoom = existing.length && existing[0].placeId === d.childId;
           if (!sameRoom) {
@@ -2443,8 +3031,7 @@ BRIDGE:`;
           } else {
             const idx = existing.findIndex(x => x.edge === d.edge);
             if (idx >= 0) this._suiteSelEdges = existing.filter((_, i) => i !== idx);
-            else if (existing.length < 2) this._suiteSelEdges = [...existing, { placeId: d.childId, edge: d.edge }];
-            else this._suiteSelEdges = [{ placeId: d.childId, edge: d.edge }];
+            else this._suiteSelEdges = [...existing, { placeId: d.childId, edge: d.edge }];
           }
           this._suiteMode = 'walls';
           this.render(this.container);
@@ -2491,8 +3078,16 @@ BRIDGE:`;
         const compass = ensureCompass(st);
         if (d.kind === 'child') {
           moveSuiteChild(compass, d.unitId, d.childId, d.pose, { snap: true });
-        } else if (d.kind === 'edge' && d.preview) {
-          setFootprint(compass, d.childId, d.preview);
+        } else if (d.kind === 'edge' && (d.worldVerts || d.worldTarget)) {
+          reshapeSuiteRoomFace(
+            compass,
+            d.unitId,
+            d.childId,
+            d.edge,
+            d.worldTarget,
+            this._suiteSelEdges,
+            d.worldVerts,
+          );
         } else if (d.kind === 'opening') {
           updateOpening(compass, d.placeId, d.linkId, d.opnId, { along: d.along });
         }
@@ -2564,6 +3159,8 @@ BRIDGE:`;
             g: g || svg.querySelector(`[data-suite-child="${childId}"]`),
             startFp: room.footprint,
             startWorld: clientToWorld(e),
+            startClientX: e.clientX,
+            startClientY: e.clientY,
             mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
             horiz,
             preview: null,
@@ -2576,12 +3173,6 @@ BRIDGE:`;
           return true;
         };
 
-        if (edgeEl && host.contains(edgeEl)) {
-          e.preventDefault();
-          e.stopPropagation();
-          startEdgeDrag(edgeEl.dataset.place || '', Number(edgeEl.dataset.edge), edgeEl.closest('[data-suite-child]'));
-          return;
-        }
         if (sharedEl && host.contains(sharedEl)) {
           e.preventDefault();
           e.stopPropagation();
@@ -2597,8 +3188,31 @@ BRIDGE:`;
           if (!room) return;
           const pose = normalizeSuitePose(unit.suiteLayout?.[childId] || { x: 0, y: 0, rot: 0 });
           const wpt = clientToWorld(e);
-          const edge = nearestFacingEdge(room, pose, wall, wpt.x, wpt.y);
+          const edgeAttr = childId === bId ? sharedEl.dataset.edgeB : sharedEl.dataset.edgeA;
+          const fromAttr = Number(edgeAttr);
+          const edge = Number.isFinite(fromAttr)
+            ? fromAttr
+            : nearestFacingEdge(room, pose, wall, wpt.x, wpt.y);
           startEdgeDrag(childId, edge, svg.querySelector(`[data-suite-child="${childId}"]`));
+          return;
+        }
+        if (edgeEl && host.contains(edgeEl)) {
+          e.preventDefault();
+          e.stopPropagation();
+          const childId = edgeEl.dataset.place || '';
+          const edge = Number(edgeEl.dataset.edge);
+          const pair = sharedPairForSuiteEdge(compass, unitId, childId, edge);
+          if (pair) {
+            this._suiteSelShared = {
+              aId: pair.aId,
+              bId: pair.bId,
+              wallA: pair.wallA,
+              wallB: pair.wallB,
+            };
+          } else {
+            this._suiteSelShared = null;
+          }
+          startEdgeDrag(childId, edge, edgeEl.closest('[data-suite-child]'));
         }
         return;
       }
@@ -2660,7 +3274,7 @@ BRIDGE:`;
       return { x, y };
     };
 
-    const onMove = (ev) => {
+    const onMove = rafMove((ev) => {
       if (!dragging) return;
       const { x, y } = clientToNorm(ev);
       if (dragging.kind === 'room') {
@@ -2728,19 +3342,30 @@ BRIDGE:`;
         const compass = ensureCompass(st);
         const room = getPlace(compass, dragging.placeId);
         if (!room) return;
-        const preview = moveEdge(room.footprint, dragging.edge, x, y);
+        const selected = [...(this._compassSelEdges || [])].map(Number).filter(Number.isFinite);
+        const inSel = selected.includes(dragging.edge);
+        const idxs = (inSel && selected.length)
+          ? [...new Set([...selected, dragging.edge])]
+          : [dragging.edge];
+        const preview = moveEdges(room.footprint, idxs, x, y);
         const { pts } = projectFootprint(preview, FP_SIZE, FP_PAD);
-        const i = dragging.edge;
-        const j = (i + 1) % pts.length;
-        // Update vertex circles
-        const c0 = svg.querySelector(`[data-vert="${i}"]`);
-        const c1 = svg.querySelector(`[data-vert="${j}"]`);
-        if (c0) { c0.setAttribute('cx', String(pts[i].x)); c0.setAttribute('cy', String(pts[i].y)); }
-        if (c1) { c1.setAttribute('cx', String(pts[j].x)); c1.setAttribute('cy', String(pts[j].y)); }
-        dragging.el?.setAttribute('x1', String(pts[i].x));
-        dragging.el?.setAttribute('y1', String(pts[i].y));
-        dragging.el?.setAttribute('x2', String(pts[j].x));
-        dragging.el?.setAttribute('y2', String(pts[j].y));
+        const fill = svg.querySelector('.bst-fp-fill');
+        if (fill && pts.length) {
+          fill.setAttribute('d', pts.map((p, i) => `${i ? 'L' : 'M'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z');
+        }
+        const n = pts.length;
+        for (const i of idxs) {
+          const j = (i + 1) % n;
+          const c0 = svg.querySelector(`[data-vert="${i}"]`);
+          const c1 = svg.querySelector(`[data-vert="${j}"]`);
+          if (c0) { c0.setAttribute('cx', String(pts[i].x)); c0.setAttribute('cy', String(pts[i].y)); }
+          if (c1) { c1.setAttribute('cx', String(pts[j].x)); c1.setAttribute('cy', String(pts[j].y)); }
+        }
+        dragging.el?.setAttribute('x1', String(pts[dragging.edge].x));
+        dragging.el?.setAttribute('y1', String(pts[dragging.edge].y));
+        dragging.el?.setAttribute('x2', String(pts[(dragging.edge + 1) % n].x));
+        dragging.el?.setAttribute('y2', String(pts[(dragging.edge + 1) % n].y));
+        dragging.idxs = idxs;
         return;
       }
       if (dragging.kind === 'draw-wall') {
@@ -2756,10 +3381,11 @@ BRIDGE:`;
           ghost.setAttribute('y2', String(FP_PAD + y * inner));
         }
       }
-    };
+    });
 
     const onUp = () => {
       if (!dragging) return;
+      onMove.flush();
       const d = dragging;
       dragging = null;
       window.removeEventListener('pointermove', onMove);
@@ -2805,7 +3431,8 @@ BRIDGE:`;
         this._compassTry(() => {
           const compass = ensureCompass(st);
           const room = getPlace(compass, d.placeId);
-          setFootprint(compass, d.placeId, moveEdge(room.footprint, d.edge, d.x, d.y));
+          const idxs = Array.isArray(d.idxs) && d.idxs.length ? d.idxs : [d.edge];
+          setFootprint(compass, d.placeId, moveEdges(room.footprint, idxs, d.x, d.y));
           this._compassSave(st);
         });
         return;
@@ -3029,6 +3656,7 @@ BRIDGE:`;
         width: type === 'window' ? 0.16 : (type === 'arch' || type === 'passage' ? 0.2 : 0.14),
         cell: this._compassSelCell || 'C',
       });
+      this._lastOpening = { placeId, linkId: link.id };
       this._compassSave(st);
     });
   }
@@ -3081,6 +3709,7 @@ BRIDGE:`;
         width: type === 'window' ? 0.16 : (type === 'arch' || type === 'passage' ? 0.2 : 0.14),
         cell: 'C',
       });
+      this._lastOpening = { placeId, linkId: link.id };
       this._compassSave(st);
     });
   }
@@ -3142,6 +3771,9 @@ BRIDGE:`;
     this._foldAreaListsOutside(e);
     const act = e.target.closest('[data-action]');
     if (!act) return;
+    if (act.closest('summary.bst-place-drawer-sum') && act.tagName === 'BUTTON') {
+      e.preventDefault();
+    }
     const action = act.dataset.action;
     const st = this._db();
 
@@ -3158,6 +3790,9 @@ BRIDGE:`;
       return void this.render(this.container);
     }
     if (action === 'director-check') return this._directorCheck();
+    if (action === 'event-paper-open') return this._renderEventPaper();
+    if (action === 'event-log-open') return this._openEventFromLog(Number(act.dataset.idx));
+    if (action === 'event-log-clear') return this._clearEventLog();
     if (action === 'event-compose') return this._composeHolidayEvent();
     if (action === 'clear-orphan-tags') return this._clearOrphanTags();
     if (action === 'event-pitch') return this._pitchEventCast(act.dataset.uid);
@@ -3179,13 +3814,33 @@ BRIDGE:`;
       this.saveState();
       return void this.render(this.container);
     }
-    if (action === 'note-ask') {
+    if (action === 'note-ask' || action === 'note-ask-about') {
       if (!st.interview.active) return;
-      return this._interviewNoteAsk(act.dataset.note);
+      return this._interviewNoteAsk(act.dataset.note, { about: action === 'note-ask-about' });
     }
     if (action === 'iv-send') {
       if (!st.interview.active) return;
       return this._interviewFree();
+    }
+    if (action === 'iv-retry') {
+      const retry = st.interview.retry;
+      if (!retry?.question) return;
+      return this._interviewTurn(retry.question, retry.askKind || 'free', retry.meta || {}, { replay: true });
+    }
+    if (action === 'iv-retry-dismiss') {
+      st.interview.retry = null;
+      this.saveState();
+      return void this.render(this.container);
+    }
+    if (action === 'iv-album-step' || action === 'iv-album-shuffle') {
+      if (!st.interview.active) return;
+      const dir = action === 'iv-album-shuffle' ? 1 : (Number(act.dataset.dir) || 1);
+      const n = NOTECARDS.length;
+      const next = (this._ivNoteIdx(st.interview) + dir + n) % n;
+      st.interview.noteIdx = next;
+      st.interview.flippedNote = NOTECARDS[next].id;
+      this.saveState();
+      return void this.render(this.container);
     }
     if (action === 'iv-anon') {
       if (st.interview.active) return;
@@ -3210,7 +3865,9 @@ BRIDGE:`;
       st.interview.active = true;
       st.interview.startedAt = Date.now();
       st.interview.turns = [];
-      st.interview.flippedNote = '';
+      st.interview.noteIdx = 0;
+      st.interview.flippedNote = NOTECARDS[0].id;
+      st.interview.retry = null;
       this.saveState();
       return void this.render(this.container);
     }
@@ -3277,6 +3934,93 @@ BRIDGE:`;
       });
       return void this.render(this.container);
     }
+    if (action === 'sonar-pin' || action === 'sonar-follow') {
+      const castId = act.dataset.cast || '';
+      const member = this._sonarCast().find(m => String(m.id) === String(castId));
+      if (!member) return;
+      if (action === 'sonar-follow' && member.presence === 'absent') return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        if (action === 'sonar-follow') {
+          pinSonarPing(compass, member, {
+            placeId: compass.sonar?.pings?.[castId]?.placeId || '',
+            cell: compass.sonar?.pings?.[castId]?.cell || 'C',
+            locked: false,
+          });
+        } else {
+          const row = this.container.querySelector(`.bst-sonar-cast[data-cast="${CSS.escape(castId)}"]`);
+          const placeId = row?.querySelector('[data-role="sonar-place"]')?.value || '';
+          const cell = row?.querySelector('[data-role="sonar-cell"]')?.value || 'C';
+          pinSonarPing(compass, member, { placeId, cell, locked: true });
+          if (placeId) {
+            try {
+              addOccupant(compass, placeId, { name: member.name, cell, castId: member.id, description: 'parked' });
+            } catch { /* ignore */ }
+          }
+        }
+        this._compassSave(st);
+      });
+      return void this.render(this.container);
+    }
+    if (action === 'sonar-view') {
+      this._sonarView = act.dataset.view || 'all';
+      this._applySonarFilter();
+      return void this.render(this.container);
+    }
+    if (action === 'sonar-bulk') {
+      const bulk = act.dataset.bulk || '';
+      const rows = this._visibleSonarRows();
+      const members = this._sonarCast();
+      const bulkPlace = this.container.querySelector('[data-role="sonar-bulk-place"]')?.value || '';
+      const bulkCell = this.container.querySelector('[data-role="sonar-bulk-cell"]')?.value || 'C';
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const excluded = new Set((compass.sonar?.excludeIds || []).map(String));
+        for (const row of rows) {
+          const id = row.dataset.cast || '';
+          const member = members.find(m => String(m.id) === String(id));
+          if (!member) continue;
+          if (bulk === 'include') setSonarExcluded(compass, id, false);
+          else if (bulk === 'exclude') setSonarExcluded(compass, id, true);
+          else if (bulk === 'park') {
+            const placeId = row.querySelector('[data-role="sonar-place"]')?.value || '';
+            const cell = row.querySelector('[data-role="sonar-cell"]')?.value || 'C';
+            pinSonarPing(compass, member, { placeId, cell, locked: true });
+            if (placeId) {
+              try { addOccupant(compass, placeId, { name: member.name, cell, castId: member.id, description: 'parked' }); } catch { /* ignore */ }
+            }
+          } else if (bulk === 'follow') {
+            if (member.presence === 'absent') continue;
+            pinSonarPing(compass, member, {
+              placeId: compass.sonar?.pings?.[id]?.placeId || '',
+              cell: compass.sonar?.pings?.[id]?.cell || 'C',
+              locked: false,
+            });
+          } else if (bulk === 'place') {
+            if (excluded.has(id)) continue;
+            pinSonarPing(compass, member, { placeId: bulkPlace, cell: bulkCell, locked: true });
+            if (bulkPlace) {
+              try { addOccupant(compass, bulkPlace, { name: member.name, cell: bulkCell, castId: member.id, description: 'parked' }); } catch { /* ignore */ }
+            }
+          }
+        }
+        this._compassSave(st);
+      });
+      return void this.render(this.container);
+    }
+    if (action === 'suite-opn-link') {
+      const pick = this.container.querySelector('[data-role="suite-opn-pick"]')?.value || '';
+      const toPlaceId = this.container.querySelector('[data-role="suite-opn-to"]')?.value || '';
+      const [placeId, linkId] = pick.split('|');
+      if (!placeId || !linkId) { alert('Pick an opening first.'); return; }
+      if (!toPlaceId) { alert('Pick a room to link.'); return; }
+      this._compassTry(() => {
+        linkWallToRoom(ensureCompass(st), placeId, linkId, toPlaceId);
+        this._lastOpening = { placeId, linkId };
+        this._compassSave(st);
+      });
+      return;
+    }
     if (action === 'set-audit') {
       return void this.render(this.container);
     }
@@ -3315,7 +4059,7 @@ BRIDGE:`;
           description,
         });
         this._compassFocusId = room.id;
-        if (room.kind === 'room' || room.kind === 'transitional') {
+        if (isCompassPlaceKind(room.kind)) {
           loadRoom(compass, room.id);
         }
         this._compassSave(st);
@@ -3327,13 +4071,268 @@ BRIDGE:`;
       if (this._compassFocusId !== this._suiteHighlightChild) {
         // Keep highlight only while viewing that child's parent unit
         const place = getPlace(ensureCompass(st), this._compassFocusId);
-        if (place?.kind !== 'unit') this._suiteHighlightChild = '';
+        if (!isSuiteHostKind(place?.kind)) this._suiteHighlightChild = '';
       }
       return void this.render(this.container);
+    }
+    if (action === 'set-toggle-create') {
+      this._setCreateOpen = !this._setCreateOpen;
+      this._prodFolds ??= new Set();
+      if (this._setCreateOpen) this._prodFolds.add('set-places');
+      return void this.render(this.container);
+    }
+    if (action === 'set-open-place') {
+      const placeId = act.dataset.place || '';
+      const tag = String(act.dataset.tag || '').trim();
+      if (placeId) {
+        this._compassFocusId = placeId;
+        this._openPlaceFloorplanIfNeeded(st, placeId);
+        return void this.render(this.container);
+      }
+      if (act.dataset.unlisted === '1') {
+        this._placesEditId = act.dataset.node || '';
+        this._prodFolds ??= new Set();
+        this._prodFolds.add('set-places');
+        this._placesFold ??= new Set();
+        this._placesFold.add('__unlisted');
+        return void this.render(this.container);
+      }
+      let saved = false;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const existing = findPlaceForTag(compass, tag);
+        if (existing) {
+          this._compassFocusId = existing.id;
+          return;
+        }
+        if (!tag) return;
+        const room = createAndStoreRoom(compass, {
+          name: tag,
+          kind: 'room',
+          locationTags: [tag],
+        });
+        this._compassFocusId = room.id;
+        saved = true;
+        this._compassSave(st);
+      });
+      if (!saved) return void this.render(this.container);
+      return;
+    }
+    if (action === 'place-open-compass') {
+      const placeId = act.dataset.place || '';
+      if (!placeId) return;
+      this._compassFocusId = placeId;
+      this._openPlaceFloorplanIfNeeded(st, placeId, { force: true });
+      return void this.render(this.container);
+    }
+    if (action === 'place-edit') {
+      this._placesEditId = act.dataset.node || '';
+      return void this.render(this.container);
+    }
+    if (action === 'place-edit-cancel') {
+      this._placesEditId = '';
+      return void this.render(this.container);
+    }
+    if (action === 'place-edit-save') {
+      const wrap = act.closest('.bst-set-edit') || this.container.querySelector(`.bst-set-edit[data-node="${CSS.escape(act.dataset.node || '')}"]`);
+      const placeId = act.dataset.place || wrap?.dataset.place || '';
+      const oldTag = String(act.dataset.tag || wrap?.dataset.tag || '').trim();
+      const name = String(wrap?.querySelector('[data-role="place-edit-name"]')?.value || '').trim() || oldTag;
+      const kindRaw = String(wrap?.querySelector('[data-role="place-edit-kind"]')?.value || '').trim();
+      const kind = PLACE_KIND_SET.has(kindRaw) ? kindRaw : (GROUP_TO_COMPASS[kindRaw] || '');
+      const aliases = String(wrap?.querySelector('[data-role="place-edit-aliases"]')?.value || '')
+        .split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const allow = PLACE_NEST_PARENTS[kind] || [];
+        let parentId = String(wrap?.querySelector('[data-role="place-edit-parent"]')?.value || '').trim();
+        const parent = parentId ? compass.rooms[parentId] : null;
+        if (!allow.length || !parent || !allow.includes(parent.kind)) parentId = '';
+        const rowName = name || oldTag;
+        let id = '';
+        if (placeId && compass.rooms[placeId]
+          && String(compass.rooms[placeId].name || '').trim().toLowerCase() === rowName.toLowerCase()) {
+          id = placeId;
+        } else {
+          id = findPlaceByExactName(compass, rowName)?.id
+            || findPlaceByExactName(compass, oldTag)?.id
+            || '';
+        }
+        if (id && parentId === id) parentId = '';
+        if (!id && kind && name) {
+          const room = createAndStoreRoom(compass, {
+            name,
+            kind,
+            parentId,
+            locationTags: [name],
+            aliases,
+          });
+          id = room.id;
+          this._compassFocusId = room.id;
+        }
+        if (id) {
+          if (name) renamePlace(compass, id, name);
+          if (kind) setPlaceKind(compass, id, kind);
+          setParent(compass, id, parentId);
+          setPlaceAliases(compass, id, aliases);
+        } else if (oldTag) {
+          const node = findLocationNodeByName(this.storage, oldTag);
+          if (node) {
+            node.name = name || node.name;
+            node.kind = '';
+            node.parentId = '';
+          }
+        }
+        const catalogKind = COMPASS_TO_GROUP[kind] || '';
+        if (kind && name && id) {
+          const parentCat = parentId
+            ? findLocationNodeByName(this.storage, compass.rooms[parentId]?.name)
+            : null;
+          upsertLocationNode(this.storage, {
+            name,
+            kind: catalogKind,
+            parentId: parentCat?.id || '',
+            placeId: id,
+          });
+        }
+        try { pruneGhostLocationNodes(this.storage, compass); } catch { /* ignore */ }
+        try {
+          forgetUnlisted(compass, name);
+          if (oldTag) forgetUnlisted(compass, oldTag);
+          dropMatchedUnlisted(compass, this.storage);
+        } catch { /* ignore */ }
+        this._placesEditId = '';
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'place-unlisted-dismiss') {
+      const tag = String(act.dataset.tag || act.closest('.bst-set-edit')?.dataset.tag || '').trim();
+      if (!tag) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        dismissUnlisted(compass, tag);
+        this._placesEditId = '';
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'place-edit-remove') {
+      const wrap = act.closest('.bst-set-edit') || this.container.querySelector(`.bst-set-edit[data-node="${CSS.escape(act.dataset.node || '')}"]`);
+      const placeId = act.dataset.place || wrap?.dataset.place || '';
+      const nodeId = act.dataset.node || wrap?.dataset.node || '';
+      const tag = String(act.dataset.tag || wrap?.dataset.tag || '').trim();
+      const label = tag || 'this location';
+      if (!confirm(`Remove "${label}" and every Script / Library / Compass tag that names it?\n\nNested places stay and move up one level.`)) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
+        const id = placeId || ident.place?.id || '';
+        if (id && compass.rooms[id]) {
+          deletePlace(compass, id, { reparent: true });
+          if (this._compassFocusId === id) this._compassFocusId = '';
+        }
+        rewriteLocationTagNames(this.storage, compass, { removeKeys: ident.keys });
+        const catNode = ident.node || findLocationNodeById(this.storage, nodeId)
+          || findLocationNodeByPlaceId(this.storage, id)
+          || findLocationNodeByName(this.storage, tag);
+        if (catNode) removeLocationNode(this.storage, catNode.id);
+        this._placesEditId = '';
+        this.storage.saveChat();
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'place-edit-merge') {
+      const wrap = act.closest('.bst-set-edit') || this.container.querySelector(`.bst-set-edit[data-node="${CSS.escape(act.dataset.node || '')}"]`);
+      const placeId = act.dataset.place || wrap?.dataset.place || '';
+      const nodeId = act.dataset.node || wrap?.dataset.node || '';
+      const tag = String(act.dataset.tag || wrap?.dataset.tag || '').trim();
+      const raw = String(wrap?.querySelector('[data-role="place-edit-merge"]')?.value || '').trim();
+      if (!raw) { alert('Pick a location to merge into.'); return; }
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        let targetPlaceId = raw.startsWith('place:') ? raw.slice(6) : '';
+        let targetNodeId = raw.startsWith('node:') ? raw.slice(5) : '';
+        if (targetPlaceId) {
+          const byPlace = findLocationNodeByPlaceId(this.storage, targetPlaceId);
+          if (byPlace) targetNodeId = byPlace.id;
+        } else if (targetNodeId) {
+          const tNode = findLocationNodeById(this.storage, targetNodeId);
+          targetPlaceId = tNode?.placeId || findPlaceForTag(compass, tNode?.name)?.id || '';
+        }
+        const targetPlace = targetPlaceId ? compass.rooms[targetPlaceId] : null;
+        const targetNode = targetNodeId
+          ? findLocationNodeById(this.storage, targetNodeId)
+          : (targetPlace ? findLocationNodeByPlaceId(this.storage, targetPlace.id) || findLocationNodeByName(this.storage, targetPlace.name) : null);
+        const destName = String(targetPlace?.name || targetNode?.name || '').trim();
+        if (!destName) throw new Error('Pick a location to merge into.');
+        const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
+        const sourceId = placeId || ident.place?.id || '';
+        if ((sourceId && targetPlaceId && sourceId === targetPlaceId)
+          || (ident.node && targetNode && ident.node.id === targetNode.id)) {
+          throw new Error('Cannot merge a place into itself.');
+        }
+        if (!confirm(`Merge "${tag || ident.names[0] || 'this location'}" into "${destName}"?\n\nTags, aliases, and nested places move to ${destName}.`)) return;
+        let destId = targetPlaceId;
+        if (!destId && targetNode) {
+          const kind = GROUP_TO_COMPASS[targetNode.kind] || 'room';
+          const room = createAndStoreRoom(compass, {
+            name: destName,
+            kind,
+            locationTags: [destName],
+          });
+          destId = room.id;
+          targetNode.placeId = destId;
+        }
+        if (sourceId && destId && sourceId !== destId && compass.rooms[sourceId]) {
+          mergePlaces(compass, sourceId, destId);
+          if (this._compassFocusId === sourceId) this._compassFocusId = destId;
+        } else if (destId && ident.names.length) {
+          const dest = compass.rooms[destId];
+          if (dest) {
+            const aliases = [...(dest.aliases || [])];
+            for (const n of ident.names) {
+              if (n.toLowerCase() === destName.toLowerCase()) continue;
+              if (!aliases.some(a => String(a).toLowerCase() === n.toLowerCase())) aliases.push(n);
+            }
+            dest.aliases = aliases;
+          }
+        }
+        rewriteLocationTagNames(this.storage, compass, {
+          removeKeys: ident.keys,
+          replaceWith: destName,
+          skipAliasPlaceIds: destId ? [destId] : [],
+        });
+        const destNode = targetNode
+          || findLocationNodeByPlaceId(this.storage, destId)
+          || findLocationNodeByName(this.storage, destName);
+        const srcNode = ident.node || findLocationNodeById(this.storage, nodeId)
+          || findLocationNodeByPlaceId(this.storage, sourceId)
+          || findLocationNodeByName(this.storage, tag);
+        if (srcNode && destNode && srcNode.id !== destNode.id) {
+          mergeLocationNodes(this.storage, srcNode.id, destNode.id);
+          destNode.placeId = destId || destNode.placeId;
+        } else if (srcNode && !destNode) {
+          srcNode.placeId = destId || srcNode.placeId;
+          if (destName) srcNode.name = destName;
+        } else if (srcNode && destNode && srcNode.id === destNode.id) {
+          destNode.placeId = destId || destNode.placeId;
+        }
+        this._placesEditId = '';
+        this.storage.saveChat();
+        this._compassSave(st);
+      });
+      return;
     }
     if (action === 'suite-mode') {
       const mode = act.dataset.mode || 'browse';
       this._suiteMode = ['arrange', 'walls', 'fixtures'].includes(mode) ? mode : 'browse';
+      return void this.render(this.container);
+    }
+    if (action === 'suite-story-focus') {
+      this._suiteStoryFocus = act.dataset.focus === 'lower' ? 'lower' : 'upper';
+      if (act.dataset.unit) this._compassFocusId = act.dataset.unit;
       return void this.render(this.container);
     }
     if (action === 'suite-fixture-act') {
@@ -3375,21 +4374,140 @@ BRIDGE:`;
     }
     if (action === 'suite-shared-style') {
       const sel = this._suiteSelShared;
-      if (!sel?.aId || !sel?.bId) { alert('Select a shared wall first.'); return; }
       const style = act.dataset.style === 'threshold' ? 'threshold' : 'merged';
       const unitId = act.dataset.unit || '';
-      this._compassTry(() => {
+      if (sel?.aId && sel?.bId && style === 'merged') {
         const compass = ensureCompass(st);
-        setSharedWallStyle(compass, sel.aId, sel.bId, sel.wallA, sel.wallB, style);
-        // NOTE: this used to auto-run alignSuiteWalls(unitId) here, but that
-        // welds *every* contacting pair in the suite (not just the wall you
-        // just styled) and can nudge unrelated rooms' real poses just enough
-        // to fall outside contact tolerance — which then makes the layout's
-        // own link cleanup drop *their* shared link outright (e.g. the
-        // bathroom going "solid" or gapping even though you only touched the
-        // kitchenette/living wall). Align is manual (the "Align" button) —
-        // styling a wall should never move rooms on its own.
+        const keepPref = this._suiteHighlightChild;
+        const keepId = keepPref === sel.bId || keepPref === sel.aId ? keepPref : sel.aId;
+        const dropId = keepId === sel.aId ? sel.bId : sel.aId;
+        const keepName = getPlace(compass, keepId)?.name || keepId;
+        const dropName = getPlace(compass, dropId)?.name || dropId;
+        if (!confirm(`Merge "${dropName}" into "${keepName}"?\n\nThey become one room with one arrange handle. "${dropName}" is kept as an alias.`)) return;
+        const ident = collectLocationIdentity(this.storage, compass, { placeId: dropId, name: dropName });
+        this._compassTry(() => {
+          const fused = fuseSuiteRoomsAlongWall(ensureCompass(st), unitId, sel.aId, sel.bId, keepId);
+          const destId = fused?.id || keepId;
+          rewriteLocationTagNames(this.storage, ensureCompass(st), {
+            removeKeys: ident.keys,
+            replaceWith: keepName,
+            skipAliasPlaceIds: destId ? [destId] : [],
+          });
+          const srcNode = ident.node || findLocationNodeByPlaceId(this.storage, dropId)
+            || findLocationNodeByName(this.storage, dropName);
+          const destNode = findLocationNodeByPlaceId(this.storage, destId)
+            || findLocationNodeByName(this.storage, keepName);
+          if (srcNode && destNode && srcNode.id !== destNode.id) {
+            mergeLocationNodes(this.storage, srcNode.id, destNode.id);
+            destNode.placeId = destId || destNode.placeId;
+          } else if (srcNode && !destNode) {
+            srcNode.placeId = destId || srcNode.placeId;
+            if (keepName) srcNode.name = keepName;
+          }
+          this._suiteSelShared = null;
+          this._suiteSelEdge = null;
+          this._suiteSelEdges = [];
+          this._suiteHighlightChild = destId;
+          if (this._compassFocusId === dropId) this._compassFocusId = destId;
+          this.storage.saveChat();
+          this._compassSave(st);
+        });
+        return;
+      }
+      if (sel?.aId && sel?.bId) {
+        this._compassTry(() => {
+          const compass = ensureCompass(st);
+          setSharedWallStyle(compass, sel.aId, sel.bId, sel.wallA, sel.wallB, style);
+          this._compassSave(st);
+        });
+        return;
+      }
+      const edge = this._suiteSelEdge;
+      if (style === 'threshold' && edge?.placeId && Number.isFinite(Number(edge.edge))) {
+        this._compassTry(() => {
+          const compass = ensureCompass(st);
+          pushSuiteHistory(compass, unitId || edge.placeId, 'threshold');
+          addLink(compass, edge.placeId, {
+            edge: Number(edge.edge),
+            external: true,
+            description: 'exterior threshold',
+          });
+          this._compassSave(st);
+        });
+        return;
+      }
+      alert('Select a shared wall first.');
+      return;
+    }
+    if (action === 'suite-delete-shared') {
+      const sel = this._suiteSelShared;
+      if (!sel?.aId || !sel?.bId) { alert('Select an interior shared wall first.'); return; }
+      this._compassTry(() => {
+        deleteInteriorSharedWall(ensureCompass(st), sel.aId, sel.bId, sel.wallA, sel.wallB);
+        this._suiteSelShared = null;
         this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-undo') {
+      const unitId = act.dataset.unit || '';
+      if (!unitId) return;
+      this._compassTry(() => {
+        undoSuiteLastChange(ensureCompass(st), unitId);
+        this._suiteSelShared = null;
+        this._suiteSelEdge = null;
+        this._suiteSelEdges = [];
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-restore-wall') {
+      const sel = this._suiteSelShared;
+      const edge = this._suiteSelEdge;
+      this._compassTry(() => {
+        restoreSuiteWall(ensureCompass(st), {
+          aId: sel?.aId || act.dataset.a || '',
+          bId: sel?.bId || act.dataset.b || '',
+          wallA: sel?.wallA || act.dataset.wallA || '',
+          wallB: sel?.wallB || act.dataset.wallB || '',
+          placeId: edge?.placeId || act.dataset.place || '',
+          edge: Number.isFinite(Number(edge?.edge)) ? Number(edge.edge) : act.dataset.edge,
+        });
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-join-segment') {
+      const placeId = act.dataset.place || this._suiteSelEdge?.placeId || this._suiteSelEdges?.[0]?.placeId || '';
+      const edge = Number.isFinite(Number(act.dataset.edge))
+        ? Number(act.dataset.edge)
+        : (this._suiteSelEdge?.edge ?? this._suiteSelEdges?.[0]?.edge);
+      if (!placeId || !Number.isFinite(Number(edge))) {
+        alert('Click a leftover split segment first.');
+        return;
+      }
+      this._compassTry(() => {
+        joinCollinearSuiteVertex(ensureCompass(st), placeId, edge);
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-clean-vertices') {
+      const placeId = act.dataset.place || this._suiteSelEdge?.placeId || this._suiteHighlightChild || '';
+      if (!placeId) { alert('Click a room (or one of its walls) first.'); return; }
+      this._compassTry(() => {
+        simplifySuiteRoomFootprint(ensureCompass(st), placeId);
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-split-corners') {
+      const unitId = act.dataset.unit || '';
+      if (!unitId) return;
+      this._compassTry(() => {
+        const n = insertSuiteCornerVertices(ensureCompass(st), unitId);
+        this._compassSave(st);
+        if (!n) alert('No corners sitting on another wall — nudge rooms so a corner meets a face, then try again.');
       });
       return;
     }
@@ -3410,6 +4528,21 @@ BRIDGE:`;
         this._compassSave(st);
       });
       return;
+    }
+    if (action === 'suite-select-face') {
+      const edges = this._suiteSelEdges || [];
+      if (!edges.length) { alert('Click a wall first.'); return; }
+      const unitId = act.dataset.unit || '';
+      const compass = ensureCompass(st);
+      const unit = getPlace(compass, unitId);
+      const room = getPlace(compass, edges[0].placeId);
+      if (!unit || !room) return;
+      const pose = normalizeSuitePose(unit.suiteLayout?.[room.id] || { x: 0, y: 0, rot: 0 });
+      const face = facingEdges(room, pose, edges[0].edge);
+      this._suiteSelEdges = face.map(e => ({ placeId: room.id, edge: e }));
+      this._suiteSelEdge = { placeId: room.id, edge: edges[0].edge };
+      this._suiteMode = 'walls';
+      return void this.render(this.container);
     }
     if (action === 'suite-divide-room') {
       const edges = this._suiteSelEdges || [];
@@ -3473,7 +4606,11 @@ BRIDGE:`;
         existing: null,
         onSave: (payload) => {
           this._compassTry(() => {
-            addOpening(ensureCompass(st), placeId, payload.linkId || link.id, payload);
+            const compass = ensureCompass(st);
+            const lid = payload.linkId || link.id;
+            addOpening(compass, placeId, lid, payload);
+            if (payload.toPlaceId) linkWallToRoom(compass, placeId, lid, payload.toPlaceId);
+            this._lastOpening = { placeId, linkId: lid };
             this._compassSave(st);
           });
         },
@@ -3587,13 +4724,19 @@ BRIDGE:`;
           },
           addOpening: (payload) => {
             this._compassTry(() => {
-              addOpening(ensureCompass(st), placeId, payload.linkId, payload);
+              const compass = ensureCompass(st);
+              addOpening(compass, placeId, payload.linkId, payload);
+              if (payload.toPlaceId) linkWallToRoom(compass, placeId, payload.linkId, payload.toPlaceId);
+              this._lastOpening = { placeId, linkId: payload.linkId };
               this._compassSave(st);
             });
           },
           updateOpening: (linkId, openingId, patch) => {
             this._compassTry(() => {
-              updateOpening(ensureCompass(st), placeId, linkId, openingId, patch);
+              const compass = ensureCompass(st);
+              updateOpening(compass, placeId, linkId, openingId, patch);
+              if (patch.toPlaceId) linkWallToRoom(compass, placeId, linkId, patch.toPlaceId);
+              this._lastOpening = { placeId, linkId };
               this._compassSave(st);
             });
           },
@@ -3635,7 +4778,7 @@ BRIDGE:`;
     }
     if (action === 'placement-focus') {
       const placeId = this.container.querySelector('[data-role="placement-place"]')?.value || '';
-      if (!placeId) { alert('Pick a room or hall.'); return; }
+      if (!placeId) { alert('Pick a room, hall, or building exterior.'); return; }
       this._compassFocusId = placeId;
       this._povPreviewText = '';
       return void this.render(this.container);
@@ -3885,7 +5028,11 @@ BRIDGE:`;
         defaultCell: this._compassSelCell || 'C',
         onSave: (payload) => {
           this._compassTry(() => {
-            addOpening(ensureCompass(st), placeId, payload.linkId || link.id, payload);
+            const compass = ensureCompass(st);
+            const lid = payload.linkId || link.id;
+            addOpening(compass, placeId, lid, payload);
+            if (payload.toPlaceId) linkWallToRoom(compass, placeId, lid, payload.toPlaceId);
+            this._lastOpening = { placeId, linkId: lid };
             this._compassSave(st);
           });
         },
@@ -3968,7 +5115,16 @@ BRIDGE:`;
     if (action === 'compass-undo') {
       const place = act.dataset.place || '';
       this._compassTry(() => {
-        undoLastChange(ensureCompass(st), place);
+        const compass = ensureCompass(st);
+        const room = getPlace(compass, place);
+        if (room && isSuiteHostKind(room.kind) && (room.suiteHistory || []).length) {
+          undoSuiteLastChange(compass, place);
+          this._suiteSelShared = null;
+          this._suiteSelEdge = null;
+          this._suiteSelEdges = [];
+        } else {
+          undoLastChange(compass, place);
+        }
         this._compassSave(st);
       });
       return;
@@ -4148,8 +5304,12 @@ BRIDGE:`;
       const preset = TEST_PRESETS[act.dataset.preset];
       if (!preset) return;
       const fx = normalizeEffects(this._db().effects);
-      const sheltered = resolveSheltered(fx, this._activeRoomExposed());
-      paintWeatherOverlay(preset.st, { ...fx, sheltered });
+      const sheltered = preset.sheltered || resolveSheltered(fx, this._activeRoomExposed());
+      paintWeatherOverlay(preset.st, {
+        ...fx,
+        sheltered,
+        candlelight: preset.candlelight ?? fx.candlelight,
+      });
       syncWeatherAudio(preset.st, fx.audio, { sheltered });
       this._wxTestUntil = Date.now() + 12000;
       return;
@@ -4238,6 +5398,7 @@ BRIDGE:`;
 
   _syncFloatingClapper(forceShow = false) {
     this._injectClapperCss();
+    try { this._scanChatTrackers({ persist: false }); } catch { /* ignore */ }
     const st = this._db();
     const scene = normalizeTrackers(st.trackers).scene;
     let root = document.getElementById('st-clapper-float');
@@ -4293,7 +5454,7 @@ BRIDGE:`;
       ox = rect.left; oy = rect.top;
       e.preventDefault();
     });
-    window.addEventListener('mousemove', e => {
+    const paintDrag = rafMove(e => {
       if (!dragging) return;
       root.style.left = `${ox + (e.clientX - sx)}px`;
       root.style.top = `${oy + (e.clientY - sy)}px`;
@@ -4301,8 +5462,12 @@ BRIDGE:`;
       root.style.bottom = 'auto';
       clamp();
     });
+    window.addEventListener('mousemove', e => {
+      if (dragging) paintDrag(e);
+    });
     window.addEventListener('mouseup', () => {
       if (!dragging) return;
+      paintDrag.flush();
       dragging = false;
       clamp();
       const st = this._db();
@@ -4345,8 +5510,11 @@ BRIDGE:`;
 
   _activeRoomExposed() {
     try {
-      const active = getActiveRoom(ensureCompass(this._db()));
-      return active ? !!active.exposed : true;
+      const st = this._db();
+      const compass = ensureCompass(st);
+      const scene = normalizeTrackers(st.trackers).scene;
+      const place = this._trackerPlace(compass, scene) || getActiveRoom(compass);
+      return place ? !!place.exposed : true;
     } catch {
       return true;
     }
@@ -4367,28 +5535,78 @@ BRIDGE:`;
     }
   }
 
+  /** Scene tracker / clapper place — lastLocationKey wins over a stale sonar ping. */
+  _trackerPlace(compass, scene) {
+    const raw = String(scene?.lastLocationKey || compass?.sonar?.lastKey || '').trim();
+    const lastKey = locationKeyFromStored(raw);
+    const unit = (raw.match(/\(([^)]+)\)\s*$/) || [])[1] || '';
+    if (unit) {
+      const unitPlace = findPlaceByExactName(compass, unit);
+      if (unitPlace) {
+        const parent = unitPlace.parentId ? getPlace(compass, unitPlace.parentId) : null;
+        const parentHit = !lastKey || !parent
+          || locationKeyFromStored(parent.name).toLowerCase() === lastKey.toLowerCase()
+          || (parent.locationTags || []).some(t => locationKeyFromStored(t).toLowerCase() === lastKey.toLowerCase())
+          || String(parent.name || '').toLowerCase().includes(lastKey.toLowerCase());
+        if (parentHit || locationKeyFromStored(unitPlace.name).toLowerCase() === lastKey.toLowerCase()) {
+          return unitPlace;
+        }
+      }
+    }
+    if (lastKey) {
+      const tagged = findPlaceForTag(compass, lastKey) || findPlaceByExactName(compass, lastKey);
+      if (tagged) return tagged;
+      const needle = lastKey.toLowerCase();
+      const hit = Object.values(compass?.rooms || {}).find((p) => {
+        try {
+          const formatted = formatSceneLocation({ compass, placeId: p.id });
+          const fk = locationKeyFromStored(formatted).toLowerCase();
+          return fk === needle || formatted.toLowerCase().includes(needle);
+        } catch { return false; }
+      });
+      if (hit) return hit;
+    }
+    const storyPlaceId = String(compass?.sonar?.lastPlaceId || '').trim();
+    return storyPlaceId ? getPlace(compass, storyPlaceId) : null;
+  }
+
   /** Scene context used to auto-select / link backgrounds (place, area, tags). */
   _bgContext() {
     const st = this._db();
     const compass = ensureCompass(st);
-    const active = getActiveRoom(compass);
-    const locationTags = [
-      ...collectActiveLocationTags(this.storage),
-      ...(active?.locationTags || []),
-    ];
+    const scene = normalizeTrackers(st.trackers).scene;
+    const lastRaw = String(scene.lastLocationKey || compass.sonar?.lastKey || '').trim();
+    const lastKey = locationKeyFromStored(lastRaw);
+    const place = this._trackerPlace(compass, scene);
+    const locationTags = [];
+    const seen = new Set();
+    const push = (t) => {
+      const s = String(t || '').trim();
+      if (!s) return;
+      const k = s.toLowerCase();
+      if (seen.has(k)) return;
+      seen.add(k);
+      locationTags.push(s);
+    };
+    push(lastRaw);
+    push(lastKey);
+    const unit = (lastRaw.match(/\(([^)]+)\)\s*$/) || [])[1] || '';
+    if (unit) push(unit);
+    if (place) {
+      push(place.name);
+      (place.locationTags || []).forEach(push);
+      (place.aliases || []).forEach(push);
+      try { lowestLocationNames(compass, place).forEach(push); } catch { /* ignore */ }
+    }
     const narrativeTags = [];
     try {
-      // getChat always returns a truthy object, so never use `|| getGlobal`.
-      // Union chat (soft-sync) + global (Composer UI) scene facets.
       const chatFacets = this.storage.getChat('composer', {})?.sceneFacets || {};
       const globFacets = this.storage.getGlobal('composer', {})?.sceneFacets || {};
-      const seen = new Set();
+      const seenN = new Set();
       for (const list of [
-        ...(chatFacets.location || []),
         ...(chatFacets.mood || []),
         ...(chatFacets.datetime || []),
         ...(chatFacets.characters || []),
-        ...(globFacets.location || []),
         ...(globFacets.mood || []),
         ...(globFacets.datetime || []),
         ...(globFacets.characters || []),
@@ -4396,17 +5614,17 @@ BRIDGE:`;
         const s = String(list || '').trim();
         if (!s) continue;
         const k = s.toLowerCase();
-        if (seen.has(k)) continue;
-        seen.add(k);
+        if (seenN.has(k)) continue;
+        seenN.add(k);
         narrativeTags.push(s);
       }
     } catch { /* ignore */ }
     return {
       locationTags,
       narrativeTags,
-      placeId: active?.id || '',
-      cellId: this._compassSelCell || 'C',
-      placeName: active?.name || '',
+      placeId: place?.id || '',
+      cellId: '',
+      placeName: place?.name || lastKey,
     };
   }
 
@@ -4761,10 +5979,14 @@ BRIDGE:`;
   }
 
   _sceneClap() {
+    try { this._scanChatTrackers({ persist: true }); } catch { /* ignore */ }
     const st = this._db();
     st.trackers = normalizeTrackers(st.trackers);
     const snap = this._sceneClapSnapshot(st);
-    st.trackers.scene.lastLocationKey = snap.location === '—' ? '' : snap.location;
+    const locKey = locationKeyFromStored(st.trackers.scene.lastLocationKey)
+      || locationKeyFromStored(ensureCompass(st).sonar?.lastKey)
+      || locationKeyFromStored(snap.location);
+    st.trackers.scene.lastLocationKey = locKey;
     st.trackers.scene.lastTimeLabel = st.trackers.scene.time
       ? (snap.time || '')
       : '';
@@ -4774,8 +5996,12 @@ BRIDGE:`;
     st.trackers.scene.lastClapAt = Date.now();
     // Soft-sync composer scene location when we have a key
     try {
-      if (st.trackers.scene.trackStar && st.trackers.scene.lastLocationKey) {
-        this._pushComposerLocation(st.trackers.scene.lastLocationKey);
+      if (st.trackers.scene.trackStar && locKey) {
+        this._pushComposerLocation(this._sceneLocationBits(
+          ensureCompass(st),
+          ensureCompass(st).sonar?.lastPlaceId,
+          locKey,
+        ));
       }
     } catch { /* ignore */ }
     this.saveState();
@@ -4812,6 +6038,89 @@ BRIDGE:`;
   _onChange(e) {
     const el = e.target;
     const st = this._db();
+
+    if (el.dataset.g && String(el.dataset.g).startsWith('profile-')) {
+      const slot = el.dataset.g.slice('profile-'.length);
+      this._saveProfileSlot(slot, el.value);
+      return;
+    }
+
+    if (el.dataset.role === 'place-edit-kind') {
+      const wrap = el.closest('.bst-set-edit');
+      const sel = wrap?.querySelector('[data-role="place-edit-parent"]');
+      const allow = PLACE_NEST_PARENTS[el.value] || [];
+      if (sel) {
+        for (const opt of sel.options) {
+          if (!opt.value) {
+            opt.hidden = false;
+            continue;
+          }
+          opt.hidden = !allow.includes(opt.dataset.kind);
+        }
+        if (sel.selectedOptions[0]?.hidden) sel.value = '';
+      }
+      return;
+    }
+
+    if (el.dataset.role === 'set-place-kind') {
+      const placeId = el.dataset.place || '';
+      const tag = String(el.dataset.tag || '').trim();
+      const kind = String(el.value || '').trim();
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        if (placeId) {
+          setPlaceKind(compass, placeId, kind || 'room');
+        } else if (kind) {
+          upsertLocationNode(this.storage, { name: tag, kind });
+          const compassKind = GROUP_TO_COMPASS[kind] || '';
+          const existing = findPlaceForTag(compass, tag);
+          if (existing && compassKind) {
+            setPlaceKind(compass, existing.id, compassKind);
+          } else if (!existing && compassKind && tag) {
+            createAndStoreRoom(compass, {
+              name: tag,
+              kind: compassKind,
+              locationTags: [tag],
+            });
+          }
+        } else if (tag) {
+          const node = findLocationNodeByName(this.storage, tag);
+          if (node) {
+            node.kind = '';
+            node.parentId = '';
+          }
+        }
+        try { syncLocationCatalogFromCompass(this.storage, compass); } catch { /* ignore */ }
+        this._compassSave(st);
+      });
+      return void this.render(this.container);
+    }
+
+    if (el.dataset.role === 'sonar-include') {
+      const castId = el.dataset.cast || '';
+      this._compassTry(() => {
+        setSonarExcluded(ensureCompass(st), castId, !el.checked);
+        this._compassSave(st);
+      });
+      return void this.render(this.container);
+    }
+    if (el.dataset.role === 'sonar-place' || el.dataset.role === 'sonar-cell') {
+      const castId = el.dataset.cast || '';
+      const member = this._sonarCast().find(m => String(m.id) === String(castId));
+      if (!member) return;
+      const row = el.closest('.bst-sonar-cast');
+      const placeId = row?.querySelector('[data-role="sonar-place"]')?.value || '';
+      const cell = row?.querySelector('[data-role="sonar-cell"]')?.value || 'C';
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        pinSonarPing(compass, member, { placeId, cell, locked: true });
+        if (placeId) {
+          try { addOccupant(compass, placeId, { name: member.name, cell, castId: member.id, description: 'parked' }); } catch { /* ignore */ }
+        }
+        this._compassSave(st);
+      });
+      return;
+    }
 
     if (el.dataset.role === 'placement-move-piece') {
       const toCell = el.value;
@@ -4932,6 +6241,10 @@ BRIDGE:`;
         if (el.type === 'checkbox') st.effects[key] = el.checked;
         else if (el.type === 'range' || el.type === 'number') st.effects[key] = Number(el.value);
         else st.effects[key] = el.value;
+        if (key === 'particleIntensity' && el.type === 'range') {
+          const k = el.closest('.bst-field')?.querySelector('.bst-k');
+          if (k) k.textContent = `${clampParticleIntensity(st.effects.particleIntensity)}%`;
+        }
       } else {
         const key = el.dataset.fxManual;
         st.effects.manual ??= normalizeEffects().manual;
@@ -4969,12 +6282,13 @@ BRIDGE:`;
       this.saveState();
       return void this.render(this.container);
     }
-    if (el.dataset.noteQ != null || el.dataset.noteTarget != null) {
-      const noteId = el.dataset.noteQ || el.dataset.noteTarget;
+    if (el.dataset.noteQ != null || el.dataset.noteTarget != null || el.dataset.noteAbout != null) {
+      const noteId = el.dataset.noteQ || el.dataset.noteTarget || el.dataset.noteAbout;
       st.interview.notePick ??= {};
       st.interview.notePick[noteId] ??= {};
       if (el.dataset.noteQ != null) st.interview.notePick[noteId].q = Number(el.value) || 0;
       if (el.dataset.noteTarget != null) st.interview.notePick[noteId].targetId = el.value;
+      if (el.dataset.noteAbout != null) st.interview.notePick[noteId].about = el.value;
       this.saveState();
       return;
     }
@@ -5011,99 +6325,130 @@ BRIDGE:`;
     }
   }
 
-  async _directorCheck({ auto = false } = {}) {
+  async _directorCheck({ auto = false, force = false, settings = null, picks = null } = {}) {
     const st = this._db();
-    if (!st.production.directorOn || this._busy) return;
+    if ((!st.production.directorOn && !force) || this._busy) {
+      if (force && this._busy) alert('Director is already rolling.');
+      return;
+    }
     this._busy = true;
-    if (!auto || this._door === 'production') this.render(this.container);
+    const showProd = this._door === 'production' && this.container;
+    if (showProd) this.render(this.container);
+    const p = st.production;
+    const snap = {
+      sources: mergeDirectorSources(p.sources),
+      intrusiveness: p.intrusiveness,
+      intrudeRandom: !!p.intrudeRandom,
+    };
+    if (settings?.sources) p.sources = mergeDirectorSources({ ...snap.sources, ...settings.sources });
+    if (settings?.intrusiveness) p.intrusiveness = settings.intrusiveness;
+    if (typeof settings?.intrudeRandom === 'boolean') p.intrudeRandom = settings.intrudeRandom;
+    const restoreRun = () => {
+      p.sources = snap.sources;
+      p.intrusiveness = snap.intrusiveness;
+      p.intrudeRandom = snap.intrudeRandom;
+    };
     try {
       const brief = this._directorBrief();
-      const mode = st.production.intrudeRandom
+      const mode = p.intrudeRandom
         ? INTRUDE[Math.floor(Math.random() * INTRUDE.length)]
-        : (INTRUDE.find(i => i.id === st.production.intrusiveness) || INTRUDE[2]);
-      const eventsOn = st.production.sources?.events !== false;
+        : (INTRUDE.find(i => i.id === p.intrusiveness) || INTRUDE[2]);
+      const eventsOn = p.sources?.events !== false;
+      const pinned = formatDirectorPicksBlock(this.storage, picks);
+      const fireRule = force
+        ? '- The user requested an event NOW. You MUST set "fire": true and write the beat. Prefer PINNED CUES when present.'
+        : '- Fire sparingly. Prefer "fire": false unless something clearly warrants a nudge.';
       const prompt = `You are the Director for a roleplay production. Review the floor and decide whether to inject ONE event beat now.
 
 DIRECTOR CARD (your creative brief — obey tone, genre, and constraints here):
 ${this._directorCardBlock()}
 
-INTRUSIVENESS — ${mode.label}${st.production.intrudeRandom ? ' (rolled this check)' : ''}: ${mode.tip}
+INTRUSIVENESS — ${mode.label}${p.intrudeRandom ? ' (rolled this check)' : ''}: ${mode.tip}
 
 RULES:
-- Fire sparingly. Prefer "fire": false unless something clearly warrants a nudge.
+${fireRule}
 - Prefer advancing or pressuring an ACTIVE PLOT HOOK when one fits the floor — do not ignore filed hooks.
 ${eventsOn ? '- When EVENTS & HOLIDAYS are listed, prefer cueing or echoing one of those composed holidays/events when the floor timing or cast fits — do not invent a new holiday if a filed one applies.\n' : ''}- Stay within the allowed source sections in the floor brief. Do not invent trackers.
 - Do not rewrite the plot wholesale. One concrete beat matching the intrusiveness mode.
 ${this._directorVoiceRules()}
 - The "event" field is a stage beat, never a line or thought from the Star / {{user}}.
-- Return ONLY JSON: {"fire":boolean,"event":"1-3 sentences if fire","tags":["optional","keywords"],"reason":"short why"}
-
+- "cast" may be the Director, supporting, absent, or in-play (name or id). Never the Star or a written-out member.
+- "beat" / "hook" / "reward" only if they already exist on the floor — never invent filed records.
+- Return ONLY JSON: {"fire":boolean,"event":"1-3 sentences if fire","tags":["optional","keywords"],"reason":"short why","cast":"","beat":"","hook":"","reward":{"kind":"achievement|item|secret","name":""}}
+${pinned ? `
+PINNED CUES (must use in the beat; fill JSON cast/beat/hook/reward from these):
+${pinned}
+` : ''}
 FLOOR BRIEF:
 ${brief}
 
 JSON:`;
+      restoreRun();
       const raw = await this._quiet(prompt, { quietName: 'Director', profileSlot: 'event' });
       const parsed = parseJsonObject(raw);
       st.production.lastCheckAt = Date.now();
       if (!auto) st.production.msgSinceCheck = 0;
-      if (parsed?.fire && parsed.event) {
-        const text = String(parsed.event).trim().slice(0, 600);
-        st.production.pendingEvent = {
-          text,
-          tags: Array.isArray(parsed.tags) ? parsed.tags.map(t => String(t).slice(0, 40)).slice(0, 8) : [],
-          at: Date.now(),
-          mode: mode.id,
-        };
+      const extras = { mode: mode.id };
+      if (picks?.castId) extras.castId = picks.castId;
+      if (picks?.hookIds?.[0]) extras.hookId = picks.hookIds[0];
+      const hasBeat = !!(parsed?.event);
+      const shouldFire = force ? hasBeat : !!(parsed?.fire && parsed.event);
+      if (shouldFire) {
+        const ev = hydrateFromDirectorJson(this.storage, parsed, extras);
+        const text = ev?.text || String(parsed.event).trim().slice(0, 600);
         (st.production.eventLog ??= []).push({
           kind: 'event',
           text: `EVENT [${mode.label}] — ${text}`,
           at: Date.now(),
+          event: ev,
         });
         if (st.production.queueComposer) {
           this.bus?.emit('composer.queueAudit', { reason: 'director-event', event: text });
-          (st.production.eventLog ??= []).push({
-            kind: 'check',
-            text: 'Composer queue audit requested.',
-            at: Date.now(),
-          });
         }
-        this.bus?.emit('showtime.stateChanged');
-      } else {
-        (st.production.eventLog ??= []).push({
-          kind: 'check',
-          text: `${auto ? 'Auto hold' : 'Hold'} [${mode.label}] — ${String(parsed?.reason || 'nothing to cue').slice(0, 160)}`,
-          at: Date.now(),
-        });
+        if (ev) this._presentDirectorEvent(ev);
+      } else if (force) {
+        alert('Director returned no beat. Try again or pin a cue from the pool.');
       }
-      if ((st.production.eventLog || []).length > 40) {
-        st.production.eventLog = st.production.eventLog.slice(-40);
-      }
+      st.production.eventLog = (st.production.eventLog || []).filter(e => e.kind === 'event').slice(-40);
       this.saveState();
     } catch (err) {
       console.error('[Backstage director]', err);
       if (!auto) alert(`Director check failed: ${err.message || err}`);
     } finally {
+      restoreRun();
       this._busy = false;
-      if (this._door === 'production' && this.container) this.render(this.container);
+      if (showProd) this.render(this.container);
     }
   }
 
-  async _interviewNoteAsk(noteId) {
+  async _interviewNoteAsk(noteId, { about = false } = {}) {
     const card = NOTECARDS.find(c => c.id === noteId);
     if (!card) return;
     const st = this._db();
     const qEl = this.container.querySelector(`[data-note-q="${noteId}"]`);
     const tEl = this.container.querySelector(`[data-note-target="${noteId}"]`);
+    const aEl = this.container.querySelector(`[data-note-about="${noteId}"]`);
     const qIdx = Math.min(Number(qEl?.value) || 0, card.questions.length - 1);
     const targetId = tEl?.value || '';
+    const aboutText = String(aEl?.value || '').trim();
     if (!targetId) { alert('Pick a title on the notecard back.'); return; }
+    if (about && !aboutText) {
+      alert('Add a line in About this… first.');
+      aEl?.focus();
+      return;
+    }
     st.interview.notePick ??= {};
-    st.interview.notePick[noteId] = { q: qIdx, targetId };
+    st.interview.notePick[noteId] = { q: qIdx, targetId, about: aboutText };
     this.saveState();
     const subjectId = st.interview.subjectId || this._interviewSubject()?.id;
     const target = this._noteTargets(noteId, subjectId).find(t => t.id === targetId);
-    const question = `${card.questions[qIdx].text}${target ? ` — ${target.title}` : ''}`;
-    await this._interviewTurn(question, noteId, { questionId: card.questions[qIdx].id, target });
+    let question = `${card.questions[qIdx].text}${target ? ` — ${target.title}` : ''}`;
+    if (about && aboutText) question = `${question} — About this: ${aboutText}`;
+    await this._interviewTurn(question, noteId, {
+      questionId: card.questions[qIdx].id,
+      target,
+      about: about ? aboutText : '',
+    });
   }
 
   async _interviewFree() {
@@ -5160,14 +6505,17 @@ ${this._repTowardBlock(star?.id || null, name)}`,
     };
   }
 
-  async _interviewTurn(question, askKind = 'free', meta = {}) {
+  async _interviewTurn(question, askKind = 'free', meta = {}, { replay = false } = {}) {
     const st = this._db();
     if (this._busy) return;
     const subject = this._interviewSubject();
     if (!subject) return;
     const interviewer = this._interviewerInfo();
 
-    (st.interview.turns ??= []).push({ who: 'user', name: interviewer.name, text: question, at: Date.now() });
+    if (!replay) {
+      (st.interview.turns ??= []).push({ who: 'user', name: interviewer.name, text: question, at: Date.now() });
+    }
+    st.interview.retry = null;
     this.saveState();
     this._busy = true;
     this._ivPinBottom = true;
@@ -5175,9 +6523,10 @@ ${this._repTowardBlock(star?.id || null, name)}`,
 
     try {
       const dossier = this._subjectDossier(subject, askKind, meta.target);
+      const aboutLine = String(meta.about || '').trim();
       const targetBlock = meta.target
-        ? `ABOUT (private briefing for you only — never quote or restate this block; answer in spoken opinion/feeling):\n${meta.target.prompt || meta.target.title}`
-        : '';
+        ? `ABOUT (private briefing for you only — never quote or restate this block; answer in spoken opinion/feeling):\n${meta.target.prompt || meta.target.title}${aboutLine ? `\nInterviewer angle — About this: ${aboutLine}` : ''}`
+        : (aboutLine ? `ABOUT:\nInterviewer angle — About this: ${aboutLine}` : '');
       const history = (st.interview.turns || []).slice(-8)
         .map(t => `${t.name || (t.who === 'cast' ? subject.name : 'Interviewer')}: ${t.text}`).join('\n');
       const relationRule = interviewer.anonymous
@@ -5204,24 +6553,25 @@ ${interviewer.name}: ${question}
 
 === YOUR REPLY (as ${subject.name}, 2–6 sentences of dialogue/thought only — opinion, not a file dump) ===`;
 
-      let reply = await this._quiet(prompt, { quietName: subject.name });
+      let reply = await this._quiet(prompt, { quietName: subject.name, profileSlot: 'interview' });
       reply = this._cleanInterviewReply(reply, subject.name, prompt, meta.target);
       if (!reply) {
-        // One retry with a tighter ask if the model echoed instructions.
         const retry = `You are ${subject.name}. ${interviewer.name}${interviewer.anonymous ? ' (a stranger)' : ''} asks: ${question}
 
 Answer in character as spoken words only (2–6 sentences). Do not quote briefing text, standing numbers, or system labels.${meta.target ? ` Topic: ${meta.target.title}.` : ''}
 
 ${subject.name}:`;
-        reply = await this._quiet(retry, { quietName: subject.name });
+        reply = await this._quiet(retry, { quietName: subject.name, profileSlot: 'interview' });
         reply = this._cleanInterviewReply(reply, subject.name, retry, meta.target);
       }
-      if (!reply) reply = `…doesn't answer.`;
+      if (!reply) {
+        st.interview.retry = { question, askKind, meta };
+        this.saveState();
+        return;
+      }
 
       st.interview.turns.push({ who: 'cast', name: '', text: reply, at: Date.now() });
 
-      // When the Cast/Connections notecard (or a Rep/House target) is in play,
-      // harvest a reading or rumor into Reputation → Connections.
       const note = await this._interviewConnHarvest(subject, reply, question, askKind, meta.target);
       if (note) {
         st.interview.turns.push({ who: 'user', name: 'Connections', text: note, at: Date.now() });
@@ -5233,12 +6583,7 @@ ${subject.name}:`;
       this.bus?.emit('reputation.updated', {});
     } catch (err) {
       console.error('[Backstage interview]', err);
-      st.interview.turns.push({
-        who: 'cast',
-        name: '',
-        text: `(interview flubbed: ${err.message || err})`,
-        at: Date.now(),
-      });
+      st.interview.retry = { question, askKind, meta };
       this.saveState();
     } finally {
       this._busy = false;
@@ -5510,31 +6855,140 @@ JSON schema:
     return nm ? nodes.find(n => String(n.name || '').toLowerCase() === nm) : null;
   }
 
+  _peanutBand(val) {
+    if (val == null || val === '') return '—';
+    const n = Number(val);
+    if (!Number.isFinite(n)) return String(val);
+    return `${standingInfo(n).label} (${n})`;
+  }
+
+  _peanutLibraryLeaves() {
+    try {
+      return listVisibleLibraryLeaves(this.storage).filter(l => !l.disabled);
+    } catch {
+      return [];
+    }
+  }
+
+  _peanutStampLeaf(entry, leaves) {
+    if (!entry) return null;
+    return leaves.find(l =>
+      (entry.key && l.key === entry.key)
+      || (entry.book && entry.uid != null && l.book === entry.book && String(l.uid) === String(entry.uid))
+      || (entry.book && entry.title && l.book === entry.book && l.title === entry.title))
+      || null;
+  }
+
+  _peanutLoreBrief(speakers, source, scene = null) {
+    try {
+      const leaves = this._peanutLibraryLeaves();
+      const hay = `${source || ''} ${(speakers || []).map(s => s.c?.name || '').join(' ')}`.toLowerCase();
+      const stampLines = [];
+      const tagBits = [];
+      const seenLeaf = new Set();
+      const seenTag = new Set();
+
+      const pushTag = (type, value) => {
+        const v = String(value || '').trim();
+        if (!v) return;
+        const id = `${String(type || 'tag').toLowerCase()}\u241f${v.toLowerCase()}`;
+        if (seenTag.has(id)) return;
+        seenTag.add(id);
+        tagBits.push(type ? `${type}:${v}` : v);
+      };
+
+      const pushStamp = (leaf, entry) => {
+        const key = leaf?.key || `${entry?.book || ''}::${entry?.uid || entry?.title || ''}`;
+        if (!key || seenLeaf.has(key)) return;
+        const body = String(leaf?.content || '').replace(/\s+/g, ' ').trim();
+        if (!body) return;
+        seenLeaf.add(key);
+        for (const t of (leaf.tags || [])) pushTag(t.type, t.value);
+        const tags = (leaf.tags || []).map(t => t.value).filter(Boolean).slice(0, 4);
+        stampLines.push(`⌘ ${leaf.title || entry?.title || 'lore'}${tags.length ? ` 〔${tags.join(', ')}〕` : ''}: ${body.slice(0, 220)}`);
+      };
+
+      const considerCard = (row, force) => {
+        const card = row?.card || row;
+        if (!card) return;
+        const code = row.code || '';
+        const title = row.title || card.title || '';
+        const facets = flattenFacets(card.keywordFacets);
+        const hit = force
+          || textMatchesHay(title, hay)
+          || textMatchesHay(code, hay)
+          || facets.some(k => textMatchesHay(k, hay));
+        if (!hit) return;
+        for (const k of facets) pushTag('facet', k);
+        const entries = Array.isArray(card.sourceStamp?.entries) ? card.sourceStamp.entries : [];
+        for (const e of entries) {
+          const leaf = this._peanutStampLeaf(e, leaves);
+          if (leaf) pushStamp(leaf, e);
+        }
+      };
+
+      if (scene) considerCard(scene, true);
+      for (const row of getSceneCards(this.storage)) {
+        if (scene && row.uid === scene.uid) continue;
+        considerCard(row, false);
+      }
+
+      for (const leaf of leaves) {
+        if (stampLines.length >= 6) break;
+        if (seenLeaf.has(leaf.key)) continue;
+        const keys = [...(leaf.keys || []), leaf.title, ...(leaf.tags || []).map(t => t.value)];
+        if (!keys.some(k => k && textMatchesHay(k, hay))) continue;
+        pushStamp(leaf, { title: leaf.title });
+      }
+
+      const lines = [];
+      if (tagBits.length) lines.push(`Tags: ${tagBits.slice(0, 18).join(', ')}`);
+      lines.push(...stampLines.slice(0, 6));
+      return lines.join('\n') || '(none stamped or tagged in play)';
+    } catch {
+      return '(unavailable)';
+    }
+  }
+
   _peanutConnectionsBrief(speakers) {
     try {
       const rep = this.storage.getChat('reputation', { personal: [], house: [] });
+      const secrets = listPlaySecrets(this.storage);
       const lines = [];
       for (const s of speakers) {
         const node = this._peanutFindNode(rep, s.c);
-        if (!node) continue;
         const bits = [];
+        const starStand = standingToward(this.storage, `cast:${s.c.id}`);
+        if (starStand != null) bits.push(`toward Star: ${this._peanutBand(starStand)}`);
         for (const other of speakers) {
           if (other.c.id === s.c.id) continue;
           const otherNode = this._peanutFindNode(rep, other.c);
-          if (!otherNode) continue;
+          if (!otherNode || !node) continue;
           const reading = (node.readings || []).find(r => r.targetId === otherNode.id);
           const linked = (node.links || []).includes(otherNode.id)
             || (otherNode.links || []).includes(node.id);
           if (reading) {
-            bits.push(`toward ${other.c.name}: standing ${reading.standing ?? '—'}; ${clipText(reading.take || 'no take', 80)}`);
+            const take = clipText(reading.take || '', 100);
+            bits.push(`toward ${other.c.name}: ${this._peanutBand(reading.standing)}${take ? `; ${take}` : ''}`);
           } else if (linked) {
             bits.push(`linked to ${other.c.name}`);
           }
         }
+        const houses = characterHouseIds(this.storage, s.c.id);
         for (const h of (rep.house || [])) {
           const hit = h.headId === s.c.id || (h.connections || []).some(c => c.characterId === s.c.id);
-          if (hit) bits.push(`affiliation ${h.alias || h.name}`);
+          if (!hit) continue;
+          const hStand = standingToward(this.storage, `house:${h.id}`);
+          bits.push(`affiliation ${h.alias || h.name}${hStand != null ? ` (house→Star ${this._peanutBand(hStand)})` : ''}`);
         }
+        const owned = secretsAboutCharacter(secrets, s.c.id);
+        const known = secretsKnownToCharacter(secrets, s.c.id, houses);
+        const unaware = secrets.filter(sec => (sec.unawareBy || []).some(k =>
+          (k.type === 'cast' && k.id === s.c.id)
+          || (k.type === 'house' && houses.includes(k.id))));
+        if (owned.length) bits.push(`owns ${owned.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
+        if (known.length) bits.push(`knows ${known.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
+        if (unaware.length) bits.push(`unaware of ${unaware.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
         if (!bits.length) continue;
         lines.push(`- ${s.c.name}: ${bits.join(' · ')}`);
       }
@@ -5603,9 +7057,9 @@ JSON schema:
   _peanutWantCount(speakerCount, { continueThread = false } = {}) {
     const n = Math.max(1, Number(speakerCount) || 1);
     // Listen: a partial handful — not one-per-speaker.
-    const listenBase = Math.min(Math.max(2, Math.ceil(n * 0.55)), Math.min(4, n));
+    const listenBase = Math.min(Math.max(2, Math.ceil(n * 0.6)), Math.min(5, n));
     const want = continueThread ? listenBase * 2 : listenBase;
-    return Math.min(Math.max(want, continueThread ? 4 : 2), continueThread ? 10 : 5);
+    return Math.min(Math.max(want, continueThread ? 4 : 2), continueThread ? 12 : 6);
   }
 
   _peanutLineBad(text) {
@@ -5623,7 +7077,7 @@ JSON schema:
       return true;
     }
     // Very long literary prose only
-    if (t.length > 280) return true;
+    if (t.length > 480) return true;
     return false;
   }
 
@@ -5682,10 +7136,10 @@ JSON schema:
     };
     const out = [];
     const seen = new Set();
-    const cap = Math.max(1, Math.min(12, Number(maxOut) || 9));
+    const cap = Math.max(1, Math.min(14, Number(maxOut) || 9));
     for (const c of (arr || [])) {
       if (!c) continue;
-      const text = String(c.text || c.comment || c.line || c.message || '').trim().slice(0, 220);
+      const text = String(c.text || c.comment || c.line || c.message || '').trim().slice(0, 360);
       if (!text || /watching closely/i.test(text) || this._peanutLineBad(text)) continue;
       const name = resolveName(c.name || c.speaker || c.who || c.character);
       if (!name) continue;
@@ -5709,7 +7163,7 @@ JSON schema:
       const re = new RegExp(`(?:^|[\\n\\r])\\s*(?:[-*•\\d.)\\]]\\s*)?${escName}\\s*[:：\\-—]\\s*(.+)`, 'i');
       const m = text.match(re);
       if (!m) continue;
-      const line = m[1].replace(/^["']|["']$/g, '').trim().slice(0, 220);
+      const line = m[1].replace(/^["']|["']$/g, '').trim().slice(0, 360);
       if (!line || seen.has(name) || this._peanutLineBad(line)) continue;
       seen.add(name);
       out.push({ name, text: line });
@@ -5722,7 +7176,7 @@ JSON schema:
         const re = new RegExp(`(?:^|[\\n\\r])\\s*${first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[:：\\-—]\\s*(.+)`, 'i');
         const m = text.match(re);
         if (!m || seen.has(name)) continue;
-        const line = m[1].replace(/^["']|["']$/g, '').trim().slice(0, 220);
+        const line = m[1].replace(/^["']|["']$/g, '').trim().slice(0, 360);
         if (!line || this._peanutLineBad(line)) continue;
         seen.add(name);
         out.push({ name, text: line });
@@ -5731,14 +7185,14 @@ JSON schema:
     return out;
   }
 
-  _peanutPrompt({ names, castBlock, connBrief, label, source, want, continueThread = '' }) {
+  _peanutPrompt({ names, castBlock, connBrief, loreBrief = '', label, source, want, continueThread = '' }) {
     const shuffled = [...names].sort(() => Math.random() - 0.5);
     const exA = shuffled[0] || 'CastA';
     const exB = shuffled[Math.min(1, shuffled.length - 1)] || exA;
     const banterRule = continueThread
       ? `REQUIRED: At least half the lines must answer, rib, quote, or disagree with a PRIOR balcony line (name-check who you're talking to). Do not ignore the prior chat.`
       : `REQUIRED: Speakers talk to EACH OTHER about the scene — address someone by name, pile on, contradict, or riff. Not ${want} isolated monologues.`;
-    return `You write short balcony / stream-chat reactions. You are NOT writing the scene.
+    return `You write balcony / stream-chat reactions. You are NOT writing the scene. Speakers are watching, not performing.
 
 Available speakers (use these exact name strings when they speak):
 ${shuffled.map(n => `- ${n}`).join('\n')}
@@ -5746,11 +7200,14 @@ ${shuffled.map(n => `- ${n}`).join('\n')}
 Tone hints (do not quote):
 ${castBlock}
 
-How they feel about each other (use this for tone / digs):
+How they feel about each other and the Star (use for tone, digs, alliances, and what they would never say):
 ${connBrief}
 
+Filed lore, stamps, and tags in play (in-jokes and accurate references — do not recap dump. A speaker may only allude to a secret they own or know; never leak what they are unaware of):
+${loreBrief || '(none stamped or tagged in play)'}
+
 ${continueThread ? `Prior balcony chat (react to THESE lines):\n${continueThread}\n\n` : ''}Scene they are watching (${label}):
-${String(source).slice(0, 1800)}
+${String(source).slice(0, 2400)}
 
 ${banterRule}
 
@@ -5759,12 +7216,13 @@ IMPORTANT:
 - Speakers may appear in ANY order (not roster order).
 - The same speaker may speak more than once; others may speak zero times.
 - Return exactly ${want} chat lines total.
+- Be specific: name a beat, tag, stamped fact, or relationship when it would sting or land.
 
 Return ONLY a JSON array of ${want} objects: {"name":"...","text":"..."}.
-Each text = one short spoken reaction (under 25 words), first person or banter.
+Each text = one spoken reaction (under 45 words), first person or banter.
 
 Good (partial cast, mixed order):
-[{"name":"${exA}","text":"${exB.split(/[\s,]/)[0]}, did you see that?!"},{"name":"${exB}","text":"I saw it — sit down before you fall."}]
+[{"name":"${exA}","text":"${exB.split(/[\s,]/)[0]}, that stamp? You knew and you still walked in."},{"name":"${exB}","text":"Sit down. I knew enough — not that."}]
 
 No narration. No markdown fences. No preamble.`;
   }
@@ -5779,13 +7237,13 @@ No narration. No markdown fences. No preamble.`;
     if (!text) return '';
     const jsonSchema = {
       name: 'peanut_gallery',
-      description: 'Short balcony chat reactions',
+      description: 'Balcony chat reactions',
       strict: false,
       returnInvalid: true,
       value: {
         type: 'array',
         minItems: 1,
-        maxItems: 12,
+        maxItems: 14,
         items: {
           type: 'object',
           properties: {
@@ -5798,16 +7256,12 @@ No narration. No markdown fences. No preamble.`;
     };
     const runRaw = async (useSchema) => {
       try {
-        const out = await generateRaw({
+        return await pinnedGenerateRaw({
           prompt: text,
-          systemPrompt: 'Output a JSON array of short chat reactions only. No scene writing. No markdown.',
-          instructOverride: true,
-          quietToLoud: true,
-          responseLength: 600,
+          systemPrompt: `${SYSTEM_VOICE} Output a JSON array of balcony chat reactions only. No scene writing. No markdown.`,
           jsonSchema: useSchema ? jsonSchema : null,
-          trimNames: false,
+          responseLength: 2000,
         });
-        return String(out ?? '').trim();
       } catch (err) {
         console.warn('[Backstage peanut generateRaw]', err);
         return '';
@@ -5816,19 +7270,6 @@ No narration. No markdown fences. No preamble.`;
     return this._withEventProfile(async () => {
       let raw = await runRaw(true);
       if (!raw) raw = await runRaw(false);
-      if (!raw) {
-        // Last resort: quiet prompt (may include chat — parser still filters)
-        try {
-          raw = String(await generateQuietPrompt({
-            quietPrompt: text,
-            trimToSentence: false,
-            skipWIAN: true,
-            quietName: 'System',
-          }) ?? '').trim();
-        } catch (err) {
-          console.warn('[Backstage peanut quiet fallback]', err);
-        }
-      }
       return raw;
     });
   }
@@ -5851,25 +7292,28 @@ No narration. No markdown fences. No preamble.`;
     this._busy = true;
     this.render(this.container);
     try {
-      const { label, source } = this._peanutSource(st);
+      const { label, source, scene } = this._peanutSource(st);
       const speakers = this._peanutPickSpeakers();
       const castBlock = speakers.map(s => {
         const tip = String(s.blurb || s.identity?.description || s.c.priority || 'cast')
-          .replace(/\s+/g, ' ').trim().slice(0, 80);
+          .replace(/\s+/g, ' ').trim().slice(0, 160);
         return `- ${s.c.name}: ${tip}`;
       }).join('\n');
       const names = speakers.map(s => s.c.name);
       const connBrief = this._peanutConnectionsBrief(speakers);
+      const loreBrief = this._peanutLoreBrief(speakers, source, scene);
       const want = this._peanutWantCount(names.length, { continueThread: false });
 
-      const prompt = this._peanutPrompt({ names, castBlock, connBrief, label, source, want });
+      const prompt = this._peanutPrompt({ names, castBlock, connBrief, loreBrief, label, source, want });
       let raw = await this._peanutGenerate(prompt);
       let comments = this._parsePeanutComments(raw, names, { maxOut: want + 2 });
       if (!comments.length) {
-        const retry = `JSON array only. ${want} short REACTION lines. Not everyone must speak. Any order.
+        const retry = `JSON array only. ${want} REACTION lines. Not everyone must speak. Any order.
 Exact names (pool): ${names.join(' | ')}
-Watching: ${String(source).slice(0, 800)}
-[{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[0]}, did you see that?!"}${names.length > 1 ? `,{"name":"${names[1]}","text":"Yeah — keep your voice down."}` : ''}]`;
+Watching: ${String(source).slice(0, 900)}
+Lore/tags: ${String(loreBrief).slice(0, 500)}
+Ties: ${String(connBrief).slice(0, 400)}
+[{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[0]}, that stamp? You knew."}${names.length > 1 ? `,{"name":"${names[1]}","text":"Sit down — I knew enough, not that."}` : ''}]`;
         raw = await this._peanutGenerate(retry);
         comments = this._parsePeanutComments(raw, names, { maxOut: want + 2 });
       }
@@ -5921,7 +7365,7 @@ Watching: ${String(source).slice(0, 800)}
       const names = speakers.map(s => s.c.name);
       const castBlock = speakers.map(s => {
         const tip = String(s.blurb || s.identity?.description || s.c.priority || 'cast')
-          .replace(/\s+/g, ' ').trim().slice(0, 80);
+          .replace(/\s+/g, ' ').trim().slice(0, 160);
         return `- ${s.c.name}: ${tip}`;
       }).join('\n');
       const connBrief = this._peanutConnectionsBrief(speakers);
@@ -5932,10 +7376,14 @@ Watching: ${String(source).slice(0, 800)}
         .join('\n');
       let sourceBit = '';
       let label = active.label || 'balcony';
+      let scene = null;
+      let loreBrief = '(none)';
       try {
         const src = this._peanutSource(st);
         label = src.label;
-        sourceBit = src.source.slice(0, 1600);
+        scene = src.scene || null;
+        sourceBit = src.source.slice(0, 2200);
+        loreBrief = this._peanutLoreBrief(speakers, src.source, scene);
       } catch {
         sourceBit = active.label || 'ongoing balcony chat';
       }
@@ -5945,6 +7393,7 @@ Watching: ${String(source).slice(0, 800)}
         names,
         castBlock,
         connBrief,
+        loreBrief,
         label,
         source: sourceBit,
         want,
@@ -5954,10 +7403,12 @@ Watching: ${String(source).slice(0, 800)}
       let next = this._parsePeanutComments(raw, names, { maxOut: want + 2 });
       if (!next.length) {
         raw = await this._peanutGenerate(
-          `Continue the balcony chat. JSON array of ${want} short reactions (about twice a Listen pass).
+          `Continue the balcony chat. JSON array of ${want} reactions (about twice a Listen pass).
 Not everyone must speak; any order; someone may speak twice.
-At least half must reply to someone in Prior (name them).
+At least half must reply to someone in Prior (name them). Use filed lore/tags/ties when they sting.
 Names (pool): ${names.join(' | ')}
+Lore/tags: ${String(loreBrief).slice(0, 400)}
+Ties: ${String(connBrief).slice(0, 300)}
 Prior:
 ${thread.slice(-900)}
 Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[0]} — you're not wrong."}]`,
@@ -5999,44 +7450,29 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
 
   async _quiet(prompt, { quietName = 'System', profileSlot = '' } = {}) {
     const text = String(prompt || '');
-    const isolated = quietName === 'Director' || profileSlot === 'event';
-    const go = async () => {
-      if (isolated) {
-        try {
-          const raw = await generateRaw({
-            prompt: text,
-            systemPrompt: 'You are the Director of a roleplay production. Output only what was asked. Never write as the player, the Star, or {{user}}. Third-person stage voice only.',
-            instructOverride: true,
-            quietToLoud: true,
-            responseLength: 800,
-            trimNames: false,
-          });
-          const out = String(raw ?? '').trim();
-          if (out) return out;
-        } catch (err) {
-          console.warn('[Backstage director generateRaw]', err);
-        }
-      }
-      const opts = {
-        quietPrompt: text,
-        trimToSentence: false,
-        skipWIAN: true,
-        quietName,
-      };
-      try {
-        return String(await generateQuietPrompt(opts) ?? '').trim();
-      } catch (err) {
-        console.warn('[Backstage quiet]', err);
-        try {
-          return String(await generateQuietPrompt(text) ?? '').trim();
-        } catch (err2) {
-          console.error('[Backstage quiet fallback]', err2);
-          return '';
-        }
-      }
-    };
+    const filing = quietName === 'System' || profileSlot === 'audit';
+    const go = () => leanQuietGenerate(text, {
+      kind: filing ? 'filing' : 'voice',
+      responseLength: filing ? 3200 : 1600,
+      fallback: filing ? null : { quietPrompt: text, trimToSentence: false, skipWIAN: true, quietName },
+    });
     if (profileSlot) return withShowtimeProfile(this.storage, profileSlot, go);
     return go();
+  }
+
+  _profileOpts(selected) {
+    return [
+      `<option value="">— Current (default) —</option>`,
+      ...this._profiles.map(p =>
+        `<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`),
+    ].join('');
+  }
+
+  _saveProfileSlot(slot, value) {
+    const g = this._g();
+    g.profiles ??= { audit: '', motivation: '', event: '', interview: '' };
+    g.profiles[slot] = String(value || '');
+    this._saveG();
   }
 
   _chatSlice(from, to) {
@@ -6588,13 +8024,26 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     if (mode === 'script') {
       const scene = getSceneCards(this.storage).find(s => s.uid === st.peanut.scriptUid);
       if (!scene) throw new Error('Pick a Script card first.');
+      const card = scene.card || {};
+      const facets = flattenFacets(card.keywordFacets);
+      const leaves = this._peanutLibraryLeaves();
+      const stampBits = [];
+      for (const e of (card.sourceStamp?.entries || [])) {
+        const leaf = this._peanutStampLeaf(e, leaves);
+        const body = String(leaf?.content || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+        if (!body) continue;
+        const tags = (leaf?.tags || []).map(t => t.value).filter(Boolean).slice(0, 4);
+        stampBits.push(`⌘ ${leaf?.title || e.title || 'lore'}${tags.length ? ` 〔${tags.join(', ')}〕` : ''}: ${body}`);
+      }
       const body = [
         scene.code,
         scene.title,
-        scene.card?.summary || '',
-        scene.card?.content || '',
+        facets.length ? `Tags: ${facets.join(', ')}` : '',
+        card.summary || '',
+        card.content || '',
+        ...stampBits,
       ].filter(Boolean).join('\n');
-      return { label: `${scene.code} · ${scene.title}`, source: body };
+      return { label: `${scene.code} · ${scene.title}`, source: body, scene };
     }
     if (mode === 'range') {
       const rows = this._chatSlice(st.peanut.from, st.peanut.to);
@@ -6602,6 +8051,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       return {
         label: `#${st.peanut.from}–${st.peanut.to}`,
         source: rows.map(m => `[${m.index}] ${m.name}: ${m.text}`).join('\n'),
+        scene: null,
       };
     }
     const n = Math.max(1, Math.min(80, Number(st.peanut.recentN) || 12));
@@ -6610,6 +8060,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     return {
       label: `last ${rows.length}`,
       source: rows.map(m => `[${m.index}] ${m.name}: ${m.text}`).join('\n'),
+      scene: null,
     };
   }
 
@@ -6646,21 +8097,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
 
   _registerInjection() {
     if (!this.injector) return;
-    this.injector.register({
-      id: 'backstage.director',
-      always: true,
-      buildText: () => {
-        const root = extension_settings.showtime ?? {};
-        if (root.masterOff) return '';
-        const st = this._db();
-        if (!st.production?.directorOn) return '';
-        const ev = st.production.pendingEvent;
-        if (!ev?.text) return '';
-        const star = getStarMember(this.storage);
-        const starName = star?.name || '{{user}}';
-        return `[Director Event — third-person stage beat, not ${starName}] ${clipText(ev.text, 480)}`;
-      },
-    });
+    this.injector.unregister('backstage.director');
     this.injector.register({
       id: 'backstage.scene',
       always: true,
@@ -6706,6 +8143,22 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     if (alignSmoke) console.warn('[Showtime/SuiteAlign] smoke failed:', alignSmoke);
     const suiteGlyphSmoke = smokeSuiteFloorplanGlyphs();
     if (suiteGlyphSmoke) console.warn('[Showtime/SuiteGlyphs] smoke failed:', suiteGlyphSmoke);
+    const restoreSmoke = smokeSuiteWallRestorePure();
+    if (restoreSmoke) console.warn('[Showtime/SuiteRestore] smoke failed:', restoreSmoke);
+    const jsonSmoke = smokeJsonExtractPure();
+    if (jsonSmoke) console.warn('[Showtime/JsonExtract] smoke failed:', jsonSmoke);
+    const locSmoke = smokeSceneLocationPure();
+    if (locSmoke) console.warn('[Showtime/SceneLocation] smoke failed:', locSmoke);
+    const cueSmoke = smokeChatTrackCuePure();
+    if (cueSmoke) console.warn('[Showtime/ChatCues] smoke failed:', cueSmoke);
+    const bgSmoke = smokeBackgroundPickPure();
+    if (bgSmoke) console.warn('[Showtime/BackgroundPick] smoke failed:', bgSmoke);
+    const wxSmoke = smokeOverlayWxPure();
+    if (wxSmoke) console.warn('[Showtime/WeatherOverlay] smoke failed:', wxSmoke);
+    const sonarLocSmoke = smokeSonarLocationPure();
+    if (sonarLocSmoke) console.warn('[Showtime/SonarLocation] smoke failed:', sonarLocSmoke);
+    const calSmoke = smokeCalendarShiftPure();
+    if (calSmoke) console.warn('[Showtime/CalendarShift] smoke failed:', calSmoke);
   }
 
   _reelPackOpts() {
@@ -6848,6 +8301,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     g.profiles.audit = this.container.querySelector('[data-g="profile-audit"]')?.value || '';
     g.profiles.motivation = this.container.querySelector('[data-g="profile-motivation"]')?.value || '';
     g.profiles.event = this.container.querySelector('[data-g="profile-event"]')?.value || '';
+    g.profiles.interview = this.container.querySelector('[data-g="profile-interview"]')?.value || g.profiles.interview || '';
     this._saveG();
 
     window.Showtime?.applyHousePolicy?.();
@@ -6963,30 +8417,4 @@ function downloadJson(filename, data) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
-}
-
-function parseJsonObject(raw) {
-  const text = String(raw || '');
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const body = fence ? fence[1] : text;
-  const match = body.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try { return JSON.parse(match[0]); } catch { return null; }
-}
-
-function parseJsonArray(raw) {
-  const text = String(raw || '');
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const body = fence ? fence[1] : text;
-  const match = body.match(/\[[\s\S]*\]/);
-  if (!match) return null;
-  const tryParse = (s) => {
-    try {
-      const arr = JSON.parse(s);
-      return Array.isArray(arr) ? arr : null;
-    } catch {
-      return null;
-    }
-  };
-  return tryParse(match[0]) || tryParse(match[0].replace(/,\s*([\]}])/g, '$1'));
 }

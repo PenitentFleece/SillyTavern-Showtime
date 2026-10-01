@@ -87,6 +87,124 @@
   color: var(--st-gold);
 }
 
+.showtime-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  position: relative;
+}
+
+.showtime-notice-pip {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  border: 1px solid var(--st-gold-dim);
+  background: var(--st-gold-dim);
+  color: var(--st-paper);
+  font-family: var(--st-font-mono);
+  font-size: 10px;
+  line-height: 16px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.showtime-notice-mark {
+  font-weight: 700;
+  line-height: 1;
+}
+.showtime-notice-pip.has-mark .showtime-notice-mark {
+  color: var(--st-paper);
+}
+.showtime-notice-glyph {
+  display: inline-block;
+  min-width: 1em;
+  margin-right: 4px;
+  font-family: var(--st-font-mono);
+  font-weight: 700;
+  color: var(--st-crimson);
+}
+.showtime-notice-pip.has-unread {
+  background: var(--st-crimson);
+  border-color: var(--st-crimson);
+  color: var(--st-paper);
+}
+.showtime-notice-pip:hover {
+  border-color: var(--st-gold);
+}
+.showtime-notice-pip[hidden],
+.showtime-notice-drop[hidden] {
+  display: none !important;
+}
+
+.showtime-marquee.showtime-marquee--notices-open {
+  overflow: visible;
+}
+
+.showtime-notice-drop {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  width: min(280px, 70vw);
+  max-height: 240px;
+  overflow: auto;
+  background: var(--st-paper);
+  color: var(--st-ink);
+  border: 1px solid var(--st-gold-dim);
+  box-shadow: var(--st-shadow);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: default;
+}
+.showtime-notice-head {
+  font-family: var(--st-font-title);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--st-sepia);
+}
+.showtime-notice-row {
+  font-size: 13px;
+  line-height: 1.3;
+  color: var(--st-ink);
+}
+.showtime-notice-row--jump {
+  cursor: pointer;
+}
+.showtime-notice-row--jump:hover {
+  color: var(--st-gold);
+}
+.showtime-notice-empty {
+  font-style: italic;
+  color: var(--st-ink-soft);
+  font-size: 12px;
+}
+.showtime-notice-clear {
+  align-self: flex-end;
+  background: var(--st-ink);
+  color: var(--st-gold);
+  border: 1px solid var(--st-gold-dim);
+  font-family: var(--st-font-title);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.showtime-marquee.collapsed.showtime-marquee--notices-open {
+  overflow: visible;
+  max-height: none;
+}
+
 .showtime-titlebar-actions {
   display: flex;
   align-items: center;

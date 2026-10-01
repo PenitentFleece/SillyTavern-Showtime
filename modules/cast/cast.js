@@ -11,6 +11,7 @@ import {
   PRONOUN_APPARENT_OPTIONS, PRONOUN_PREFERRED_OPTIONS,
   normalizePronouns, formatPronounsPromptLine,
   normalizePlotHook, priorityColor,
+  getCastRecords,
 } from '../../lib/castCatalog.js';
 import {
   isAspectEvolutiaAvailable,
@@ -23,8 +24,6 @@ import {
   getPersonaEvolutiaState,
 } from '../../lib/aspectBridge.js';
 import {
-  generateQuietPrompt,
-  generateRaw,
   eventSource,
   event_types,
   getThumbnailUrl,
@@ -32,7 +31,65 @@ import {
   saveChatDebounced,
 } from '../../../../../../script.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
-import { inPlayMemberIds, clipText, compactStatusCueInject, recentPlayMessages } from '../../lib/chatTrack.js';
+import { schemaAllowed, leanQuietGenerate, smokeIsolatedGenPure, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
+import { bindStarAbsentPersonaGate } from '../../lib/starAbsent.js';
+import {
+  EVENT_MODES,
+  DIRECTOR_TAG_FACETS,
+  mergeDirectorSources,
+  listDirectorInjectPools,
+  smokeDirectorInjectPure,
+} from '../../lib/directorEvent.js';
+import { applyDifficultyToStat, difficultyAuditHint } from '../../lib/trackersConfig.js';
+import { registerCastCueCommand, buildCastCuePrompt, resolveCueGenerationTarget, clipCueToPov, cueOtherNames, smokeCuePovPure } from '../../lib/castCue.js';
+import { inPlayMemberIds, clipText, compactStatusCueInject, recentPlayMessages, playMessagesSince } from '../../lib/chatTrack.js';
+import { standingToward, standingMeterStyle, characterHouseIds } from '../../lib/motivationCatalog.js';
+import { parseJsonArray, parseJsonObject } from '../../lib/jsonExtract.js';
+import { buildCueTakePrompt, applyCueTake, cueTakeWorthFiling, CUE_TAKE_SCHEMA, smokeCueTakePure } from '../../lib/cueTake.js';
+import {
+  sceneExcerpt,
+  sceneKitHay,
+  kitSnapshot,
+  cadenceIncludeSet,
+  auditIncludeForKind,
+  buildCastDeltaPrompt,
+  castDeltaSchema,
+  parseCastDelta,
+  applyCastDelta,
+  buildCastDressPrompt,
+  castDressSchema,
+  parseCastDress,
+  resolveTrackerId,
+  clampItemCondition,
+  collectKnownKitEntries,
+  formatKnownKitRoster,
+  clipExcerptToLines,
+  smokeCastDeltaPure,
+  KIT_SCENE_CAP,
+  KIT_LINE_CAP,
+} from '../../lib/castAudit.js';
+import { formatPacksForPrompt } from '../../lib/invAmount.js';
+import {
+  inferKitKind, kitChildren, kitDescendantIds, kitRoots, formatCarryBrief, smokeKitNestPure,
+} from '../../lib/kitNest.js';
+import { getSceneCards } from '../../lib/scriptCatalog.js';
+import {
+  ensureCompass,
+  getActiveRoom,
+  listLostAndFound,
+  removeFromLostAndFound,
+  pickupItem,
+  addToLostAndFound,
+} from '../../lib/compass/state.js';
+import { listAllSetPieces } from '../../lib/compass/schema.js';
+import {
+  syncBeatFromHook,
+  pullBeatAsHook,
+  unlinkHook,
+  listPullableBeats,
+  hookSceneLabel,
+  hookBoardHint,
+} from '../../lib/plotHookBridge.js';
 const STATS_ELIGIBLE = new Set(['star', 'lead', 'major', 'foil']);
 const UNIQUE_ROLES = {
   director: { demoteTo: 'major' },
@@ -43,6 +100,7 @@ const STAT_DEFS = {
   base: [
     {
       id: 'health', label: 'Health', color: '#7a1f1f', direction: 'up',
+      auditHint: 'injury, blood, pain, illness lower this; treatment raises it',
       thresholds: [
         { at: 15,  label: 'Dying' },
         { at: 30,  label: 'Critical' },
@@ -55,6 +113,7 @@ const STAT_DEFS = {
     },
     {
       id: 'energy', label: 'Energy', color: '#c9a24a', direction: 'up',
+      auditHint: 'exertion and sleeplessness lower this; rest raises it',
       thresholds: [
         { at: 20,  label: 'Exhausted' },
         { at: 50,  label: 'Drained' },
@@ -67,6 +126,7 @@ const STAT_DEFS = {
   hard: [
     {
       id: 'hunger', label: 'Satiety', color: '#a86b2b', direction: 'up', group: 'Satiation',
+      auditHint: 'this is fullness, NOT hunger pangs — eating RAISES it; skipping meals LOWERS it',
       thresholds: [
         { at: 25,  label: 'Starving' },
         { at: 60,  label: 'Hungry' },
@@ -77,6 +137,7 @@ const STAT_DEFS = {
     },
     {
       id: 'thirst', label: 'Hydration', color: '#4a7fa8', direction: 'up', group: 'Satiation',
+      auditHint: 'this is hydration — drinking RAISES it; going thirsty LOWERS it',
       thresholds: [
         { at: 25,  label: 'Dehydrated' },
         { at: 60,  label: 'Parched' },
@@ -87,6 +148,7 @@ const STAT_DEFS = {
     },
     {
       id: 'bathroom', label: 'Bladder', direction: 'down', group: 'Needs',
+      auditHint: 'bladder pressure — needing to pee RAISES this; relieving LOWERS it toward 0',
       thresholds: [
         { at: 40,  label: 'Empty' },
         { at: 70,  label: 'Comfortable' },
@@ -97,6 +159,7 @@ const STAT_DEFS = {
     },
     {
       id: 'hygiene', label: 'Odor', direction: 'down', group: 'Needs',
+      auditHint: 'body odor — sweat, dirt, mess RAISE this; washing or clean clothes LOWER it toward 0',
       thresholds: [
         { at: 40,  label: 'Fresh' },
         { at: 65,  label: 'Musty' },
@@ -169,6 +232,26 @@ function statusTrackingMasterOn(storage) {
   }
 }
 
+const PRESENCE = {
+  inPlay: { id: 'inPlay', label: 'In play', title: 'In play — tracked' },
+  absent: { id: 'absent', label: 'Absent', title: 'Absent this scene — not tracked' },
+  writtenOut: { id: 'writtenOut', label: 'Written out', title: 'Written out — hidden, not tracked' },
+};
+const PRESENCE_ORDER = ['inPlay', 'absent', 'writtenOut'];
+const PRESENCE_FILTERS = [
+  { id: 'inPlay', label: 'In play' },
+  { id: 'absent', label: 'Absent' },
+  { id: 'writtenOut', label: 'Written out' },
+];
+const DEFAULT_HIDDEN_PRESENCE = ['absent', 'writtenOut'];
+
+function normalizePresence(char) {
+  if (!char) return 'inPlay';
+  const v = String(char.presence || 'inPlay');
+  if (char.priority === 'star') return v === 'absent' ? 'absent' : 'inPlay';
+  return PRESENCE[v] ? v : 'inPlay';
+}
+
 const CONDITIONS = [
   { id: 'pristine', label: 'Pristine', color: '#6b8f4a' },
   { id: 'fine',     label: 'Fine',     color: '#7a9e52' },
@@ -197,24 +280,78 @@ export class CastModule extends Module {
       document.head.appendChild(link);
     }
     this._expandedIds = new Set();
+    this._openKitBoxes = new Set();
     this._pendingStatAlert = null;
+    this._pendingCue = null;
+    this._pendingCueText = '';
+    this._cueTakeBusy = false;
     this._auditBusy = false;
     this._auditLastAt = 0;
+    this._statusLastCount = 0;
+    this._statusTrackPrimed = false;
+    this._statAlertArmed = false;
+    this._statAlertClearOnEnd = false;
+    this._resetStatusTrackCursor();
 
-    // Clear one-shot stat alert after the AI's reply lands.
+    registerCastCueCommand(this);
+
+    const auditSmoke = smokeCastDeltaPure() || smokeIsolatedGenPure() || smokeDirectorInjectPure()
+      || smokeCuePovPure() || smokeCueTakePure() || smokeKitNestPure();
+    if (auditSmoke) console.warn('[Showtime/CastAudit] smoke failed:', auditSmoke);
+
+    bindStarAbsentPersonaGate(this.storage);
+
+    this.bus?.on('cast.playDirectorEvent', ({ castId, text } = {}) => {
+      const char = (this.state?.characters || []).find(c => c.id === castId)
+        || getCastRecords(this.storage).find(c => c.id === castId);
+      if (!char) {
+        alert('Pick a cast member to play this event.');
+        return;
+      }
+      this.cueCast(char, { directorBeat: text }).catch(err => {
+        console.warn('[Cast director play]', err);
+        alert(`Play failed: ${err?.message || err}`);
+      });
+    });
+
+    // Drop a one-shot threshold note only after a later generation has had a
+    // chance to include it. Audits now run after send, so the in-flight reply
+    // never saw the note — clearing on that render would swallow it.
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
-      if (this._pendingStatAlert) {
+      if (this._statAlertClearOnEnd && this._pendingStatAlert) {
         this._pendingStatAlert = null;
+        this._statAlertArmed = false;
+        this._statAlertClearOnEnd = false;
         this.bus.emit('showtime.stateChanged');
       }
+      this._stampCueMessage(messageId);
       this._applyChatDisplayName(messageId);
     });
     eventSource.on(event_types.MESSAGE_RECEIVED, (messageId) => {
       this._applyChatDisplayName(messageId, { silent: true });
     });
+    // Commit the last AI reply only when the user keeps it by sending again.
+    // Swipes / regenerations fire MESSAGE_RECEIVED without growing the chat,
+    // and would otherwise stack tracker movement on discarded drafts.
+    eventSource.on(event_types.MESSAGE_SENT, () => {
+      this._scheduleStatusTrack();
+    });
+    eventSource.on(event_types.MESSAGE_SWIPED, () => {
+      clearTimeout(this._statusTrackTimer);
+    });
+    eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
+      if (type === 'swipe' || type === 'continue' || type === 'append') {
+        clearTimeout(this._statusTrackTimer);
+      }
+      if (dryRun || type === 'quiet' || type === 'swipe' || type === 'continue' || type === 'append') return;
+      if (this._statAlertArmed && this._pendingStatAlert) this._statAlertClearOnEnd = true;
+    });
 
     this._registerInjections();
     this.bus?.on('trackers.updated', () => {
+      if (this.container) this._renderList();
+    });
+    this.bus?.on('motivation.updated', () => {
       if (this.container) this._renderList();
     });
   }
@@ -232,11 +369,13 @@ export class CastModule extends Module {
       const mes = chat[idx];
       if (mes.is_user || mes.is_system) return;
 
+      const extraId = String(mes.extra?.showtimeCastId || '').trim();
       const avatar = String(mes.original_avatar || '').trim();
-      const speaker = resolveChatSpeaker(this.storage, {
-        avatar,
-        spokenName: mes.name || '',
-      });
+      const speaker = (extraId && this._find(extraId))
+        || resolveChatSpeaker(this.storage, {
+          avatar,
+          spokenName: mes.name || '',
+        });
       if (!speaker) return;
 
       const wantName = castDisplayName(speaker);
@@ -269,8 +408,243 @@ export class CastModule extends Module {
     }
   }
 
+  _cueOthers(char) {
+    let extra = [];
+    try {
+      const n1 = getContext()?.name1;
+      if (n1) extra.push(n1);
+    } catch { /* ignore */ }
+    return cueOtherNames(this.storage, char, extra);
+  }
+
+  _stampCueMessage(messageId) {
+    const cue = this._pendingCue;
+    if (!cue) return;
+    let scene = '';
+    try {
+      const ctx = getContext();
+      const idx = Number(messageId);
+      const mes = ctx.chat?.[idx];
+      if (!mes || mes.is_user || mes.is_system) return;
+      const others = this._cueOthers(this._find(cue.id) || { id: cue.id, name: cue.name });
+      const clipped = clipCueToPov(String(mes.mes || ''), { speaker: cue.name, others });
+      if (clipped && clipped !== mes.mes) mes.mes = clipped;
+      scene = String(mes.mes || '');
+      mes.name = cue.name || mes.name;
+      if (cue.portrait) mes.force_avatar = cue.portrait;
+      if (cue.cardId) mes.original_avatar = cue.cardId;
+      mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+      mes.extra.showtimeCastId = cue.id;
+      try { updateMessageBlock(idx, mes, { rerenderMessage: false }); } catch { /* ignore */ }
+      const root = document.querySelector(`#chat .mes[mesid="${idx}"]`);
+      const nameEl = root?.querySelector('.name_text');
+      if (nameEl && cue.name) nameEl.textContent = cue.name;
+      const face = root?.querySelector('.avatar img');
+      if (face && mes.force_avatar) face.setAttribute('src', mes.force_avatar);
+      saveChatDebounced();
+    } catch (err) {
+      console.warn('[Showtime Cast] cue stamp', err);
+    } finally {
+      this._pendingCue = null;
+      this._pendingCueText = '';
+      this.bus.emit('showtime.stateChanged');
+    }
+    if (cue.priority !== 'director' && scene.trim().length >= 40) {
+      this._fileCueTakes(cue, scene).catch(err => console.warn('[Showtime Cast] cue take file', err));
+    }
+  }
+
+  async _fileCueTakes(cue, scene) {
+    if (this._cueTakeBusy || !cue?.id) return;
+    const char = this._find(cue.id);
+    if (!char || char.priority === 'director') return;
+    if (!cueTakeWorthFiling(scene, { storage: this.storage, char })) return;
+    this._cueTakeBusy = true;
+    const chatToken = getContext()?.chatMetadata ?? null;
+    try {
+      const others = this._cueOthers(char);
+      const prompt = buildCueTakePrompt({
+        speaker: cue.name || char.name,
+        others,
+        scene,
+        storage: this.storage,
+        char,
+      });
+      const raw = await withShowtimeProfile(this.storage, 'audit', () =>
+        leanQuietGenerate(prompt, {
+          kind: 'filing',
+          jsonSchema: CUE_TAKE_SCHEMA,
+          responseLength: 1600,
+        }));
+      if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
+      const parsed = parseJsonObject(raw) || raw;
+      const counts = applyCueTake(this.storage, char, parsed);
+      if (counts.readings || counts.rumors || counts.secrets) {
+        this.bus?.emit('reputation.updated', {});
+        this.bus?.emit('motivation.updated', { characterId: char.id });
+        this.bus?.emit('showtime.stateChanged');
+      }
+    } finally {
+      this._cueTakeBusy = false;
+    }
+  }
+
+  /**
+   * Arm a one-shot prompt and generate the next reply as this cast member.
+   * Group chats force the linked ST card (Director’s card if none is linked).
+   */
+  async cueCast(char, { directorBeat = '' } = {}) {
+    if (!char || char.priority === 'star') {
+      alert('Pick a cast member (not the Star).');
+      return;
+    }
+    if (normalizePresence(char) === 'writtenOut') {
+      alert('That cast member is written out. Mark them In play or Absent first.');
+      return;
+    }
+    const ctx = getContext();
+    const characters = ctx.characters ?? [];
+    const target = resolveCueGenerationTarget(this.storage, char, {
+      characters,
+      characterId: ctx.characterId,
+    });
+    const inGroup = Boolean(ctx.groupId);
+    const currentChid = Number.parseInt(ctx.characterId, 10);
+    const canForce = inGroup && Number.isInteger(target.chid) && target.chid >= 0;
+    const generatingAsTarget = canForce
+      || (Number.isInteger(currentChid) && currentChid === target.chid);
+    let cardDump = 'identity';
+    if (char.priority === 'director') cardDump = 'director';
+    else if (generatingAsTarget && target.source === 'card') cardDump = 'none';
+    else if (!char.characterCardId && !char.personaId) cardDump = 'own';
+
+    const display = this._resolveDisplay(char);
+    this._pendingCue = {
+      id: char.id,
+      name: display.name,
+      portrait: display.portrait || '',
+      cardId: char.characterCardId || '',
+      priority: char.priority || '',
+    };
+    const others = this._cueOthers(char);
+    this._pendingCueText = buildCastCuePrompt(this.storage, char, {
+      characters,
+      personas: this._getPersonas(),
+      cardDump,
+      directorBeat,
+      others,
+    });
+    this.bus.emit('showtime.stateChanged');
+    const genOpts = {};
+    if (canForce) genOpts.force_chid = target.chid;
+    try {
+      if (typeof ctx.Generate === 'function') await ctx.Generate('normal', genOpts);
+      else if (typeof ctx.generate === 'function') await ctx.generate('normal', genOpts);
+      else document.getElementById('send_but')?.click();
+    } catch (err) {
+      this._pendingCue = null;
+      this._pendingCueText = '';
+      this.bus.emit('showtime.stateChanged');
+      throw err;
+    }
+  }
+
+  _resetStatusTrackCursor() {
+    const chat = getContext()?.chat || [];
+    this._statusTrackPrimed = true;
+    this._statusLastCount = chat.filter(m => m && !m.is_system).length;
+    clearTimeout(this._statusTrackTimer);
+  }
+
+  _scheduleStatusTrack() {
+    clearTimeout(this._statusTrackTimer);
+    this._statusTrackTimer = setTimeout(() => {
+      this._runCadenceKit().catch(err => console.warn('[Cast status track]', err));
+    }, 1100);
+  }
+
+  async _runCadenceKit() {
+    if (this._auditBusy) return;
+    if (!statusTrackingMasterOn(this.storage)) return;
+    let status = {};
+    try { status = this.storage.getChat('backstage', {})?.trackers?.status || {}; } catch { return; }
+    if (status.cadence === 'manual') return;
+    const chat = getContext()?.chat || [];
+    const n = chat.filter(m => m && !m.is_system).length;
+    const every = status.cadence === 'per_post' ? 1 : Math.max(1, Number(status.everyN) || 4);
+    if (!this._statusTrackPrimed) {
+      this._statusTrackPrimed = true;
+      this._statusLastCount = n;
+      return;
+    }
+    const prev = this._statusLastCount || 0;
+    if (n - prev < every) return;
+    const chars = this._inPlayChars().filter(c => STATS_ELIGIBLE.has(c.priority));
+    if (!chars.length) {
+      this._statusLastCount = n;
+      return;
+    }
+    this._statusLastCount = n;
+    const windowText = playMessagesSince(chat, prev).map(m => String(m?.mes || '')).join('\n');
+    const fakeBtn = { disabled: false, textContent: 'Audit', dataset: { quiet: '1' } };
+    const batch = [];
+    for (const char of chars.slice(0, 4)) {
+      const include = cadenceIncludeSet(char, windowText, { statsEnabled: !!char.stats?.enabled });
+      if (!include.length) continue;
+      try {
+        const out = await this._runAudit(char, 'kit', fakeBtn, { include, sinceCount: prev });
+        if (out && (out.diffs?.length || out.condition || out.kit?.length)) batch.push({ char, ...out });
+      } catch { /* ignore one failure */ }
+    }
+    this._announceStatusBatch(batch);
+  }
+
+  _announceStatusBatch(batch) {
+    const items = [];
+    const alerts = [];
+    for (const row of batch || []) {
+      const name = this._resolveDisplay(row.char).name || row.char.name || 'Cast';
+      const isStar = row.char?.priority === 'star';
+      for (const d of row.diffs || []) {
+        const mode = d.levelMode || 'label';
+        const flipped = !!(d.fromState && d.toState && d.fromState !== d.toState);
+        if (!flipped) continue;
+        if (THRESHOLD_NOTIFY_STATS.has(d.id)) {
+          alerts.push(`[Note: ${name}'s ${d.label} is now ${d.toState}]`);
+        }
+        if (!isStar) continue;
+        if (mode === 'none' || mode === 'amount') continue;
+        items.push({
+          name,
+          label: d.label,
+          fromState: d.fromState,
+          toState: d.toState,
+        });
+      }
+      if (!isStar) continue;
+      for (const ch of row.kit || []) {
+        if (ch.kind === 'condition') {
+          items.push({ name, label: 'Condition', fromState: '', toState: ch.toCondition || 'updated' });
+        } else if (ch.action === 'add') {
+          items.push({ name, label: ch.name, fromState: '', toState: ch.kind === 'wardrobe' ? 'wearing' : 'carried' });
+        } else if (ch.action === 'remove') {
+          items.push({ name, label: ch.name, fromState: '', toState: 'removed' });
+        } else if (ch.action === 'update') {
+          items.push({ name, label: ch.name, fromState: ch.fromCondition || '', toState: ch.toCondition || 'updated' });
+        }
+      }
+    }
+    if (items.length) this.bus.emit('showtime.notice', { kind: 'status', items });
+    if (alerts.length) {
+      this._pendingStatAlert = alerts.join(' ');
+      this._statAlertArmed = true;
+      this._statAlertClearOnEnd = false;
+      this.bus.emit('showtime.stateChanged');
+    }
+  }
+
   getDefaultState() {
-    return { characters: [], sortBy: 'priority', filterQuery: '', hiddenRoles: [] };
+    return { characters: [], sortBy: 'priority', filterQuery: '', hiddenRoles: [], hiddenPresence: [...DEFAULT_HIDDEN_PRESENCE] };
   }
 
   _hiddenRoles() {
@@ -279,11 +653,24 @@ export class CastModule extends Module {
     return raw.map(r => String(r || '').toLowerCase()).filter(r => ids.has(r));
   }
 
+  _hiddenPresence() {
+    const ids = new Set(PRESENCE_ORDER);
+    if (Array.isArray(this.state.hiddenPresence)) {
+      return this.state.hiddenPresence.map(r => String(r || '')).filter(r => ids.has(r));
+    }
+    const view = String(this.state.presenceView || 'inPlay');
+    if (view === 'all') return [];
+    if (view === 'absent') return PRESENCE_ORDER.filter(x => x !== 'absent');
+    if (view === 'writtenOut') return PRESENCE_ORDER.filter(x => x !== 'writtenOut');
+    return [...DEFAULT_HIDDEN_PRESENCE];
+  }
+
   /** Float a <details> popover body on document.body so overflow:hidden ancestors don't clip it. */
   _pinToolbarPop(details, bodySelector) {
     if (!details) return;
     const body = details.querySelector(bodySelector);
     if (!body) return;
+    this._rolesPopCleanup?.(); // drop the previous render's document listener
     const place = () => {
       if (!details.open) {
         if (body.parentElement !== details) details.appendChild(body);
@@ -316,10 +703,12 @@ export class CastModule extends Module {
       document.removeEventListener('pointerdown', onDoc, true);
       if (body.parentElement !== details) details.appendChild(body);
     };
+    this._rolesPopCleanup = details._castPopCleanup;
   }
 
   async onChatChanged() {
     this._expandedIds = new Set();
+    this._resetStatusTrackCursor();
     if (this.container) await this.render(this.container);
   }
 
@@ -329,8 +718,12 @@ export class CastModule extends Module {
     this.container = container;
     const s = this.state;
     s.hiddenRoles = this._hiddenRoles();
+    s.hiddenPresence = this._hiddenPresence();
     const hidden = new Set(s.hiddenRoles);
     const hideN = hidden.size;
+    const hideP = s.hiddenPresence.length;
+    const filterOn = hideN > 0 || hideP !== DEFAULT_HIDDEN_PRESENCE.length
+      || s.hiddenPresence.some(id => !DEFAULT_HIDDEN_PRESENCE.includes(id));
     // Detach any previously portaled roles body before wiping the pane
     document.querySelectorAll('.cast-roles-pop-body').forEach(n => {
       if (n.parentElement === document.body) n.remove();
@@ -345,15 +738,23 @@ export class CastModule extends Module {
           <option value="recent"   ${s.sortBy === 'recent'   ? 'selected' : ''}>By Recent</option>
         </select>
         <details class="cast-roles-pop" data-role="roles-pop">
-          <summary class="cast-btn${hideN ? ' cast-btn--active' : ''}" title="Hide selected roles from the list">Roles${hideN ? ` · ${hideN}` : ''}</summary>
+          <summary class="cast-btn${filterOn ? ' cast-btn--active' : ''}" title="Hide roles or presence from the list">Filter</summary>
           <div class="cast-roles-pop-body">
+            <p class="cast-filter-sec">Roles</p>
             <p class="cast-roles-hint">Uncheck a role to hide it from the list.</p>
             ${PRIORITIES.map(p => `
               <label class="cast-roles-opt">
                 <input type="checkbox" data-role-hide="${esc(p.id)}" ${hidden.has(p.id) ? '' : 'checked'}>
                 <span style="color:${esc(priorityMeta(p.id).color)}">${esc(p.label)}</span>
               </label>`).join('')}
-            <button type="button" class="cast-btn" data-role="roles-show-all" ${hideN ? '' : 'disabled'}>Show all</button>
+            <p class="cast-filter-sec">Presence</p>
+            <p class="cast-roles-hint">Uncheck to hide. In play only is the default.</p>
+            ${PRESENCE_FILTERS.map(v => `
+              <label class="cast-roles-opt">
+                <input type="checkbox" data-presence-hide="${esc(v.id)}" ${s.hiddenPresence.includes(v.id) ? '' : 'checked'}>
+                <span>${esc(v.label)}</span>
+              </label>`).join('')}
+            <button type="button" class="cast-btn" data-role="roles-show-all" ${filterOn ? '' : 'disabled'}>Show all</button>
           </div>
         </details>
         <button class="cast-btn" data-role="import" title="Import characters from current chat">+ From Chat</button>
@@ -377,24 +778,38 @@ export class CastModule extends Module {
     const rolesBody = rolesPop?.querySelector('.cast-roles-pop-body');
     this._pinToolbarPop(rolesPop, '.cast-roles-pop-body');
     const syncRolesChrome = () => {
-      const next = this._hiddenRoles();
-      const n = next.size;
+      const nextRoles = this._hiddenRoles();
+      const nextPres = this._hiddenPresence();
+      const n = nextRoles.length;
+      const p = nextPres.length;
+      const on = n > 0 || p !== DEFAULT_HIDDEN_PRESENCE.length
+        || nextPres.some(id => !DEFAULT_HIDDEN_PRESENCE.includes(id));
       const sum = rolesPop?.querySelector('summary');
       if (sum) {
-        sum.textContent = n ? `Roles · ${n}` : 'Roles';
-        sum.classList.toggle('cast-btn--active', n > 0);
+        sum.textContent = 'Filter';
+        sum.classList.toggle('cast-btn--active', on);
       }
       const showAll = rolesBody?.querySelector('[data-role="roles-show-all"]');
-      if (showAll) showAll.disabled = n === 0;
+      if (showAll) showAll.disabled = !on;
     };
     rolesBody?.addEventListener('change', e => {
-      const inp = e.target.closest('[data-role-hide]');
-      if (!inp) return;
-      const id = inp.dataset.roleHide;
-      const next = new Set(this._hiddenRoles());
-      if (inp.checked) next.delete(id);
-      else next.add(id);
-      this.state.hiddenRoles = [...next];
+      const roleInp = e.target.closest('[data-role-hide]');
+      const presInp = e.target.closest('[data-presence-hide]');
+      if (roleInp) {
+        const id = roleInp.dataset.roleHide;
+        const next = new Set(this._hiddenRoles());
+        if (roleInp.checked) next.delete(id);
+        else next.add(id);
+        this.state.hiddenRoles = [...next];
+      } else if (presInp) {
+        const id = presInp.dataset.presenceHide;
+        const next = new Set(this._hiddenPresence());
+        if (presInp.checked) next.delete(id);
+        else next.add(id);
+        this.state.hiddenPresence = [...next];
+      } else {
+        return;
+      }
       this.saveState();
       syncRolesChrome();
       this._renderList();
@@ -402,6 +817,7 @@ export class CastModule extends Module {
     rolesBody?.querySelector('[data-role="roles-show-all"]')?.addEventListener('click', e => {
       e.preventDefault();
       this.state.hiddenRoles = [];
+      this.state.hiddenPresence = [];
       this.saveState();
       this.render(this.container);
     });
@@ -415,7 +831,10 @@ export class CastModule extends Module {
     const listEl = this.container.querySelector('[data-role="list"]');
     const items = this._sortedFiltered();
     if (!items.length) {
-      listEl.innerHTML = `<div class="cast-empty">No cast members yet. Click <em>+ Cast</em> to add one.</div>`;
+      const hasAny = (this.state.characters || []).length;
+      listEl.innerHTML = hasAny
+        ? `<div class="cast-empty">No one matches this view. Open Filter to show a role or presence.</div>`
+        : `<div class="cast-empty">No cast members yet. Click <em>+ Cast</em> to add one.</div>`;
       return;
     }
     listEl.innerHTML = items.map(c => this._renderRow(c)).join('');
@@ -425,16 +844,39 @@ export class CastModule extends Module {
   _renderRow(c) {
     const p = priorityMeta(c.priority);
     const display = this._resolveDisplay(c);
+    const presence = normalizePresence(c);
     const portrait = display.portrait
       ? `<img src="${esc(display.portrait)}" alt="">`
       : esc((display.name || '?').charAt(0).toUpperCase());
     const inScene = c.characterCardId && this._getInCurrentChat().has(c.characterCardId);
     const isExp = this._expandedIds.has(c.id);
-    const cls = ['cast-row', c.priority, isExp && 'expanded', inScene && 'in-scene'].filter(Boolean).join(' ');
+    let standMeter = '';
+    if (c.priority !== 'director' && c.priority !== 'star') {
+      const stand = standingToward(this.storage, `cast:${c.id}`);
+      if (stand != null) {
+        const meter = standingMeterStyle(stand);
+        standMeter = `<span class="cast-stand-meter" style="--stand-color:${esc(meter.color)};--stand-deg:${meter.deg}deg" title="Toward Star: ${esc(meter.label)}"></span>`;
+      }
+    }
+    const cls = [
+      'cast-row', c.priority, isExp && 'expanded',
+      inScene && 'in-scene',
+      presence === 'absent' && 'cast-absent',
+      presence === 'writtenOut' && 'cast-written-out',
+    ].filter(Boolean).join(' ');
+    const presenceMeta = PRESENCE[presence];
+    const presenceTitle = c.priority === 'star'
+      ? (presence === 'absent'
+        ? 'Absent — persona, profile, and Star card stay out of generation'
+        : 'In play — persona injects as usual')
+      : presenceMeta.title;
+    const presenceBtn = c.priority !== 'director'
+      ? `<button class="cast-btn small" data-action="presence" title="${esc(presenceTitle)}">${esc(presenceMeta.label)}</button>`
+      : '';
     return `
       <div class="${cls}" data-id="${c.id}" style="border-left-color:${p.color}">
         <div class="cast-row-header">
-          <div class="cast-row-portrait">${portrait}</div>
+          <div class="cast-row-portrait-wrap${standMeter ? ' has-stand' : ''}">${standMeter}<div class="cast-row-portrait">${portrait}</div></div>
           <div class="cast-row-main">
             <div class="cast-row-name">
               ${esc(display.name || 'Unnamed')}
@@ -446,9 +888,14 @@ export class CastModule extends Module {
             ${normalizeAliases(c.aliases).length
               ? `<div class="cast-row-aliases">${esc(normalizeAliases(c.aliases).join(' · '))}</div>`
               : ''}
+            ${this._houseLabel(c.affiliationHouseId)
+              ? `<div class="cast-row-affil">${esc(this._houseLabel(c.affiliationHouseId))}</div>`
+              : ''}
           </div>
           <div class="cast-row-actions">
-            <button class="cast-btn small" data-action="edit">Edit</button>
+            ${presenceBtn}
+            ${c.priority !== 'director' && c.priority !== 'star' && presence !== 'writtenOut' ? `<button class="cast-btn small gold" data-action="cue" title="Cue ${esc(display.name || 'them')} to speak">Cue</button>` : ''}
+            <button class="cast-btn small" data-action="view">View</button>
             <button class="cast-btn small danger" data-action="delete">×</button>
           </div>
           ${p.hasDetails ? `<button class="cast-row-toggle" data-action="toggle" title="Details">${isExp ? '▾' : '▸'}</button>` : ''}
@@ -464,10 +911,10 @@ export class CastModule extends Module {
       <div class="cast-details">
         ${STATS_ELIGIBLE.has(c.priority) ? this._renderStats(c) : ''}
         <h4>${c.priority === 'star' ? 'Wardrobe <span class="cast-sync-tag">equipped</span>' : 'Wardrobe'} <button class="cast-audit" data-action="audit-wardrobe">Audit</button></h4>
-        ${this._renderItems(c.wardrobe ?? [], 'wardrobe')}
+        ${this._renderItems(c, 'wardrobe')}
         <button class="cast-item-add" data-action="add-wardrobe">+ Add wardrobe item</button>
         <h4>${c.priority === 'star' ? 'Props <span class="cast-sync-tag">on person</span>' : 'Props'} <button class="cast-audit" data-action="audit-props">Audit</button></h4>
-        ${this._renderItems(c.props ?? [], 'props')}
+        ${this._renderItems(c, 'props')}
         <button class="cast-item-add" data-action="add-prop">+ Add prop</button>
         <h4>Condition <button class="cast-audit" data-action="audit-condition">Audit</button></h4>
         <textarea class="cast-condition" data-action="condition"
@@ -634,6 +1081,10 @@ export class CastModule extends Module {
     return `
       <div class="cast-details cast-details--director">
         <p class="cast-dir-lead">Production dials — personification &amp; focus. These keywords feed Director events, audits, injections, and any prompt that asks the Director.</p>
+        <div class="cast-dir-inject-row">
+          <button type="button" class="cast-btn gold" data-action="inject-event">Inject event</button>
+          <span class="cast-modal-hint" style="margin:0">Force a Director beat. Opens Production settings plus optional pins from Motivation, hooks, and cast.</span>
+        </div>
         <label class="cast-dir-field">
           <span>Reply as</span>
           <select data-field="replyAsId">
@@ -665,7 +1116,12 @@ export class CastModule extends Module {
         <textarea class="cast-condition" data-dir="notes"
           placeholder="House rules, taboos to keep, recurring motifs, OOC reminders…">${esc(d.notes ?? '')}</textarea>
         <div class="cast-dir-keywords">${esc(directorKeywords(this.storage, c).join(' · ') || '—')}</div>
-        <h4>Plot Hooks <button class="cast-audit" data-action="audit-hooks">Audit</button></h4>
+        <h4>Plot Hooks
+          <span class="cast-h4-actions">
+            <button class="cast-audit" data-action="pull-hooks" title="Import beats from Motivation as plot hooks">From Motivation</button>
+            <button class="cast-audit" data-action="audit-hooks">Audit</button>
+          </span>
+        </h4>
         ${this._renderPlotHooks(c.plotHooks ?? [])}
         <button class="cast-item-add" data-action="add-plot-hook">+ Add plot hook</button>
       </div>
@@ -711,6 +1167,10 @@ export class CastModule extends Module {
       const badge = who
         ? `<span class="cast-item-cond" style="background:${priorityColor(who.priority)}">${esc(who.name)}</span>`
         : `<span class="cast-item-cond cast-item-cond--open">Unassigned</span>`;
+      const scene = hookSceneLabel(this.storage, h);
+      const board = h.stepId
+        ? `<span class="cast-item-cond cast-item-cond--board" title="Filed on their Motivation board">Board</span>`
+        : '';
       return `
       <div class="cast-item${h.active === false ? ' cast-item--inactive' : ''}" style="border-left-color:${who ? priorityColor(who.priority) : 'var(--st-sepia)'}">
         <div class="cast-item-row">
@@ -720,34 +1180,59 @@ export class CastModule extends Module {
           </label>
           <span class="cast-item-name">${esc(h.name)}</span>
           ${badge}
+          ${board}
           <div class="cast-item-actions">
             <button class="cast-btn small" data-action="edit-hook" data-hook-id="${esc(h.id)}">Edit</button>
             <button class="cast-btn small danger" data-action="remove-hook" data-hook-id="${esc(h.id)}">×</button>
           </div>
         </div>
         ${h.description ? `<div class="cast-item-desc">${esc(h.description)}</div>` : ''}
+        <div class="cast-item-scene">${scene ? esc(scene) : 'No scene linked'}</div>
       </div>`;
     }).join('');
   }
 
-  _renderItems(items, kind) {
+  _renderItems(char, kind) {
+    const items = char[kind] ?? [];
     if (!items.length) return `<div class="cast-tag-empty">None</div>`;
-    return items.map(x => {
-      const cond = CONDITION_MAP[x.condition] ?? CONDITION_MAP.pristine;
-      return `
-        <div class="cast-item" style="border-left-color:${cond.color}">
-          <div class="cast-item-row">
-            <span class="cast-item-name">${esc(x.name)}</span>
-            <span class="cast-item-cond" style="background:${cond.color}">${cond.label}</span>
-            <div class="cast-item-actions">
-              <button class="cast-btn small" data-action="edit-${kind}" data-item-id="${x.id}">Edit</button>
-              <button class="cast-btn small danger" data-action="remove-${kind}" data-item-id="${x.id}">×</button>
-            </div>
+    const roots = kind === 'props' ? kitRoots(items) : items.filter(x => !x.parentId);
+    const show = roots.length ? roots : items;
+    return show.map(x => this._renderKitItem(char, kind, x, false)).join('');
+  }
+
+  _kitOpenKey(char, item) {
+    return `${char.id}:${item.id}`;
+  }
+
+  _renderKitItem(char, kind, item, nested) {
+    const items = char[kind] ?? [];
+    const kids = kind === 'props' ? kitChildren(items, item.id) : [];
+    const isBox = inferKitKind(item) === 'container' || kids.length > 0;
+    const openKey = this._kitOpenKey(char, item);
+    const open = isBox && (this._openKitBoxes ??= new Set()).has(openKey);
+    const cond = CONDITION_MAP[item.condition] ?? CONDITION_MAP.pristine;
+    const fold = isBox
+      ? `<button type="button" class="cast-fold" data-action="toggle-kit" data-item-id="${item.id}" title="${open ? 'Collapse' : 'Expand'}">${open ? '▾' : '▸'}</button>`
+      : '';
+    const count = isBox && kids.length && !open
+      ? `<span class="cast-item-meta-inline">${kids.length} inside</span>`
+      : '';
+    return `
+      <div class="cast-item${nested ? ' cast-item--in' : ''}${isBox ? ' cast-item--box' : ''}" style="border-left-color:${cond.color}">
+        <div class="cast-item-row">
+          ${fold}
+          <span class="cast-item-name">${isBox ? '▣ ' : ''}${esc(item.name)}</span>
+          ${count}
+          <span class="cast-item-cond" style="background:${cond.color}">${cond.label}</span>
+          <div class="cast-item-actions">
+            <button class="cast-btn small" data-action="edit-${kind}" data-item-id="${item.id}">Edit</button>
+            <button class="cast-btn small danger" data-action="remove-${kind}" data-item-id="${item.id}">×</button>
           </div>
-          ${x.description ? `<div class="cast-item-desc">${esc(x.description)}</div>` : ''}
         </div>
-      `;
-    }).join('');
+        ${item.description ? `<div class="cast-item-desc">${esc(item.description)}</div>` : ''}
+      </div>
+      ${isBox && open ? kids.map(k => this._renderKitItem(char, kind, k, true)).join('') : ''}
+    `;
   }
 
   _statColor(def) {
@@ -836,7 +1321,9 @@ export class CastModule extends Module {
       if (!char) return;
 
       // Always-visible row actions
-      rowEl.querySelector('[data-action="edit"]')?.addEventListener('click', () => this._openCastingCall(char));
+      rowEl.querySelector('[data-action="view"]')?.addEventListener('click', () => this._openCastView(char));
+      rowEl.querySelector('[data-action="cue"]')?.addEventListener('click', () => this.cueCast(char));
+      rowEl.querySelector('[data-action="presence"]')?.addEventListener('click', () => this._cyclePresence(char));
       rowEl.querySelector('[data-action="delete"]')?.addEventListener('click', () => this._confirmDelete(char));
       rowEl.querySelector('[data-action="toggle"]')?.addEventListener('click', () => {
         this._expandedIds.has(id) ? this._expandedIds.delete(id) : this._expandedIds.add(id);
@@ -874,8 +1361,14 @@ export class CastModule extends Module {
         rowEl.querySelector('[data-action="add-plot-hook"]')?.addEventListener('click', () =>
           this._openPlotHookDialog(char));
 
+        rowEl.querySelector('[data-action="inject-event"]')?.addEventListener('click', () =>
+          this._openInjectEventDialog());
+
         rowEl.querySelector('[data-action="audit-hooks"]')?.addEventListener('click', e =>
           this._runAudit(char, 'hooks', e.target));
+
+        rowEl.querySelector('[data-action="pull-hooks"]')?.addEventListener('click', () =>
+          this._openPullHooksDialog(char));
 
         rowEl.querySelectorAll('[data-action="edit-hook"]').forEach(btn => {
           const hook = (char.plotHooks ?? []).find(h => h.id === btn.dataset.hookId);
@@ -884,10 +1377,13 @@ export class CastModule extends Module {
 
         rowEl.querySelectorAll('[data-action="remove-hook"]').forEach(btn => {
           btn.addEventListener('click', () => {
+            const hook = (char.plotHooks ?? []).find(h => h.id === btn.dataset.hookId);
+            if (hook) unlinkHook(this.storage, hook);
             char.plotHooks = (char.plotHooks ?? []).filter(h => h.id !== btn.dataset.hookId);
             char.updatedAt = Date.now();
             this.saveState();
             this.bus.emit('cast.updated', { character: char });
+            this.bus.emit('motivation.updated', { characterId: hook?.assignedTo });
             this._renderList();
           });
         });
@@ -932,6 +1428,15 @@ export class CastModule extends Module {
           btn.addEventListener('click', () => this._removeSubItem(char, 'wardrobe', btn.dataset.itemId)));
         rowEl.querySelectorAll('[data-action="remove-props"]').forEach(btn =>
           btn.addEventListener('click', () => this._removeSubItem(char, 'props', btn.dataset.itemId)));
+        rowEl.querySelectorAll('[data-action="toggle-kit"]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const key = `${char.id}:${btn.dataset.itemId}`;
+            const open = (this._openKitBoxes ??= new Set());
+            if (open.has(key)) open.delete(key);
+            else open.add(key);
+            this._renderList();
+          });
+        });
 
         rowEl.querySelector('[data-action="condition"]')?.addEventListener('change', e => {
           char.condition = e.target.value;
@@ -1025,11 +1530,14 @@ export class CastModule extends Module {
   }
 
   _removeSubItem(char, kind, itemId) {
-    const item = (char[kind] ?? []).find(x => x.id === itemId);
-    char[kind] = (char[kind] ?? []).filter(x => x.id !== itemId);
+    const list = char[kind] ?? [];
+    const item = list.find(x => x.id === itemId);
+    const drop = new Set([itemId, ...kitDescendantIds(list, itemId)]);
+    const gone = list.filter(x => drop.has(x.id));
+    char[kind] = list.filter(x => !drop.has(x.id));
     char.updatedAt = Date.now();
     this.saveState();
-    if (item) this._unlinkStarItem(char, item, kind);
+    for (const it of gone) this._relinquishKitItem(char, it, kind);
     this.bus.emit('cast.updated', { character: char });
     this._renderList();
   }
@@ -1071,11 +1579,23 @@ export class CastModule extends Module {
       buildText: () => this._buildDirectorInjection(),
     });
 
+    this.injector.register({
+      id: 'cast.starAbsent',
+      always: true,
+      buildText: () => this._buildStarAbsentInjection(),
+    });
+
     // One-shot: bladder/hygiene threshold crossing alert.
     this.injector.register({
       id: 'cast.stat_alert',
       always: true,
       buildText: () => this._pendingStatAlert ?? '',
+    });
+
+    this.injector.register({
+      id: 'cast.cue',
+      always: true,
+      buildText: () => this._pendingCueText || '',
     });
 
     // Trigger-based: wardrobe.
@@ -1102,9 +1622,12 @@ export class CastModule extends Module {
 
   _inSceneChars() {
     const inScene = this._getInCurrentChat();
-    return this.state.characters.filter(c =>
-      c.priority === 'star' ||
-      (c.characterCardId && inScene.has(c.characterCardId)));
+    return this.state.characters.filter(c => {
+      const presence = normalizePresence(c);
+      if (presence === 'absent' || presence === 'writtenOut') return false;
+      return c.priority === 'star' ||
+        (c.characterCardId && inScene.has(c.characterCardId));
+    });
   }
 
   _inPlayChars() {
@@ -1120,15 +1643,30 @@ export class CastModule extends Module {
     }
   }
 
+  _cyclePresence(char) {
+    if (!char || char.priority === 'director') return;
+    if (char.priority === 'star') {
+      char.presence = normalizePresence(char) === 'absent' ? 'inPlay' : 'absent';
+    } else {
+      const cur = normalizePresence(char);
+      const i = PRESENCE_ORDER.indexOf(cur);
+      char.presence = PRESENCE_ORDER[(i + 1) % PRESENCE_ORDER.length];
+    }
+    char.updatedAt = Date.now();
+    this.saveState();
+    this.bus.emit('cast.updated', { character: char });
+    this._renderList();
+  }
+
   _buildStatesInjection() {
     if (!statusTrackingMasterOn(this.storage)) return '';
-    const chars = this._inPlayChars().filter(c => c.stats?.enabled);
+    const inPlay = this._inPlayChars();
+    const chars = inPlay.filter(c => c.stats?.enabled);
     const cues = compactStatusCueInject(
       this.storage,
       getContext()?.chat || [],
       Number(this.storage.getChat('backstage', {})?.trackers?.status?.inPlayWindow) || 8,
     );
-    if (!chars.length) return cues || '';
     const customDefs = customBarDefsFromTrackers(this.storage);
     const lines = chars.map(c => {
       const name = this._resolveDisplay(c).name;
@@ -1149,8 +1687,13 @@ export class CastModule extends Module {
       }
       return `- ${name} — ${bits.join(', ')}`;
     });
-    const block = `[Character conditions right now:\n${lines.join('\n')}]`;
-    return cues ? `${block}\n${cues}` : block;
+    const statusBlock = lines.length ? `[Status:\n${lines.join('\n')}]` : '';
+    const condLines = inPlay
+      .filter(c => String(c.condition || '').trim())
+      .slice(0, 4)
+      .map(c => `- ${this._resolveDisplay(c).name} — ${clipText(c.condition, 140)}`);
+    const condBlock = condLines.length ? `[Condition:\n${condLines.join('\n')}]` : '';
+    return [statusBlock, condBlock, cues].filter(Boolean).join('\n');
   }
 
   _buildPronounsInjection() {
@@ -1172,6 +1715,13 @@ export class CastModule extends Module {
     return `[Director production dials:\n${block}]`;
   }
 
+  _buildStarAbsentInjection() {
+    const star = this.state.characters.find(c => c.priority === 'star');
+    if (normalizePresence(star) !== 'absent') return '';
+    const name = this._resolveDisplay(star).name || '{{user}}';
+    return `[Stage: ${name} (the Star / {{user}}) is off-camera this scene. Do not describe them as present, do not use their persona or profile, and do not write their inner thoughts.]`;
+  }
+
   _buildWardrobeInjection() {
     const chars = this._inSceneChars().filter(c => (c.wardrobe ?? []).length);
     if (!chars.length) return '';
@@ -1181,7 +1731,6 @@ export class CastModule extends Module {
       const items = c.wardrobe.map(w => {
         const parts = [w.name];
         if (w.condition && w.condition !== 'pristine') parts.push(`(${w.condition})`);
-        if (w.description) parts.push(`— ${clipText(w.description, 80)}`);
         return parts.join(' ');
       }).join('; ');
       return `- ${name} is wearing: ${items}${modifier ? `. ${modifier}` : ''}`;
@@ -1206,12 +1755,7 @@ export class CastModule extends Module {
     if (!chars.length) return '';
     const lines = chars.map(c => {
       const name = this._resolveDisplay(c).name;
-      const items = c.props.map(p => {
-        const parts = [p.name];
-        if (p.condition && p.condition !== 'pristine') parts.push(`(${p.condition})`);
-        if (p.description) parts.push(`— ${clipText(p.description, 80)}`);
-        return parts.join(' ');
-      }).join('; ');
+      const items = formatCarryBrief(c.props ?? []);
       return `- ${name} is carrying: ${items}`;
     });
     return `[Items carried:\n${lines.join('\n')}]`;
@@ -1219,11 +1763,82 @@ export class CastModule extends Module {
 
   // ─── modals ──────────────────────────────────────────────────────────────────
 
+  _pronounViewLine(char) {
+    const pronouns = normalizePronouns(char?.pronouns);
+    const apparent = PRONOUN_APPARENT_OPTIONS.find(o => o.id === pronouns.apparent)?.label || pronouns.apparent || '—';
+    let preferred = PRONOUN_PREFERRED_OPTIONS.find(o => o.id === pronouns.preferred)?.label || pronouns.preferred || '—';
+    if (pronouns.preferred === 'custom') {
+      preferred = [pronouns.custom.possessive, pronouns.custom.personal, pronouns.custom.reflexive]
+        .filter(Boolean).join(' / ') || 'custom';
+    }
+    return `${apparent} · ${preferred}`;
+  }
+
+  _openCastView(char) {
+    if (!char) return;
+    const display = this._resolveDisplay(char);
+    const p = priorityMeta(char.priority);
+    const presence = normalizePresence(char);
+    const portrait = display.portrait
+      ? `<img src="${esc(display.portrait)}" alt="">`
+      : esc((display.name || '?').charAt(0).toUpperCase());
+    const persona = char.personaId ? this._getPersonas().find(x => x.id === char.personaId) : null;
+    const card = char.characterCardId ? this._getCharacterCards().find(x => x.id === char.characterCardId) : null;
+    const link = persona
+      ? `Persona · ${persona.name}`
+      : card
+        ? `Character card · ${card.name}`
+        : 'Manual';
+    const affil = this._houseLabel(char.affiliationHouseId);
+    const aliases = normalizeAliases(char.aliases);
+    const bio = this._liveBio(char);
+    const manual = !char.personaId && !char.characterCardId;
+    const summary = String(char.summary || char.description || '').trim();
+    const appearance = String(char.appearance || '').trim();
+    const bioHtml = !manual && bio.mode !== 'manual'
+      ? this._renderInfoBoxes(bio, { taggedAlterEgos: char.taggedAlterEgos || [], showEgoTags: false })
+      : `
+        ${appearance ? `<div class="cast-view-block"><div class="cast-view-k">Appearance</div><div class="cast-view-v">${esc(appearance)}</div></div>` : ''}
+        ${summary ? `<div class="cast-view-block"><div class="cast-view-k">Summary</div><div class="cast-view-v">${esc(summary)}</div></div>` : ''}
+        ${!appearance && !summary ? `<div class="cast-info-empty">No appearance or summary yet.</div>` : ''}
+      `;
+
+    const backdrop = this._buildModal(`
+      <div class="cast-modal-title">PROFILE</div>
+      <div class="cast-modal-subtitle">— ${esc(display.name || 'Unnamed')} —</div>
+      <div class="cast-view-head">
+        <div class="cast-view-portrait">${portrait}</div>
+        <div>
+          <div class="cast-view-name">${esc(display.name || 'Unnamed')}
+            <span class="cast-row-badge" style="border-color:${p.color};color:${p.color}">${esc(p.label)}</span>
+          </div>
+          ${aliases.length ? `<div class="cast-row-aliases">${esc(aliases.join(' · '))}</div>` : ''}
+        </div>
+      </div>
+      <dl class="cast-view-dl">
+        <dt>Link</dt><dd>${esc(link)}</dd>
+        ${char.priority !== 'director' ? `<dt>Presence</dt><dd>${esc(PRESENCE[presence]?.label || presence)}</dd>` : ''}
+        ${bio.alterEgoName ? `<dt>Alter ego</dt><dd>${esc(bio.alterEgoName)}</dd>` : ''}
+        ${affil ? `<dt>Affiliation</dt><dd>${esc(affil)}</dd>` : ''}
+        <dt>Pronouns</dt><dd>${esc(this._pronounViewLine(char))}</dd>
+      </dl>
+      <div class="cast-view-bio">${bioHtml}</div>
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Close</button>
+        <button class="cast-btn gold" data-action="edit">Edit</button>
+      </div>
+    `);
+    backdrop.querySelector('[data-action="edit"]')?.addEventListener('click', () => {
+      backdrop.remove();
+      this._openCastingCall(char);
+    });
+  }
+
   _openCastingCall(existing = null) {
     const isEdit = !!existing;
     const c = existing ?? {
       name: '', priority: 'supporting', portrait: '',
-      description: '', aliases: [], characterCardId: '', syncFromCard: true,
+      description: '', appearance: '', affiliationHouseId: '', aliases: [], characterCardId: '', syncFromCard: true,
       personaId: '', syncFromPersona: true, replyAsId: '',
       preferEvolutia: true, alterEgoId: '', taggedAlterEgos: [],
     };
@@ -1237,6 +1852,8 @@ export class CastModule extends Module {
     const source0 = c.personaId ? 'persona' : c.characterCardId ? 'card' : 'manual';
     const others = this.state.characters.filter(x => (!existing || x.id !== existing.id) && x.priority !== 'director');
     const pronouns = normalizePronouns(c.pronouns);
+    const houses = this._repHouses();
+    const affilId = this._affiliationId(c);
 
     const backdrop = this._buildModal(`
       <div class="cast-modal-title">${isEdit ? 'RECAST' : 'CASTING CALL'}</div>
@@ -1299,10 +1916,24 @@ export class CastModule extends Module {
       <div class="cast-modal-field"><label>Portrait URL (optional)</label>
         <input type="text" data-field="portrait" value="${esc(c.portrait ?? '')}"></div>
       <div class="cast-modal-field" data-role="info-wrap">
-        <label>Information</label>
+        <label data-role="info-label">Information</label>
         <div data-role="info-view"></div>
-        <textarea data-field="description" data-role="desc-edit" style="display:none" placeholder="Optional note for manual cast entries…">${esc(c.description ?? '')}</textarea>
-        <div class="cast-modal-hint" data-role="desc-manual-hint" style="display:none">Manual entries only — linked cards and personas are read-only here; edit them in SillyTavern.</div>
+        <div data-role="manual-extras" style="display:none">
+          <label>Appearance</label>
+          <textarea data-field="appearance" placeholder="Build, face, notable marks, how they read at a glance…">${esc(c.appearance ?? '')}</textarea>
+          <label>Affiliation</label>
+          <select data-field="affiliationHouseId">
+            <option value="">— None —</option>
+            ${houses.map(h =>
+              `<option value="${esc(h.id)}" ${h.id === affilId ? 'selected' : ''}>${esc(h.alias ? `${h.name} (${h.alias})` : h.name)}</option>`).join('')}
+          </select>
+          <div class="cast-modal-hint">${houses.length
+            ? 'From Reputation organizations. Relationships still live on Connections.'
+            : 'No organizations filed yet — add one on the Reputation Affiliations tab.'}</div>
+          <label>Summary</label>
+          <textarea data-field="description" data-role="desc-edit" placeholder="Short read — who they are in this production…">${esc(c.summary || c.description || '')}</textarea>
+          <div class="cast-modal-hint" data-role="desc-manual-hint">Manual entries only — linked cards and personas are read-only here; edit them in SillyTavern.</div>
+        </div>
       </div>
       <div class="cast-modal-field" data-role="pronouns-wrap">
         <label>Pronouns</label>
@@ -1340,6 +1971,22 @@ export class CastModule extends Module {
         </div>
         <div class="cast-modal-hint">Apparent is how they present; preferred forms feed narration when this cast member is in scene.</div>
       </div>
+      ${isEdit ? '' : `
+      <div class="cast-modal-field" data-role="kit-wrap">
+        <label>Starting kit</label>
+        <div class="cast-source-row">
+          <button type="button" class="cast-source-btn" data-kit="empty">Empty</button>
+          <button type="button" class="cast-source-btn" data-kit="manual">Fill in</button>
+          <button type="button" class="cast-source-btn" data-kit="generate">Generate</button>
+        </div>
+        <div class="cast-modal-hint" data-role="kit-hint"></div>
+        <div data-role="kit-manual" style="display:none">
+          <label>Wardrobe <span class="cast-modal-hint" style="display:inline;text-transform:none;letter-spacing:0">· one garment per line</span></label>
+          <textarea data-field="kit-wardrobe" placeholder="tan jacket&#10;canvas work shirt | sleeves rolled&#10;boots (worn)"></textarea>
+          <label>Props <span class="cast-modal-hint" style="display:inline;text-transform:none;letter-spacing:0">· one object per line; nest with “in bag”</span></label>
+          <textarea data-field="kit-props" placeholder="canvas bag&#10;headphones in canvas bag&#10;charger in canvas bag"></textarea>
+        </div>
+      </div>`}
       <div class="cast-modal-actions">
         <button class="cast-btn" data-action="cancel">Cancel</button>
         <button class="cast-btn" data-action="save">${isEdit ? 'Save' : 'Cast'}</button>
@@ -1352,13 +1999,17 @@ export class CastModule extends Module {
     const aliasEl    = backdrop.querySelector('[data-field="aliases"]');
     const portEl     = backdrop.querySelector('[data-field="portrait"]');
     const descEl     = backdrop.querySelector('[data-field="description"]');
+    const appearEl   = backdrop.querySelector('[data-field="appearance"]');
+    const affilEl    = backdrop.querySelector('[data-field="affiliationHouseId"]');
     const infoView   = backdrop.querySelector('[data-role="info-view"]');
-    const manualHint = backdrop.querySelector('[data-role="desc-manual-hint"]');
+    const infoLabel  = backdrop.querySelector('[data-role="info-label"]');
+    const manualExtras = backdrop.querySelector('[data-role="manual-extras"]');
     const priEl      = backdrop.querySelector('[data-field="priority"]');
     const apparentEl = backdrop.querySelector('[data-field="pronouns-apparent"]');
     const preferredEl = backdrop.querySelector('[data-field="pronouns-preferred"]');
     const customWrap = backdrop.querySelector('[data-role="pronouns-custom"]');
     let source = source0;
+    let kitMode = 'empty';
     let infoSnapshot = String(c.description || '').trim();
     let draftAlterEgoId = String(c.alterEgoId || '').trim();
     let draftTaggedEgos = [...(c.taggedAlterEgos || [])].map(String);
@@ -1381,15 +2032,15 @@ export class CastModule extends Module {
       if (source === 'manual') {
         infoView.innerHTML = '';
         infoView.style.display = 'none';
-        descEl.style.display = '';
-        if (manualHint) manualHint.style.display = '';
-        infoSnapshot = descEl.value.trim();
+        if (infoLabel) infoLabel.style.display = 'none';
+        if (manualExtras) manualExtras.style.display = '';
+        infoSnapshot = descEl?.value.trim() || '';
         draftAlterEgoId = '';
         draftTaggedEgos = [];
         return;
       }
-      descEl.style.display = 'none';
-      if (manualHint) manualHint.style.display = 'none';
+      if (manualExtras) manualExtras.style.display = 'none';
+      if (infoLabel) infoLabel.style.display = '';
       infoView.style.display = '';
       if ((source === 'card' && !cardSel.value) || (source === 'persona' && !personaSel.value)) {
         infoView.innerHTML = `<div class="cast-info-empty">Choose a ${source === 'persona' ? 'persona' : 'character card'} to view information.</div>`;
@@ -1436,7 +2087,7 @@ export class CastModule extends Module {
       refreshInfoView();
     };
     const syncSource = () => {
-      backdrop.querySelectorAll('.cast-source-btn').forEach(b => {
+      backdrop.querySelectorAll('[data-source]').forEach(b => {
         b.classList.toggle('on', b.dataset.source === source);
       });
       backdrop.querySelector('[data-role="card-wrap"]').style.display = source === 'card' ? '' : 'none';
@@ -1448,9 +2099,29 @@ export class CastModule extends Module {
     const syncStarHint = () => {
       backdrop.querySelector('[data-role="star-hint"]').style.display = priEl.value === 'star' ? '' : 'none';
       backdrop.querySelector('[data-role="reply-as-wrap"]').style.display = priEl.value === 'director' ? '' : 'none';
+      const kitWrap = backdrop.querySelector('[data-role="kit-wrap"]');
+      if (kitWrap) kitWrap.style.display = priEl.value === 'director' ? 'none' : '';
     };
+    const syncKitMode = () => {
+      backdrop.querySelectorAll('[data-kit]').forEach(b => {
+        b.classList.toggle('on', b.dataset.kit === kitMode);
+      });
+      const manual = backdrop.querySelector('[data-role="kit-manual"]');
+      if (manual) manual.style.display = kitMode === 'manual' ? '' : 'none';
+      const hint = backdrop.querySelector('[data-role="kit-hint"]');
+      if (hint) {
+        hint.textContent = kitMode === 'generate'
+          ? 'On Cast, fill wardrobe and props from the character card or the summary you wrote.'
+          : kitMode === 'manual'
+            ? 'One item per line. Optional: name | description, or “headphones in canvas bag”.'
+            : 'Add wardrobe and props later from the call sheet, or Audit after they appear in a scene.';
+      }
+    };
+    backdrop.querySelectorAll('[data-kit]').forEach(b => {
+      b.addEventListener('click', () => { kitMode = b.dataset.kit; syncKitMode(); });
+    });
 
-    backdrop.querySelectorAll('.cast-source-btn').forEach(b => {
+    backdrop.querySelectorAll('[data-source]').forEach(b => {
       b.addEventListener('click', () => { source = b.dataset.source; syncSource(); });
     });
     cardSel.addEventListener('change', () => {
@@ -1475,6 +2146,7 @@ export class CastModule extends Module {
 
     syncSource();
     syncStarHint();
+    syncKitMode();
 
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       collectEgoDraft();
@@ -1505,8 +2177,12 @@ export class CastModule extends Module {
       const alterEgoIndex = (bioForTags?.alterEgos || []).map(e => ({ id: e.id, name: e.name }));
       // Linked bios are live/read-only — snapshot for search & offline.
       const description = source === 'manual'
-        ? descEl.value
+        ? (descEl?.value || '')
         : (this._liveBio(c, { source, cardId: characterCardId, personaId, alterEgoId }).text || infoSnapshot || '');
+      const appearance = source === 'manual' ? String(appearEl?.value || '') : (existing?.appearance || c.appearance || '');
+      const affiliationHouseId = source === 'manual'
+        ? String(affilEl?.value || '')
+        : (existing?.affiliationHouseId || c.affiliationHouseId || '');
       const pronounsNext = normalizePronouns({
         apparent: apparentEl?.value || '',
         preferred: preferredEl?.value || '',
@@ -1523,31 +2199,51 @@ export class CastModule extends Module {
       if (isEdit) {
         const prev = structuredClone(existing);
         Object.assign(existing, {
-          name, priority, portrait, description, aliases, pronouns: pronounsNext,
+          name, priority, portrait, description, appearance, affiliationHouseId,
+          aliases, pronouns: pronounsNext,
           characterCardId, syncFromCard, personaId, syncFromPersona,
           preferEvolutia, alterEgoId, taggedAlterEgos, alterEgoIndex, replyAsId,
           updatedAt: Date.now(),
         });
         if (priority === 'director') ensureDirectorDirection(existing);
         else existing.replyAsId = '';
+        this._syncAffiliation(existing.id, affiliationHouseId);
         this.saveState();
         this.bus.emit('cast.updated', { character: existing, previous: prev });
+        backdrop.remove();
+        this._renderList();
       } else {
         const newChar = {
-          id: uid(), name, priority, portrait, description, aliases, pronouns: pronounsNext,
+          id: uid(), name, priority, portrait, description, appearance, affiliationHouseId,
+          aliases, pronouns: pronounsNext,
           characterCardId, syncFromCard, personaId, syncFromPersona,
           preferEvolutia, alterEgoId, taggedAlterEgos, alterEgoIndex, replyAsId,
-          wardrobe: [], props: [], condition: '',
+          wardrobe: [], props: [], condition: '', presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         };
         if (priority === 'director') ensureDirectorDirection(newChar);
         this.state.characters.push(newChar);
+        this._syncAffiliation(newChar.id, affiliationHouseId);
+        if (priority !== 'director' && kitMode === 'manual') {
+          this._applyManualStartingKit(
+            newChar,
+            backdrop.querySelector('[data-field="kit-wardrobe"]')?.value || '',
+            backdrop.querySelector('[data-field="kit-props"]')?.value || '',
+          );
+        }
         this.saveState();
         this.bus.emit('cast.added', { character: newChar });
+        backdrop.remove();
+        this._renderList();
+        if (priority !== 'director' && kitMode === 'generate') {
+          this._generateStartingKit(newChar).catch(err => {
+            console.warn('[Cast dress]', err);
+            alert(`Cast, but kit generate failed: ${err?.message || err}`);
+          });
+        }
+        return;
       }
-      backdrop.remove();
-      this._renderList();
     });
     setTimeout(() => nameEl.focus(), 0);
   }
@@ -1566,6 +2262,122 @@ export class CastModule extends Module {
     current.updatedAt = Date.now();
     this.bus.emit('cast.updated', { character: current });
     return true;
+  }
+
+  _parseKitLines(text) {
+    const rows = [];
+    for (const line of String(text || '').split('\n')) {
+      let raw = line.trim();
+      if (!raw) continue;
+      let description = '';
+      const pipe = raw.split(/\s*[|—–]\s*/);
+      if (pipe.length > 1) {
+        raw = pipe[0].trim();
+        description = pipe.slice(1).join(' | ').trim();
+      }
+      let inside = '';
+      const inn = raw.match(/^(.*?)\s+\bin\b\s+(.+)$/i);
+      if (inn) {
+        raw = inn[1].trim();
+        inside = inn[2].trim();
+      }
+      const cond = raw.match(/\((pristine|fine|worn|damaged|broken|ruined)\)\s*$/i);
+      if (cond) raw = raw.replace(cond[0], '').trim();
+      if (!raw) continue;
+      rows.push({
+        name: raw.slice(0, 80),
+        description: description.slice(0, 200),
+        condition: (cond?.[1] || 'pristine').toLowerCase(),
+        inside,
+        kind: inferKitKind({ name: raw }),
+      });
+    }
+    return rows;
+  }
+
+  _kitStarHooks() {
+    return {
+      onStarAdd: (c, item, k) => this._mirrorStarItem(c, item, k),
+      onStarUpdate: (c, item, k) => this._mirrorStarItem(c, item, k),
+      onStarRemove: (c, item, k) => this._relinquishKitItem(c, item, k),
+      onStarMove: (c, item, fromKind, toKind) => {
+        this._unlinkStarItem(c, item, fromKind);
+        this._mirrorStarItem(c, item, toKind);
+      },
+    };
+  }
+
+  _applyManualStartingKit(char, wardrobeText, propsText) {
+    const wardrobe = this._parseKitLines(wardrobeText);
+    const props = this._parseKitLines(propsText);
+    const boxes = [];
+    const seen = new Set();
+    for (const row of props) {
+      if (!row.inside) continue;
+      const key = row.inside.trim().toLowerCase();
+      if (seen.has(key) || props.some(p => !p.inside && String(p.name || '').trim().toLowerCase() === key)) continue;
+      seen.add(key);
+      boxes.push({ name: row.inside.slice(0, 80), kind: 'container', condition: 'pristine' });
+    }
+    const hooks = this._kitStarHooks();
+    if (wardrobe.length) {
+      applyCastDelta(char, { wardrobe: { add: wardrobe, update: [], remove: [] } }, { include: ['wardrobe'], ...hooks });
+    }
+    const propAdd = [...boxes, ...props];
+    if (propAdd.length) {
+      applyCastDelta(char, { props: { add: propAdd, update: [], remove: [] } }, { include: ['props'], ...hooks });
+    }
+  }
+
+  async _generateStartingKit(char) {
+    if (!char || char.priority === 'director') return;
+    if (this._auditBusy) {
+      alert('An audit is already running. Wait for it to finish, then Audit wardrobe/props.');
+      return;
+    }
+    this._auditBusy = true;
+    try {
+      const ctx = getContext();
+      const identity = resolveCastPromptIdentity(char, this.storage, {
+        characters: ctx.characters ?? [],
+        personas: this._getPersonas(),
+      });
+      const bio = this._liveBio(char);
+      const sourceText = [
+        bio.text,
+        char.appearance,
+        char.summary,
+        char.description,
+      ].filter(t => String(t || '').trim()).join('\n\n');
+      if (!String(sourceText).trim()) {
+        throw new Error('No character card or written description to generate from.');
+      }
+      const who = this._auditIdentityLine(char, identity, { full: false });
+      const prompt = buildCastDressPrompt({
+        who,
+        sourceLabel: bio.sourceLabel || 'description',
+        sourceText: clipText(sourceText, 4000),
+      });
+      const response = await this._quietAudit(prompt, {
+        jsonSchema: castDressSchema(),
+        responseLength: FILING_RESPONSE_LENGTH,
+      });
+      const dressed = parseCastDress(response);
+      applyCastDelta(char, dressed, {
+        include: ['wardrobe', 'props'],
+        ...this._kitStarHooks(),
+      });
+      if (dressed.appearance && !String(char.appearance || '').trim()) {
+        char.appearance = dressed.appearance;
+      }
+      char.updatedAt = Date.now();
+      this.saveState();
+      this.bus.emit('cast.updated', { character: char });
+      this._expandedIds.add(char.id);
+      this._renderList();
+    } finally {
+      this._auditBusy = false;
+    }
   }
 
   _openImportFromChat() {
@@ -1618,7 +2430,7 @@ export class CastModule extends Module {
           portrait: card.avatarUrl, characterCardId: card.id,
           syncFromCard: true, personaId: '', syncFromPersona: false,
           description, aliases: [], preferEvolutia: true,
-          wardrobe: [], props: [], condition: '',
+          wardrobe: [], props: [], condition: '', presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         });
@@ -1679,7 +2491,7 @@ export class CastModule extends Module {
           portrait: p.avatarUrl, personaId: p.id, syncFromPersona: true,
           characterCardId: '', syncFromCard: false,
           description: p.description || '', aliases: [],
-          wardrobe: [], props: [], condition: '',
+          wardrobe: [], props: [], condition: '', presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         });
@@ -1693,13 +2505,33 @@ export class CastModule extends Module {
 
   _openItemDialog(char, kind, existing = null) {
     const isEdit     = !!existing;
-    const item       = existing ?? { name: '', description: '', condition: 'pristine' };
+    const item       = existing ?? { name: '', description: '', condition: 'pristine', kind: 'item', parentId: null };
     const otherKind  = kind === 'wardrobe' ? 'props' : 'wardrobe';
     const otherLabel = kind === 'wardrobe' ? 'Props' : 'Wardrobe';
     const title      = kind === 'wardrobe' ? 'WARDROBE' : 'PROPS';
+    const boxes = (char.props ?? []).filter(x =>
+      inferKitKind(x) === 'container' && (!isEdit || x.id !== existing.id),
+    );
     const moveBtn    = isEdit
       ? `<button class="cast-btn" data-action="move" style="margin-right:auto">→ Move to ${otherLabel}</button>`
       : '';
+    const nestFields = kind === 'props' ? `
+      <div class="cast-modal-field">
+        <label>What is this?</label>
+        <select data-field="kind">
+          <option value="item" ${inferKitKind(item) !== 'container' ? 'selected' : ''}>Item</option>
+          <option value="container" ${inferKitKind(item) === 'container' ? 'selected' : ''}>Container</option>
+        </select>
+      </div>
+      <div class="cast-modal-field">
+        <label>Inside a container (optional)</label>
+        <select data-field="parentId">
+          <option value="">— Loose / carried —</option>
+          ${boxes.map(c =>
+            `<option value="${c.id}" ${item.parentId === c.id ? 'selected' : ''}>${esc(c.name)}</option>`,
+          ).join('')}
+        </select>
+      </div>` : '';
 
     const backdrop = this._buildModal(`
       <div class="cast-modal-title">${title}</div>
@@ -1714,6 +2546,7 @@ export class CastModule extends Module {
             `<option value="${cn.id}" ${cn.id === item.condition ? 'selected' : ''}>${cn.label}</option>`
           ).join('')}
         </select></div>
+      ${nestFields}
       <div class="cast-modal-actions">
         ${moveBtn}
         <button class="cast-btn" data-action="cancel">Cancel</button>
@@ -1724,7 +2557,9 @@ export class CastModule extends Module {
     if (isEdit) {
       backdrop.querySelector('[data-action="move"]')?.addEventListener('click', () => {
         char[kind] = (char[kind] ?? []).filter(x => x.id !== existing.id);
-        (char[otherKind] ??= []).push({ ...existing });
+        const moved = { ...existing, parentId: kind === 'props' ? existing.parentId : null };
+        if (otherKind === 'wardrobe') moved.parentId = null;
+        (char[otherKind] ??= []).push(moved);
         char.updatedAt = Date.now();
         this.saveState();
         this._mirrorStarItem(char, existing, otherKind);
@@ -1739,10 +2574,14 @@ export class CastModule extends Module {
       if (!name) { alert('Name is required.'); return; }
       const description = backdrop.querySelector('[data-field="description"]').value.trim();
       const condition   = backdrop.querySelector('[data-field="condition"]').value;
+      const itemKind = kind === 'props'
+        ? (backdrop.querySelector('[data-field="kind"]')?.value || inferKitKind({ name }))
+        : 'item';
+      let parentId = kind === 'props' ? (backdrop.querySelector('[data-field="parentId"]')?.value || null) : null;
       if (isEdit) {
-        Object.assign(existing, { name, description, condition });
+        Object.assign(existing, { name, description, condition, kind: itemKind, parentId });
       } else {
-        (char[kind] ??= []).push({ id: uid(), name, description, condition });
+        (char[kind] ??= []).push({ id: uid(), name, description, condition, kind: itemKind, parentId });
       }
       char.updatedAt = Date.now();
       this.saveState();
@@ -1766,38 +2605,197 @@ export class CastModule extends Module {
     return inv.mobile.find(x => x.id === id) || inv.static.find(x => x.id === id) || null;
   }
 
+  _findInvByName(inv, name) {
+    const key = String(name || '').trim().toLowerCase();
+    if (!key) return null;
+    return inv.mobile.find(x => String(x.name || '').trim().toLowerCase() === key)
+      || inv.static.find(x => String(x.name || '').trim().toLowerCase() === key)
+      || null;
+  }
+
+  _compassBag() {
+    const st = this.storage.getChat('backstage', {});
+    return { st, compass: ensureCompass(st) };
+  }
+
+  _ingestInvFromPiece(piece, kind) {
+    const inv = this._invState();
+    let row = this._findInvByName(inv, piece?.name);
+    if (!row) {
+      row = {
+        id: uid(),
+        kind: piece?.kind === 'container' ? 'container' : 'item',
+        name: String(piece?.name || '').trim(),
+        description: String(piece?.description || piece?.state || '').trim(),
+        condition: piece?.condition || 'fine',
+        category: kind === 'wardrobe' ? 'wearable' : (piece?.category || 'misc'),
+        parentId: null,
+        location: 'mobile',
+      };
+      inv.mobile.push(row);
+    } else {
+      if (piece?.description && !row.description) row.description = piece.description;
+      if (piece?.condition) row.condition = piece.condition;
+      if (kind === 'wardrobe') row.category = 'wearable';
+      this._ensureMobile(inv, row);
+    }
+    return row;
+  }
+
+  _knownKitPools() {
+    const inv = this._invState();
+    const inventory = [...(inv.mobile || []), ...(inv.static || [])];
+    let setPieces = [];
+    let lost = [];
+    try {
+      const { compass } = this._compassBag();
+      lost = listLostAndFound(compass);
+      const here = getActiveRoom(compass);
+      const all = listAllSetPieces(compass).filter(p => p.layer !== 'fixtures');
+      const local = here?.id ? all.filter(p => p.placeId === here.id) : all;
+      const rest = here?.id ? all.filter(p => p.placeId !== here.id) : [];
+      setPieces = [...local, ...rest];
+    } catch { /* compass missing */ }
+    return { inventory, setPieces, lost };
+  }
+
+  _knownKitRoster(char, scene, include) {
+    const pools = this._knownKitPools();
+    const entries = collectKnownKitEntries({ char, ...pools, scene, include, max: 36 });
+    return formatKnownKitRoster(entries);
+  }
+
+  _claimKnownKit(char, kind, spec) {
+    const name = String(spec?.name || '').trim();
+    if (!name) return null;
+    const wantId = String(spec?.id || '').trim();
+    const fold = s => String(s || '').trim().toLowerCase();
+    const hitName = (list) => {
+      const rows = Array.isArray(list) ? list : [];
+      if (wantId) {
+        const byId = rows.find(x => x.id === wantId);
+        if (byId) return byId;
+      }
+      return rows.find(x => fold(x.name) === fold(name)) || null;
+    };
+    const isStar = char.priority === 'star';
+
+    const inv = this._invState();
+    const invRow = hitName([...(inv.mobile || []), ...(inv.static || [])]);
+    if (invRow) {
+      const row = {
+        id: uid(),
+        name: invRow.name,
+        description: String(spec.description || invRow.description || '').slice(0, 200),
+        condition: clampItemCondition(spec.condition || invRow.condition, invRow.condition || 'fine'),
+      };
+      if (isStar) row.inventoryId = invRow.id;
+      return row;
+    }
+
+    if (!isStar) {
+      try {
+        const pools = this._knownKitPools();
+        const world = hitName([...(pools.lost || []), ...(pools.setPieces || [])]);
+        if (world) {
+          return {
+            id: uid(),
+            name: world.name,
+            description: String(spec.description || world.description || '').slice(0, 200),
+            condition: clampItemCondition(spec.condition || world.condition, world.condition || 'fine'),
+          };
+        }
+      } catch { /* ignore */ }
+      return null;
+    }
+
+    try {
+      const { compass } = this._compassBag();
+      const lostHit = hitName(listLostAndFound(compass));
+      if (lostHit) {
+        const piece = removeFromLostAndFound(compass, lostHit.id) || lostHit;
+        const invTaken = this._ingestInvFromPiece(piece, kind);
+        this.storage.saveChat();
+        this.bus.emit('inventory.updated');
+        return {
+          id: uid(),
+          name: piece.name,
+          description: String(spec.description || piece.description || '').slice(0, 200),
+          condition: clampItemCondition(spec.condition || piece.condition, piece.condition || 'fine'),
+          inventoryId: invTaken.id,
+        };
+      }
+      const setHit = hitName(listAllSetPieces(compass).filter(p => p.layer !== 'fixtures'));
+      if (setHit) {
+        const piece = pickupItem(compass, setHit.placeId, { itemId: setHit.id });
+        const invTaken = this._ingestInvFromPiece(piece, kind);
+        this.storage.saveChat();
+        this.bus.emit('inventory.updated');
+        return {
+          id: uid(),
+          name: piece.name,
+          description: String(spec.description || piece.description || '').slice(0, 200),
+          condition: clampItemCondition(spec.condition || piece.condition, piece.condition || 'fine'),
+          inventoryId: invTaken.id,
+        };
+      }
+    } catch (err) {
+      console.warn('[Cast audit claim]', err);
+    }
+    return null;
+  }
+
   _ensureMobile(inv, row) {
-    if (row.location === 'mobile' && inv.mobile.includes(row)) return;
+    this._placeInvRow(inv, row, 'mobile', null);
+  }
+
+  _placeInvRow(inv, row, loc, parentId = null) {
     inv.static = inv.static.filter(x => x.id !== row.id);
     inv.mobile = inv.mobile.filter(x => x.id !== row.id);
-    row.parentId = null;
-    row.location = 'mobile';
-    inv.mobile.push(row);
+    row.location = loc === 'static' ? 'static' : 'mobile';
+    row.parentId = parentId || null;
+    if (row.location === 'static') inv.static.push(row);
+    else inv.mobile.push(row);
   }
 
   _mirrorStarItem(char, item, kind) {
     if (char.priority !== 'star' || !item) return;
     const inv = this._invState();
-    let row = this._findInvRow(inv, item.inventoryId);
+    let parentInvId = null;
+    if (item.parentId) {
+      const parent = [...(char.props || []), ...(char.wardrobe || [])].find(x => x.id === item.parentId);
+      if (parent && !parent.inventoryId) this._mirrorStarItem(char, parent, 'props');
+      parentInvId = parent?.inventoryId || null;
+    }
+    let row = this._findInvRow(inv, item.inventoryId)
+      || this._findInvByName(inv, item.name);
     if (!row) {
       row = {
         id: uid(),
-        kind: 'item',
+        kind: inferKitKind(item),
         name: item.name,
         description: item.description ?? '',
         condition: item.condition || 'pristine',
         category: kind === 'wardrobe' ? 'wearable' : 'misc',
-        parentId: null,
+        parentId: parentInvId,
         location: 'mobile',
       };
-      inv.mobile.push(row);
+      const parentRow = parentInvId ? this._findInvRow(inv, parentInvId) : null;
+      this._placeInvRow(inv, row, parentRow?.location || 'mobile', parentInvId);
       item.inventoryId = row.id;
     } else {
+      item.inventoryId = row.id;
       row.name = item.name;
       row.description = item.description ?? '';
       row.condition = item.condition || row.condition || 'pristine';
+      row.kind = inferKitKind(item);
       if (kind === 'wardrobe') row.category = 'wearable';
-      this._ensureMobile(inv, row);
+      if (parentInvId) {
+        const parentRow = this._findInvRow(inv, parentInvId);
+        this._placeInvRow(inv, row, parentRow?.location || row.location || 'mobile', parentInvId);
+      } else {
+        this._ensureMobile(inv, row);
+      }
     }
     row.equippedTo = kind === 'wardrobe' ? { type: 'player' } : null;
     this.storage.saveChat();
@@ -1805,27 +2803,236 @@ export class CastModule extends Module {
   }
 
   _unlinkStarItem(char, item, kind) {
-    if (char.priority !== 'star' || !item?.inventoryId) return;
+    if (char.priority !== 'star' || !item?.inventoryId) return false;
     const inv = this._invState();
     const row = this._findInvRow(inv, item.inventoryId);
-    if (!row) return;
-    if (kind === 'wardrobe') {
-      row.equippedTo = null;
-    } else {
-      inv.static = inv.static.filter(x => x.id !== row.id);
-      inv.mobile = inv.mobile.filter(x => x.id !== row.id);
-      row.parentId = null;
-      row.location = 'static';
-      row.equippedTo = null;
-      inv.static.push(row);
-    }
+    if (!row) return false;
+    inv.static = inv.static.filter(x => x.id !== row.id);
+    inv.mobile = inv.mobile.filter(x => x.id !== row.id);
+    row.parentId = null;
+    row.location = 'static';
+    row.equippedTo = null;
+    inv.static.push(row);
     this.storage.saveChat();
     this.bus.emit('inventory.updated');
+    return true;
+  }
+
+  _sendItemToLostAndFound(item, kind) {
+    const name = String(item?.name || '').trim();
+    if (!name) return;
+    try {
+      const { compass } = this._compassBag();
+      const hit = listLostAndFound(compass).find(
+        p => String(p.name || '').trim().toLowerCase() === name.toLowerCase(),
+      );
+      if (hit) return;
+      addToLostAndFound(compass, {
+        name,
+        description: item.description || '',
+        condition: item.condition || 'fine',
+        category: kind === 'wardrobe' ? 'wearable' : (item.category || 'misc'),
+      }, { layer: 'clutter' });
+      this.storage.saveChat();
+    } catch (err) {
+      console.warn('[Cast relinquish]', err);
+    }
+  }
+
+  _relinquishKitItem(char, item, kind) {
+    if (!item) return;
+    if (char.priority === 'star' && this._unlinkStarItem(char, item, kind)) return;
+    this._sendItemToLostAndFound(item, kind);
+  }
+
+  _sceneOptionsHTML(sceneUid = '') {
+    const scenes = getSceneCards(this.storage);
+    return `
+      <option value="">— Not connected —</option>
+      ${scenes.map(s =>
+        `<option value="${esc(s.uid)}" ${s.uid === sceneUid ? 'selected' : ''}>${esc(s.code)} — ${esc(s.title)}</option>`).join('')}`;
+  }
+
+  _persistPlotHook(char, hook) {
+    const result = syncBeatFromHook(this.storage, hook);
+    char.updatedAt = Date.now();
+    this.saveState();
+    this.bus.emit('cast.updated', { character: char });
+    if (result.landed) {
+      this.bus.emit('motivation.updated', { characterId: result.characterId });
+    }
+    return result;
+  }
+
+  _openInjectEventDialog() {
+    let prod = {};
+    try { prod = this.storage.getChat('backstage', {})?.production || {}; } catch { /* ignore */ }
+    const src = mergeDirectorSources(prod.sources);
+    const facets = src.tagFacets || {};
+    const pools = listDirectorInjectPools(this.storage);
+    const modeId = EVENT_MODES.some(m => m.id === prod.intrusiveness) ? prod.intrusiveness : 'advance';
+    const randomOn = !!prod.intrudeRandom;
+
+    const poolBox = (title, rows, dataKey) => {
+      if (!rows.length) {
+        return `<div class="cast-modal-field"><label>${esc(title)}</label>
+          <div class="cast-tag-empty">None filed yet.</div></div>`;
+      }
+      return `<div class="cast-modal-field"><label>${esc(title)}</label>
+        <div class="cast-inject-pool">
+          ${rows.map(r => `<label class="cast-inject-opt">
+            <input type="checkbox" data-pool="${esc(dataKey)}" value="${esc(r.key || r.id)}">
+            <span>${esc(r.line || (r.who ? `${r.title} (${r.who})` : r.title))}</span>
+          </label>`).join('')}
+        </div></div>`;
+    };
+
+    const aliasOpts = (member) => {
+      if (!member) return '<option value="">— Pick a cast member —</option>';
+      const names = [member.name, ...(member.aliases || [])]
+        .map(n => String(n || '').trim())
+        .filter(Boolean);
+      const seen = new Set();
+      return names.filter(n => {
+        const k = n.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }).map((n, i) => `<option value="${esc(n)}" ${i === 0 ? 'selected' : ''}>${esc(n)}</option>`).join('');
+    };
+
+    const backdrop = this._buildModal(`
+      <div class="cast-modal-title">INJECT EVENT</div>
+      <div class="cast-modal-subtitle">— Director check —</div>
+      <p class="cast-modal-hint">Uses Production settings for this roll. Pins below are optional — the Director must weave any you select. Works even if Director on call is off.</p>
+      <div class="cast-modal-field"><label>Intrusiveness</label>
+        <div class="cast-inject-modes">
+          ${EVENT_MODES.map(i => `
+            <label class="cast-inject-opt" title="${esc(i.tip || '')}">
+              <input type="radio" name="cast-intrude" data-field="intrusiveness" value="${esc(i.id)}"
+                ${modeId === i.id ? 'checked' : ''} ${randomOn ? 'disabled' : ''}>
+              ${esc(i.label)}
+            </label>`).join('')}
+          <label class="cast-inject-opt" title="Each check rolls Derail, Twist, Advance, or Pressure at random">
+            <input type="checkbox" data-field="intrudeRandom" ${randomOn ? 'checked' : ''}>
+            Random
+          </label>
+        </div>
+        <div class="cast-modal-hint" data-role="intrude-tip">${esc(randomOn
+          ? 'Random — each check picks how hard the beat hits'
+          : (EVENT_MODES.find(m => m.id === modeId)?.tip || ''))}</div>
+      </div>
+      <div class="cast-modal-field"><label>Director may pull from</label>
+        <div class="cast-inject-sources">
+          <label class="cast-inject-opt"><input type="checkbox" data-src="tags" ${src.tags ? 'checked' : ''}> Limit by tag</label>
+          <div class="cast-inject-facets" data-role="tags-facets" ${src.tags ? '' : 'hidden'}>
+            ${DIRECTOR_TAG_FACETS.map(f =>
+              `<label class="cast-inject-opt"><input type="checkbox" data-facet="${esc(f.id)}" ${facets[f.id] !== false ? 'checked' : ''}> ${esc(f.label)}</label>`).join('')}
+          </div>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="stage" ${src.stage !== false ? 'checked' : ''}> Stage / Set</label>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="inventory" ${src.inventory ? 'checked' : ''}> Inventory</label>
+          <div class="cast-inject-facets" data-role="inv-facets" ${src.inventory ? '' : 'hidden'}>
+            <label class="cast-inject-opt"><input type="checkbox" data-src="inventoryOnPerson" ${src.inventoryOnPerson !== false ? 'checked' : ''}> On Person</label>
+            <label class="cast-inject-opt"><input type="checkbox" data-src="inventoryTrunk" ${src.inventoryTrunk !== false ? 'checked' : ''}> Trunk</label>
+          </div>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="script" ${src.script ? 'checked' : ''}> Script</label>
+          <div class="cast-inject-facets" data-role="script-facets" ${src.script ? '' : 'hidden'}>
+            <label class="cast-inject-opt"><input type="checkbox" data-src="scriptStampedLore" ${src.scriptStampedLore ? 'checked' : ''}> Stamped lorebook entries</label>
+          </div>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="events" ${src.events !== false ? 'checked' : ''}> Events &amp; Holidays</label>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="library" ${src.library ? 'checked' : ''}> Library</label>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="reputation" ${src.reputation ? 'checked' : ''}> Reputation</label>
+          <label class="cast-inject-opt"><input type="checkbox" data-src="motivation" ${src.motivation ? 'checked' : ''}> Motivation</label>
+        </div>
+      </div>
+      <div class="cast-modal-field"><label>Cast member (optional)</label>
+        <select data-field="castId">
+          <option value="">— Any / Director’s pick —</option>
+          ${pools.cast.map(c =>
+            `<option value="${esc(c.id)}">${esc(c.name)}${c.priority === 'director' ? ' (Director)' : ''}</option>`).join('')}
+        </select>
+      </div>
+      <div class="cast-modal-field" data-role="alias-wrap" hidden>
+        <label>Alias for generation</label>
+        <select data-field="alias">${aliasOpts(null)}</select>
+        <div class="cast-modal-hint">The beat will use this name instead of the card’s primary name.</div>
+      </div>
+      ${poolBox('Motivations (beats)', pools.beats, 'beat')}
+      ${poolBox('Plot hooks', pools.hooks, 'hook')}
+      ${poolBox('Secrets', pools.secrets, 'secret')}
+      ${poolBox('Achievements', pools.achievements, 'achievement')}
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Cancel</button>
+        <button class="cast-btn gold" data-action="save">Generate</button>
+      </div>
+    `);
+    backdrop.querySelector('.cast-modal')?.classList.add('cast-modal--wide');
+
+    const randomCb = backdrop.querySelector('[data-field="intrudeRandom"]');
+    const radios = () => backdrop.querySelectorAll('[data-field="intrusiveness"]');
+    const tipEl = backdrop.querySelector('[data-role="intrude-tip"]');
+    const syncIntrude = () => {
+      const rand = !!randomCb?.checked;
+      radios().forEach(r => { r.disabled = rand; });
+      const id = backdrop.querySelector('[data-field="intrusiveness"]:checked')?.value || modeId;
+      tipEl.textContent = rand
+        ? 'Random — each check picks how hard the beat hits'
+        : (EVENT_MODES.find(m => m.id === id)?.tip || '');
+    };
+    randomCb?.addEventListener('change', syncIntrude);
+    radios().forEach(r => r.addEventListener('change', syncIntrude));
+
+    const toggleRow = (srcName, role) => {
+      const on = backdrop.querySelector(`[data-src="${srcName}"]`)?.checked;
+      const row = backdrop.querySelector(`[data-role="${role}"]`);
+      if (row) row.hidden = !on;
+    };
+    backdrop.querySelector('[data-src="tags"]')?.addEventListener('change', () => toggleRow('tags', 'tags-facets'));
+    backdrop.querySelector('[data-src="inventory"]')?.addEventListener('change', () => toggleRow('inventory', 'inv-facets'));
+    backdrop.querySelector('[data-src="script"]')?.addEventListener('change', () => toggleRow('script', 'script-facets'));
+
+    const castSel = backdrop.querySelector('[data-field="castId"]');
+    const aliasWrap = backdrop.querySelector('[data-role="alias-wrap"]');
+    const aliasSel = backdrop.querySelector('[data-field="alias"]');
+    const fillAlias = () => {
+      const member = pools.cast.find(c => c.id === castSel.value);
+      aliasWrap.hidden = !member;
+      aliasSel.innerHTML = aliasOpts(member);
+    };
+    castSel?.addEventListener('change', fillAlias);
+
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+      const sources = mergeDirectorSources(src);
+      backdrop.querySelectorAll('[data-src]').forEach(el => {
+        sources[el.dataset.src] = !!el.checked;
+      });
+      sources.tagFacets = { ...sources.tagFacets };
+      backdrop.querySelectorAll('[data-facet]').forEach(el => {
+        sources.tagFacets[el.dataset.facet] = !!el.checked;
+      });
+      const checked = (key) => [...backdrop.querySelectorAll(`[data-pool="${key}"]:checked`)].map(el => el.value);
+      const picks = {
+        castId: castSel.value || '',
+        alias: aliasWrap.hidden ? '' : (aliasSel.value || ''),
+        beatIds: checked('beat'),
+        hookIds: checked('hook'),
+        secretIds: checked('secret'),
+        achievementIds: checked('achievement'),
+      };
+      const settings = {
+        intrusiveness: backdrop.querySelector('[data-field="intrusiveness"]:checked')?.value || modeId,
+        intrudeRandom: !!randomCb?.checked,
+        sources,
+      };
+      backdrop.remove();
+      this.bus.emit('production.forceDirectorCheck', { settings, picks });
+    });
   }
 
   _openPlotHookDialog(char, existing = null) {
     const isEdit = !!existing;
-    const hook = normalizePlotHook(existing) || { name: '', description: '', assignedTo: '', active: true };
+    const hook = normalizePlotHook(existing) || { name: '', description: '', assignedTo: '', sceneUid: '', active: true };
+    const hint = isEdit ? hookBoardHint(this.storage, hook) : 'Assign a Star, Lead, Major, or Foil and link a Script scene to file this on their Motivation board.';
 
     const backdrop = this._buildModal(`
       <div class="cast-modal-title">PLOT HOOK</div>
@@ -1837,6 +3044,10 @@ export class CastModule extends Module {
       <div class="cast-modal-field"><label>Assigned to</label>
         <select data-field="assignedTo">${this._hookAssigneeOptions(hook.assignedTo)}</select>
         <div class="cast-modal-hint">Who this pressure sits on. Unassigned hooks stay in the Director’s pool.</div>
+      </div>
+      <div class="cast-modal-field"><label>Script scene</label>
+        <select data-field="sceneUid">${this._sceneOptionsHTML(hook.sceneUid)}</select>
+        <div class="cast-modal-hint">${esc(hint)}</div>
       </div>
       <div class="cast-modal-field">
         <label style="display:flex;align-items:center;gap:6px;cursor:pointer;text-transform:none;
@@ -1855,21 +3066,84 @@ export class CastModule extends Module {
       const name = backdrop.querySelector('[data-field="name"]').value.trim();
       const description = backdrop.querySelector('[data-field="description"]').value.trim();
       const assignedTo = backdrop.querySelector('[data-field="assignedTo"]').value.trim();
+      const sceneUid = backdrop.querySelector('[data-field="sceneUid"]').value.trim();
       const active = backdrop.querySelector('[data-field="active"]').checked;
       if (!name) { alert('Name is required.'); return; }
-      const next = { name, description, assignedTo, active, text: name };
+      const next = { name, description, assignedTo, sceneUid, active, text: name };
+      let row = existing;
       if (isEdit) {
         Object.assign(existing, next);
       } else {
-        (char.plotHooks ??= []).push({ id: uid(), ...next });
+        row = { id: uid(), stepId: '', ...next };
+        (char.plotHooks ??= []).push(row);
+      }
+      const result = this._persistPlotHook(char, row);
+      backdrop.remove();
+      this._renderList();
+      if (result.reason === 'billing' && assignedTo && sceneUid) {
+        alert('Motivation boards are for Star, Lead, Major, or Foil. The hook is saved here until you reassign it.');
+      }
+    });
+    setTimeout(() => backdrop.querySelector('[data-field="name"]').focus(), 0);
+  }
+
+  _openPullHooksDialog(char) {
+    const rows = listPullableBeats(this.storage);
+    if (!rows.length) {
+      alert('No unlinked Motivation beats to pull. Add beats on a Star, Lead, Major, or Foil first.');
+      return;
+    }
+    const groups = [];
+    const byChar = new Map();
+    for (const row of rows) {
+      if (!byChar.has(row.characterId)) {
+        const g = { id: row.characterId, name: row.characterName, items: [] };
+        byChar.set(row.characterId, g);
+        groups.push(g);
+      }
+      byChar.get(row.characterId).items.push(row);
+    }
+    const backdrop = this._buildModal(`
+      <div class="cast-modal-title">FROM MOTIVATION</div>
+      <div class="cast-modal-subtitle">— pull beats onto the Director’s hook list —</div>
+      <div class="cast-pull-list">
+        ${groups.map(g => `
+          <div class="cast-pull-group">
+            <div class="cast-pull-who">${esc(g.name)}</div>
+            ${g.items.map(it => `
+              <label class="cast-pull-row">
+                <input type="checkbox" data-char="${esc(it.characterId)}" data-step="${esc(it.step.id)}" checked>
+                <span class="cast-pull-title">${esc(it.step.title || 'Untitled beat')}</span>
+                <span class="cast-pull-scene">${esc(it.scene || 'No scene')}</span>
+              </label>`).join('')}
+          </div>`).join('')}
+      </div>
+      <div class="cast-modal-hint">Checked beats become plot hooks assigned to that character. Linked scenes come along.</div>
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Cancel</button>
+        <button class="cast-btn" data-action="save">Pull selected</button>
+      </div>
+    `);
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+      const picks = [...backdrop.querySelectorAll('input[type="checkbox"]:checked')];
+      if (!picks.length) { alert('Select at least one beat.'); return; }
+      let n = 0;
+      const touched = new Set();
+      for (const el of picks) {
+        const hit = rows.find(r => r.characterId === el.dataset.char && r.step.id === el.dataset.step);
+        if (!hit) continue;
+        const out = pullBeatAsHook(this.storage, hit.characterId, hit.step);
+        if (out.created) n += 1;
+        if (out.hooked) touched.add(hit.characterId);
       }
       char.updatedAt = Date.now();
       this.saveState();
       this.bus.emit('cast.updated', { character: char });
+      for (const id of touched) this.bus.emit('motivation.updated', { characterId: id });
       backdrop.remove();
       this._renderList();
+      if (!n) alert('Those beats were already plot hooks.');
     });
-    setTimeout(() => backdrop.querySelector('[data-field="name"]').focus(), 0);
   }
 
   _buildModal(innerHtml) {
@@ -1893,12 +3167,18 @@ export class CastModule extends Module {
   _sortedFiltered() {
     const q = (this.state.filterQuery ?? '').toLowerCase().trim();
     const hidden = new Set(this._hiddenRoles());
+    const hiddenPresence = new Set(this._hiddenPresence());
     let list = this.state.characters.filter(c => {
       if (hidden.has(c.priority)) return false;
+      const presence = normalizePresence(c);
+      if (hiddenPresence.has(presence)) return false;
       if (!q) return true;
-      return (c.name ?? '').toLowerCase().includes(q) ||
-             (c.description ?? '').toLowerCase().includes(q) ||
-             normalizeAliases(c.aliases).some(a => a.toLowerCase().includes(q));
+      const hay = [
+        c.name, c.description, c.summary, c.appearance,
+        this._houseLabel(c.affiliationHouseId),
+        ...normalizeAliases(c.aliases),
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
     });
     const by = this.state.sortBy ?? 'priority';
     if (by === 'priority') {
@@ -1917,6 +3197,48 @@ export class CastModule extends Module {
 
   _find(id) {
     return this.state.characters.find(c => c.id === id);
+  }
+
+  _repHouses() {
+    try {
+      return (this.storage.getChat('reputation', { house: [] }).house || [])
+        .filter(h => h && h.id)
+        .slice()
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    } catch {
+      return [];
+    }
+  }
+
+  _houseLabel(houseId) {
+    const id = String(houseId || '').trim();
+    if (!id) return '';
+    const h = this._repHouses().find(x => x.id === id);
+    if (!h?.name) return '';
+    return h.alias ? `${h.name} (${h.alias})` : h.name;
+  }
+
+  _affiliationId(char) {
+    const explicit = String(char?.affiliationHouseId || '').trim();
+    if (explicit) return explicit;
+    return characterHouseIds(this.storage, char?.id)[0] || '';
+  }
+
+  _syncAffiliation(charId, houseId) {
+    const cid = String(charId || '').trim();
+    const hid = String(houseId || '').trim();
+    if (!cid || !hid) return;
+    try {
+      const rep = this.storage.getChat('reputation', { house: [] });
+      const h = (rep.house || []).find(x => x.id === hid);
+      if (!h) return;
+      if (h.headId === cid) return;
+      h.connections = Array.isArray(h.connections) ? h.connections : [];
+      if (h.connections.some(c => c.characterId === cid)) return;
+      h.connections.push({ characterId: cid, role: '' });
+      this.storage.saveChat();
+      this.bus?.emit('reputation.updated', {});
+    } catch { /* reputation optional */ }
   }
 
   _getCharacterCards() {
@@ -1997,42 +3319,15 @@ export class CastModule extends Module {
     return `${name}: ${body}`;
   }
 
-  // Filter chat to messages by or about this character; hard-cap a small excerpt.
-  _getCharacterContext(char, linkedCard, ctx) {
-    const allChat = ctx.chat ?? [];
-    const charName = (linkedCard?.name ?? char.name ?? '').trim().toLowerCase();
-    const cap = 720;
-    const take = (rows) => rows.map(m => this._formatChatLine(m)).filter(Boolean).join('\n').slice(-cap);
-
-    if (char.priority === 'star') {
-      const byUser = allChat.filter(m => m.is_user && !m.is_system);
-      const source = byUser.length >= 2 ? byUser.slice(-4) : allChat.filter(m => !m.is_system).slice(-4);
-      return take(source);
-    }
-    const usable = allChat.filter(m => m && !m.is_system);
-    if (!charName) return take(usable.slice(-4));
-
-    const byChar = usable.filter(m => (m.name ?? '').trim().toLowerCase() === charName);
-    const mentioning = usable.filter(m =>
-      (m.name ?? '').trim().toLowerCase() !== charName &&
-      this._plainMes(m.mes).toLowerCase().includes(charName));
-
-    const relevant = [...byChar.slice(-3), ...mentioning.slice(-2)]
-      .filter((v, i, a) => a.indexOf(v) === i)
-      .sort((a, b) => allChat.indexOf(a) - allChat.indexOf(b));
-
-    const source = relevant.length >= 2 ? relevant.slice(-4) : usable.slice(-4);
-    return take(source);
-  }
-
   _getPlotHookContext(ctx) {
     const rows = recentPlayMessages(ctx.chat ?? [], 16);
-    return rows.map(m => this._formatChatLine(m)).filter(Boolean).join('\n').slice(-2400);
+    return clipExcerptToLines(rows.map(m => this._formatChatLine(m)).filter(Boolean).join('\n'), 2400);
   }
 
-  _auditIdentityLine(char, identity) {
+  _auditIdentityLine(char, identity, { full = true } = {}) {
     const name = identity?.displayName || identity?.name || char.name || 'Unnamed';
     const role = priorityMeta(char.priority)?.label || char.priority || 'cast';
+    if (!full) return `${name} (${role})`;
     const forms = formatPronounsPromptLine({ ...char, name: '' });
     const ego = identity?.alterEgoName ? ` · ego ${identity.alterEgoName}` : '';
     return `${name} (${role}${ego})${forms ? ` · ${forms}` : ''}`;
@@ -2043,161 +3338,59 @@ export class CastModule extends Module {
   }
 
   /**
-   * Isolated quiet generation — do not ride ST's full chat/card prompt.
-   * generateRaw + instructOverride keeps the request to this prompt only.
+   * Isolated quiet generation — pin to this prompt; never ride ST's card/history.
    */
-  async _quietAudit(prompt, { jsonSchema = null, responseLength = 350 } = {}) {
+  async _quietAudit(prompt, { jsonSchema = null, responseLength = FILING_RESPONSE_LENGTH } = {}) {
     const text = String(prompt || '').trim();
     const isRate = (t) => this._isAuditRateLimit(t);
-    return withShowtimeProfile(this.storage, 'audit', async () => {
-      const runRaw = async () => {
-        try {
-          return String(await generateRaw({
-            prompt: text,
-            systemPrompt: 'Return only the requested JSON or short text. No roleplay. No markdown.',
-            instructOverride: true,
-            quietToLoud: true,
-            responseLength,
-            jsonSchema,
-            trimNames: false,
-          }) ?? '').trim();
-        } catch (err) {
-          if (isRate(err?.message)) throw err;
-          console.warn('[Cast audit generateRaw]', err);
-          return '';
-        }
-      };
-      let response = await runRaw();
-      if (!response) {
-        try {
-          response = String(await generateQuietPrompt({
-            quietPrompt: text,
-            trimToSentence: false,
-            skipWIAN: true,
-            quietName: 'System',
-          }) ?? '').trim();
-        } catch (err) {
-          if (isRate(err?.message)) {
-            throw new Error('Too many requests — wait a few seconds and press Audit again.');
-          }
-          throw err;
-        }
-      }
+    const chatToken = getContext()?.chatMetadata ?? null;
+    const guard = (out) => {
+      if ((getContext()?.chatMetadata ?? null) !== chatToken) throw new Error('Chat changed during generation — result discarded.');
+      return out;
+    };
+    const schema = jsonSchema && schemaAllowed() ? jsonSchema : null;
+    return guard(await withShowtimeProfile(this.storage, 'audit', async () => {
+      const response = await leanQuietGenerate(text, {
+        jsonSchema: schema,
+        responseLength,
+        kind: 'filing',
+      });
+      if (!response) throw new Error('Empty audit reply.');
       if (isRate(response)) {
         throw new Error('Too many requests — wait a few seconds and press Audit again.');
       }
       return response;
-    });
+    }));
   }
 
   // ─── audit ───────────────────────────────────────────────────────────────────
 
-  async _runAudit(char, kind, btn) {
+  async _runAudit(char, kind, btn, opts = {}) {
     if (this._auditBusy) {
-      alert('An audit is already running. Wait for it to finish.');
+      if (!btn?.dataset?.quiet) alert('An audit is already running. Wait for it to finish.');
       return;
     }
     const now = Date.now();
-    if (this._auditLastAt && now - this._auditLastAt < 1600) {
+    const quiet = !!btn?.dataset?.quiet;
+    if (!quiet && this._auditLastAt && now - this._auditLastAt < 1600) {
       alert('Too soon — wait a moment before another Audit (avoids rate limits).');
       return;
     }
     this._auditLastAt = now;
     this._auditBusy = true;
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '...';
+    if (btn) btn.disabled = true;
+    const origText = btn?.textContent;
+    if (btn) btn.textContent = '...';
     try {
       const ctx = getContext();
       const identity = resolveCastPromptIdentity(char, this.storage, {
         characters: ctx.characters ?? [],
         personas: this._getPersonas(),
       });
-      const who = this._auditIdentityLine(char, identity);
-      const recentChat = kind === 'hooks'
-        ? (this._getPlotHookContext(ctx) || '(no recent scene)')
-        : (this._getCharacterContext(char, {
-          name: identity.displayName || identity.name || char.name,
-        }, ctx) || '(no recent scene)');
 
-      let prompt;
-      let jsonSchema = null;
-      let responseLength = 280;
-      if (kind === 'wardrobe') {
-        const existing = (char.wardrobe ?? []).map(x => `- ${x.name}`).join('\n') || 'None';
-        prompt = `JSON array only. Clothing ${who} is explicitly described wearing in the scene text below. No card lore, no invented items.
-Scene:
-${recentChat}
-Already listed (do not repeat):
-${existing}
-0–6 items. Exclude carried objects. If no new clothing is described, return [].
-[{"name":"","description":"","condition":"pristine|fine|worn|damaged|broken|ruined"}]`;
-        jsonSchema = {
-          name: 'cast_wardrobe',
-          description: 'Worn clothing items',
-          strict: false,
-          returnInvalid: true,
-          value: {
-            type: 'array', maxItems: 6,
-            items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, condition: { type: 'string' } }, required: ['name'] },
-          },
-        };
-      } else if (kind === 'props') {
-        const existing = (char.props ?? []).map(x => `- ${x.name}`).join('\n') || 'None';
-        prompt = `JSON array only. Objects ${who} is explicitly described carrying (not wearing) in the scene text below. No card lore, no invented items.
-Scene:
-${recentChat}
-Already listed (do not repeat):
-${existing}
-0–6 items. Exclude clothing. If nothing new is described, return [].
-[{"name":"","description":"","condition":"pristine|fine|worn|damaged|broken|ruined"}]`;
-        jsonSchema = {
-          name: 'cast_props',
-          description: 'Carried objects',
-          strict: false,
-          returnInvalid: true,
-          value: {
-            type: 'array', maxItems: 6,
-            items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, condition: { type: 'string' } }, required: ['name'] },
-          },
-        };
-      } else if (kind === 'condition') {
-        prompt = `1–3 sentences, no preamble. Physical/mental state of ${who}.
-Scene:
-${recentChat}
-Existing notes: ${String(char.condition || 'None').slice(0, 400)}`;
-        responseLength = 180;
-      } else if (kind === 'stats') {
-        if (!char.stats) char.stats = DEFAULT_STATS();
-        if (!char.stats.enabled) throw new Error('Enable Track on Stats before auditing.');
-        const trackerSnapshot = this._statsAuditSnapshot(char);
-        const keys = trackerSnapshot.trackers.map(t => `"${t.id}"`).join(', ');
-        const cond = String(char.condition || 'None').slice(0, 400);
-        prompt = `JSON only. Audit ONLY the listed trackers for ${who}, based strictly on the scene below. Ignore clothing, props, and inventory entirely — do not mention or infer them.
-Scene:
-${recentChat}
-Trackers (id · label · current 0–100 · state):
-${trackerSnapshot.lines}
-Condition notes: ${cond}
-Rules: use ONLY these exact tracker ids as keys: ${keys}. Each value is an integer 0–100 (start from the current value above; keep it unchanged if the scene gives no reason to shift it). Do not add, rename, or omit tracker keys.
-Return exactly: {"stats":{${keys}},"condition":"1–3 sentences on current physical/mental state"}`;
-        const statsProps = Object.fromEntries(trackerSnapshot.trackers.map(t => [t.id, { type: 'integer' }]));
-        jsonSchema = {
-          name: 'cast_stats',
-          description: 'Enabled tracker values and condition',
-          strict: false,
-          returnInvalid: true,
-          value: {
-            type: 'object',
-            properties: {
-              stats: { type: 'object', properties: statsProps },
-              condition: { type: 'string' },
-            },
-            required: ['stats'],
-          },
-        };
-        responseLength = 220;
-      } else if (kind === 'hooks') {
+      if (kind === 'hooks') {
+        const who = this._auditIdentityLine(char, identity, { full: true });
+        const recentChat = this._getPlotHookContext(ctx) || '(no recent scene)';
         const roster = this.state.characters.filter(c => c.priority !== 'director');
         const rosterLines = roster.map(c =>
           `- ${c.name} | id=${c.id} | ${PRIORITY_MAP[c.priority]?.label || c.priority}`
@@ -2207,7 +3400,7 @@ Return exactly: {"stats":{${keys}},"condition":"1–3 sentences on current physi
           .filter(Boolean)
           .map(h => `- ${h.name}${h.assignedTo ? ` → ${this.state.characters.find(c => c.id === h.assignedTo)?.name || h.assignedTo}` : ''}`)
           .join('\n') || 'None';
-        prompt = `JSON array only. Potential plot hooks from the chat history below: unresolved tensions, promises, mysteries, deadlines, debts, secrets leaking, obligations, dangling questions. Ground each hook in the scene — no card lore, no invented subplots.
+        const prompt = `JSON array only. Potential plot hooks from the chat history below: unresolved tensions, promises, mysteries, deadlines, debts, secrets leaking, obligations, dangling questions. Ground each hook in the scene — no card lore, no invented subplots.
 Director keywords: ${directorKeywords(this.storage, char).join('; ') || '—'}
 Cast (assign a hook to one of these when it clearly belongs to them; otherwise assignedTo empty):
 ${rosterLines}
@@ -2217,7 +3410,7 @@ Chat:
 ${recentChat}
 0–8 hooks. assignedTo must be a listed id, a listed name, or "".
 [{"name":"short title","description":"one sentence","assignedTo":""}]`;
-        jsonSchema = {
+        const jsonSchema = {
           name: 'cast_plot_hooks',
           description: 'Potential plot hooks from chat',
           strict: false,
@@ -2235,23 +3428,9 @@ ${recentChat}
             },
           },
         };
-        responseLength = 420;
-      }
-
-      const response = await this._quietAudit(prompt, { jsonSchema, responseLength });
-
-      if (kind === 'condition') {
-        char.condition = response.trim().slice(0, 2000);
-      } else if (kind === 'stats') {
-        const match = response.match(/\{[\s\S]*\}/);
-        if (!match) throw new Error('No JSON object in AI response.');
-        const parsed = JSON.parse(match[0]);
-        this._applyStatsAudit(char, parsed);
-      } else if (kind === 'hooks') {
-        const match = response.match(/\[[\s\S]*\]/);
-        if (!match) throw new Error('No JSON array in AI response.');
-        const items = JSON.parse(match[0]);
-        if (!Array.isArray(items)) throw new Error('AI response not an array.');
+        const response = await this._quietAudit(prompt, { jsonSchema, responseLength: FILING_RESPONSE_LENGTH });
+        const items = parseJsonArray(response);
+        if (!Array.isArray(items)) throw new Error('No JSON array in AI response.');
         const have = new Set((char.plotHooks ?? [])
           .map(h => String(normalizePlotHook(h)?.name || '').toLowerCase())
           .filter(Boolean));
@@ -2269,37 +3448,128 @@ ${recentChat}
             active: true,
           });
         });
-      } else {
-        const match = response.match(/\[[\s\S]*\]/);
-        if (!match) throw new Error('No JSON array in AI response.');
-        const items = JSON.parse(match[0]);
-        if (!Array.isArray(items)) throw new Error('AI response not an array.');
-        (char[kind] ??= []);
-        items.forEach(it => {
-          if (!it?.name) return;
-          char[kind].push({
-            id: uid(),
-            name: String(it.name).slice(0, 80),
-            description: String(it.description ?? '').slice(0, 200),
-            condition: CONDITION_MAP[it.condition] ? it.condition : 'pristine',
-          });
-          this._mirrorStarItem(char, char[kind].at(-1), kind);
-        });
+        char.updatedAt = Date.now();
+        this.saveState();
+        this.bus.emit('cast.updated', { character: char });
+        this._renderList();
+        return;
       }
+
+      if (kind === 'stats') {
+        if (!char.stats) char.stats = DEFAULT_STATS();
+        if (!char.stats.enabled) throw new Error('Enable Track on Stats before auditing.');
+      }
+
+      const include = Array.isArray(opts.include) && opts.include.length
+        ? opts.include
+        : auditIncludeForKind(kind, char);
+      if (!include.length) return null;
+      const who = this._auditIdentityLine(char, identity, {
+        full: include.includes('stats') || include.includes('condition'),
+      });
+
+      const excerptChar = {
+        ...char,
+        name: identity.displayName || identity.name || char.name,
+      };
+      const kitOn = include.includes('stats') || include.includes('wardrobe') || include.includes('props');
+      const excerptOpts = {
+        char: excerptChar,
+        sinceCount: opts.sinceCount,
+        cap: kitOn ? KIT_SCENE_CAP : undefined,
+        lineCap: kitOn ? KIT_LINE_CAP : undefined,
+      };
+      const kitHay = opts.scene ? String(opts.scene) : sceneKitHay(ctx.chat, excerptOpts);
+      const recentChat = opts.scene
+        || sceneExcerpt(ctx.chat, excerptOpts)
+        || '(no recent scene)';
+
+      let difficulty = 'normal';
+      try { difficulty = this.storage.getChat('backstage', {})?.trackers?.status?.difficulty || 'normal'; } catch { /* ignore */ }
+
+      let trackerSnapshot = { trackers: [], lines: '' };
+      if (include.includes('stats')) {
+        if (!char.stats) char.stats = DEFAULT_STATS();
+        trackerSnapshot = this._statsAuditSnapshot(char);
+      }
+
+      let consumables = '';
+      if (include.includes('stats') && char.priority === 'star') {
+        try {
+          const inv = this.storage.getChat('inventory', { static: [], mobile: [] });
+          consumables = formatPacksForPrompt(inv.mobile || []);
+        } catch { /* ignore */ }
+      }
+
+      const snapshot = kitSnapshot(char, {
+        trackerLines: trackerSnapshot.lines,
+        trackerIds: trackerSnapshot.trackers.map(t => t.id),
+        trackerRows: trackerSnapshot.trackers,
+        knownKit: (include.includes('wardrobe') || include.includes('props'))
+          ? this._knownKitRoster(char, kitHay || recentChat, include)
+          : '',
+        consumables,
+      });
+      const prompt = buildCastDeltaPrompt({
+        who,
+        scene: recentChat,
+        snapshot,
+        include,
+        difficultyHint: include.includes('stats') ? difficultyAuditHint(difficulty) : '',
+        garmentHay: kitHay,
+      });
+      const jsonSchema = castDeltaSchema(include, {
+        trackerIds: trackerSnapshot.trackers.map(t => t.id),
+      });
+      const response = await this._quietAudit(prompt, {
+        jsonSchema,
+        responseLength: include.includes('stats') ? 4000 : FILING_RESPONSE_LENGTH,
+      });
+      const delta = parseCastDelta(response, {
+        include,
+        trackers: trackerSnapshot.trackers,
+      });
+
+      let statsOut = { diffs: [], condition: '' };
+      if (include.includes('stats') && delta.stats) {
+        statsOut = this._applyStatsAudit(char, { stats: delta.stats });
+      } else if (kind === 'stats' && !delta.stats) {
+        throw new Error('Audit returned no tracker values. Try Audit again.');
+      }
+      const kitOut = applyCastDelta(char, delta, {
+        include,
+        onStarAdd: (c, item, k) => this._mirrorStarItem(c, item, k),
+        onStarUpdate: (c, item, k) => this._mirrorStarItem(c, item, k),
+        onStarRemove: (c, item, k) => this._relinquishKitItem(c, item, k),
+        onStarMove: (c, item, fromKind, toKind) => {
+          this._unlinkStarItem(c, item, fromKind);
+          this._mirrorStarItem(c, item, toKind);
+        },
+        claimKnown: (c, k, it) => this._claimKnownKit(c, k, it),
+      });
+      if (kitOut.condition) statsOut.condition = kitOut.condition;
+
       char.updatedAt = Date.now();
       this.saveState();
       this.bus.emit('cast.updated', { character: char });
       this._renderList();
+      const out = { ...statsOut, kit: kitOut.changes || [] };
+      if (!quiet) this._announceStatusBatch([{ char, ...out }]);
+      return out;
     } catch (err) {
       console.error('[Cast audit]', err);
       const msg = String(err?.message || err);
-      alert(this._isAuditRateLimit(msg)
-        ? 'Too many requests — wait a few seconds and press Audit again.'
-        : `Audit failed: ${msg}`);
+      if (!quiet) {
+        alert(this._isAuditRateLimit(msg)
+          ? 'Too many requests — wait a few seconds and press Audit again.'
+          : `Audit failed: ${msg}`);
+      }
     } finally {
       this._auditBusy = false;
-      btn.disabled = false;
-      btn.textContent = origText;
+      if (btn) {
+        btn.disabled = false;
+        if (origText != null) btn.textContent = origText;
+      }
     }
   }
 
@@ -2317,11 +3587,20 @@ ${recentChat}
         ? this._customStatValue(stats, def.id)
         : clamp(stats[def.id] ?? (def.direction === 'down' ? 0 : 100));
       const label = stateLabel(def, val);
-      return { id: def.id, label: def.label, value: val, state: label, custom: !!def.custom };
+      return {
+        id: def.id,
+        label: def.label,
+        value: val,
+        state: label,
+        custom: !!def.custom,
+        direction: def.direction || 'up',
+        auditHint: def.auditHint || def.description || '',
+      };
     });
-    const lines = trackers.map(t =>
-      `- ${t.id} (${t.label}): ${t.value}${t.state ? ` · ${t.state}` : ''}`
-    ).join('\n') || '(none)';
+    const lines = trackers.map(t => {
+      const hint = t.auditHint ? ` — ${t.auditHint}` : '';
+      return `- id=${t.id} label="${t.label}" now=${t.value}${t.state ? ` (${t.state})` : ''} ${t.direction === 'down' ? 'higher=worse' : 'higher=better'}${hint}`;
+    }).join('\n') || '(none)';
     return { trackers, lines };
   }
 
@@ -2333,18 +3612,42 @@ ${recentChat}
     const customIds = new Set(customDefs.map(d => d.id));
     const baseIds = new Set(STAT_DEFS.base.map(d => d.id));
     const hardIds = new Set(STAT_DEFS.hard.map(d => d.id));
+    const defs = [...STAT_DEFS.base, ...STAT_DEFS.hard, ...customDefs];
+    const defById = Object.fromEntries(defs.map(d => [d.id, d]));
+    const dirById = Object.fromEntries(defs.map(d => [d.id, d.direction === 'down' ? 'down' : 'up']));
+    let difficulty = 'normal';
+    try { difficulty = this.storage.getChat('backstage', {})?.trackers?.status?.difficulty || 'normal'; } catch { /* ignore */ }
     if (!char.stats.custom || typeof char.stats.custom !== 'object') char.stats.custom = {};
-    for (const [id, raw] of Object.entries(bag)) {
-      if (id === 'condition' || id === 'enabled' || id === 'hardMode' || id === 'custom') continue;
+    const diffs = [];
+    for (const [rawId, raw] of Object.entries(bag)) {
+      if (rawId === 'condition' || rawId === 'enabled' || rawId === 'hardMode' || rawId === 'custom') continue;
+      const id = resolveTrackerId(rawId, defs) || String(rawId || '').trim();
       const n = Number(raw);
-      if (!Number.isFinite(n)) continue;
-      const val = clamp(Math.round(n));
+      if (!id || !Number.isFinite(n)) continue;
+      const proposed = clamp(Math.round(n));
+      const def = defById[id];
+      const current = customIds.has(id)
+        ? this._customStatValue(char.stats, id)
+        : clamp(char.stats[id] ?? (dirById[id] === 'down' ? 0 : 100));
+      const val = applyDifficultyToStat(current, proposed, {
+        difficulty,
+        direction: dirById[id] || 'up',
+      });
       if (customIds.has(id)) char.stats.custom[id] = val;
       else if (baseIds.has(id) || (char.stats.hardMode && hardIds.has(id))) char.stats[id] = val;
+      else continue;
+      if (val === current) continue;
+      diffs.push({
+        id,
+        label: def?.label || id,
+        from: current,
+        to: val,
+        fromState: def ? stateLabel(def, current) : '',
+        toState: def ? stateLabel(def, val) : '',
+        levelMode: def?.levelMode || 'label',
+      });
     }
-    if (typeof parsed?.condition === 'string' && parsed.condition.trim()) {
-      char.condition = parsed.condition.trim().slice(0, 2000);
-    }
+    return { diffs, condition: '' };
   }
 }
 

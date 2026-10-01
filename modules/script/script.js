@@ -3,7 +3,7 @@
 // Showtime — Script Module  |  chat-lorebook replacement
 // =============================================================
 
-import { generateRaw, getRequestHeaders, saveMetadata, stopGeneration }
+import { getRequestHeaders, saveMetadata, stopGeneration, eventSource, event_types }
     from '../../../../../../script.js';
 import { getContext, extension_settings }
     from '../../../../../extensions.js';
@@ -12,7 +12,10 @@ import { loadWorldInfo, METADATA_KEY }
 import { oai_settings } from '../../../../../openai.js';
 import { textgenerationwebui_settings } from '../../../../../textgen-settings.js';
 import { Module } from '../../lib/module.js';
-import { getCastMembers, priorityLabel, castNameMatches, PRIORITIES } from '../../lib/castCatalog.js';
+import { withConnectionProfile } from '../../lib/connectionProfile.js';
+import { pinnedGenerateRaw, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
+import { getCastMembers, priorityLabel, castNameMatches, PRIORITIES, getStarMember } from '../../lib/castCatalog.js';
+import { rafMove } from '../../lib/uiPerf.js';
 import {
     cardLevelId,
     DEFAULT_SCRIPT_LEVELS,
@@ -66,13 +69,21 @@ import {
 } from '../../lib/calendarTime.js';
 import { bindLocationCatalogPicker } from '../../lib/locationCatalog.js';
 import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
+import {
+    formatConnAt,
+    formatConnMark,
+    normalizeConnLog,
+    runScriptConnTrack,
+} from '../../lib/scriptConnTrack.js';
 
 // ─────────────────────────────────────────────────────────────
 //  Constants
 // ─────────────────────────────────────────────────────────────
 const LEGACY_META_KEY = 'showtime_script';
 const LEGACY_INJECTION_ID = 'showtime_script_v1';
-const DEBUG        = true;
+const DEBUG        = false;
+// ~3–4k tokens of Script lore per generation at most.
+const SCRIPT_INJECTION_CHAR_BUDGET = 14000;
 
 // Continuous timeline pan/zoom (Reputation-web style) — a "semi-infinite"
 // pannable ruler instead of discrete zoom-level pages with a bounded viewport.
@@ -169,6 +180,36 @@ function normalizeTlShow(raw = {}) {
 
 function isDirectorRole(role) {
     return String(role || '').toLowerCase() === 'director';
+}
+
+const CREDIT_ONLY_ROLES = Object.freeze({
+    cameo: 'Cameo',
+    narrator: 'Narrator',
+    ensemble: 'Ensemble',
+});
+
+function creditRoleLabel(role) {
+    const id = String(role || '').trim().toLowerCase();
+    const billed = PRIORITIES.find(p => p.id === id);
+    if (billed) return billed.label;
+    if (CREDIT_ONLY_ROLES[id]) return CREDIT_ONLY_ROLES[id];
+    return id ? String(role) : CREDIT_ONLY_ROLES.cameo;
+}
+
+/** Unlinked extras (not on Cast) bill as Cameo, not Supporting. */
+function unlinkedCreditRole(role) {
+    const r = String(role || '').trim().toLowerCase();
+    if (isDirectorRole(r)) return null;
+    if (!r || r === 'supporting' || r === 'minor' || r === 'extra' || r === 'npc' || r === 'background') {
+        return 'cameo';
+    }
+    if (CREDIT_ONLY_ROLES[r] || PRIORITIES.some(p => p.id === r)) return r;
+    if (r.includes('cameo')) return 'cameo';
+    if (r.includes('star')) return 'star';
+    if (r.includes('lead')) return 'lead';
+    if (r.includes('major')) return 'major';
+    if (r.includes('foil')) return 'foil';
+    return 'cameo';
 }
 
 function asStringList(val) {
@@ -333,7 +374,7 @@ Field rules:
 - Span: Time/date range in this world's calendar (e.g. "Day 3–5", "Spring 1942", or custom season/month names). Use "" if none exists.
 - Summary: One rough paragraph, narrative and atmospheric.
 - Highlights: 2–5 memorable quotes or key lines, formatted like short review blurbs.
-- Credits: One entry per character except the Director. Format: "Name (Role)" using star, lead, major, supporting, foil, cameo, narrator, ensemble. Never credit the Director. Star is {{user}}.
+- Credits: One entry per character except the Director. Format: "Name (Role)" using star, lead, major, supporting, foil, cameo, narrator, ensemble. Never credit the Director. Credit the Star once, using the CAST primary name (Star is {{user}} — do not also list {{user}}, You, or a persona alias as a second credit). Names that appear in the scene but are not on CAST must be (cameo), never (supporting).
 - Keywords: 4–8 trigger phrases for injection (places, objects, themes — not cast nicknames; cast goes in Credits).
 - Path: Existing SCRIPT SHELF folder path where this card belongs (e.g. "Act I / Night of the Fire"). Use "" for the shelf root. Never invent a path that is not listed.
 - Location / Objects / DateTime: short tags for sort and search. DateTime should prefer a single placeable key (Day N, Season, Month Year) that matches the world's calendar.
@@ -478,6 +519,7 @@ function makeCard(overrides = {}) {
         quotes:     [],
         credits:    [],
         sponsors:   [],
+        connectionLog: [],
 
         keywords:   [],
         keywordFacets: emptyFacets(),
@@ -550,6 +592,13 @@ function defaultDb() {
             tlOrientation:        'h',
             tlZoomC:              1,     // continuous pan/zoom factor (Reputation-web style)
             timelinePresent:      null, // { sort, key, scale, parts } — explicit present marker
+            lockPresentYear:      true,
+            tlRange: {
+                startYear: null,
+                startSeason: '',
+                endMode: 'present',
+                endYear: null,
+            },
             tlShow: {
                 decades: true,
                 years: true,
@@ -604,6 +653,7 @@ export class ScriptModule extends Module {
     this._checkedUids = new Set();
     this._keywordFilter = null;
     this._agentCancelled = false;
+    this._connTrackT = null;
 }
 
 getDefaultState() {
@@ -630,6 +680,9 @@ hide() { if (this._panel) this._panel.style.display = 'none'; }
     this.bus?.on('cast.added',   () => this._onCastCatalogChanged());
     this.bus?.on('cast.updated', () => this._onCastCatalogChanged());
     this.bus?.on('cast.removed', () => this._onCastCatalogChanged());
+    this.bus?.on('reputation.updated', () => this._scheduleConnTrack());
+    this.bus?.on('reputation.removed', () => this._scheduleConnTrack());
+    this._scheduleConnTrack();
     if (this._panel) this._rerender();
 }
 
@@ -637,13 +690,35 @@ _onCastCatalogChanged() {
     if (this._panel) this._refreshDrawer();
 }
 
+_scheduleConnTrack() {
+    clearTimeout(this._connTrackT);
+    this._connTrackT = setTimeout(() => this._runConnTrack(), 450);
+}
+
+_runConnTrack() {
+    this._connTrackT = null;
+    try {
+        const chat = getContext()?.chat;
+        const { dirty, stamped } = runScriptConnTrack(this.storage, { chat });
+        if (!dirty) return;
+        this.saveState();
+        if (!stamped) return;
+        this.bus?.emit('showtime.stateChanged');
+        if (this._panel && !this._editingCardUid) this._rerender();
+    } catch (err) {
+        console.warn('[Showtime Script] connection track', err);
+    }
+}
+
 async onChatChanged() {
     log('Chat changed');
+    clearTimeout(this._connTrackT);
     this._cardsNormalized = false;
     this._migrateLegacyIfNeeded();
     await this._loadWIBooks();
     this._profiles = await this._findProfiles();
     this.bus?.emit('showtime.stateChanged');
+    this._scheduleConnTrack();
     if (this._panel) this._rerender();
 }
 
@@ -719,7 +794,7 @@ async _probeSTIntegrations() {
     });
 
     // Now do the actual loads using what we found
-    await this._loadWIBooks(rawSettings);
+    await this._loadWIBooks(rawSettings, { force: true });
     log(`WI books: ${this._wiBooks.length}`,
         this._wiBooks.map(b => `${b.name} (${b.entries.length})`));
 
@@ -731,8 +806,14 @@ async _probeSTIntegrations() {
 }
 
 // ── World Info Books ────────────────────────────────────────
-async _loadWIBooks(rawSettings = null) {
+async _loadWIBooks(rawSettings = null, { force = false } = {}) {
+    // Every call re-reads EVERY lorebook. ST's cache clones each book on read
+    // (structuredClone), so this is real CPU on a big install — and it used to
+    // run on boot and on every chat switch. Reuse a recent load instead.
+    const WI_TTL_MS = 60000;
+    if (!force && this._wiBooks?.length && Date.now() - (this._wiLoadedAt || 0) < WI_TTL_MS) return;
     this._wiBooks = [];
+    this._wiLoadedAt = Date.now();
 
     // ── Strategy 1: ST settings API ─────────────────────────
     // world_names is a module-scope var in script.js — the only
@@ -975,7 +1056,16 @@ async _findProfiles(rawSettings = null) {
 
     _keysMatch(keys, haystack) {
         if (!keys.length || !haystack) return false;
-        return keys.some(k => haystack.includes(k.toLowerCase()));
+        // Key must start at a word boundary ("art" ≠ "start"), but any ending is
+        // allowed so inflected forms still match ("пожар" → "пожара").
+        const wordChar = /[\p{L}\p{N}_]/u;
+        return keys.some(k => {
+            const key = k.toLowerCase();
+            for (let i = haystack.indexOf(key); i !== -1; i = haystack.indexOf(key, i + 1)) {
+                if (i === 0 || !wordChar.test(haystack[i - 1]) || !wordChar.test(key[0])) return true;
+            }
+            return false;
+        });
     }
 
     _getInjectionCandidates(db) {
@@ -1138,7 +1228,7 @@ async _findProfiles(rawSettings = null) {
             const creditStr = (c.credits || [])
                 .map(cr => {
                     const name = cr.name || cr.character || '';
-                    const role = priorityLabel(cr.role) || cr.role;
+                    const role = creditRoleLabel(this._liveCreditRole(cr, this._castMembers()) || cr.role);
                     if (!name && !role) return '';
                     return name && role ? `${name} (${role})` : (name || role);
                 })
@@ -1162,7 +1252,18 @@ async _findProfiles(rawSettings = null) {
             }
             return lines.join('\n');
         }).filter(Boolean);
-        return blocks.join('\n\n---\n\n');
+        // Budget the prompt: blocks arrive in priority order (pinned, keyword,
+        // recent, events), so keep whole blocks until the cap is reached.
+        const SEP = '\n\n---\n\n';
+        const kept = [];
+        let used = 0;
+        for (const block of blocks) {
+            const cost = block.length + (kept.length ? SEP.length : 0);
+            if (kept.length && used + cost > SCRIPT_INJECTION_CHAR_BUDGET) break;
+            kept.push(block);
+            used += cost;
+        }
+        return kept.join(SEP);
     }
 
     /** Production → Director sources → pull stamped lore with Script cards. */
@@ -1250,16 +1351,103 @@ async _findProfiles(rawSettings = null) {
         return this._castMembers().filter(m => !isDirectorRole(m.priority));
     }
 
+    _starCreditNeedles() {
+        const needles = new Set();
+        const add = s => {
+            const t = String(s || '').trim().toLowerCase();
+            if (t) needles.add(t);
+        };
+        add('{{user}}');
+        add('you');
+        try {
+            const ctx = getContext();
+            add(ctx?.name1);
+        } catch { /* ignore */ }
+        const star = getStarMember(this.storage);
+        if (star) {
+            add(star.name);
+            for (const a of star.aliases || []) add(a);
+        }
+        return needles;
+    }
+
+    _memberForCreditName(name, members = this._castMembers()) {
+        const n = String(name || '').trim();
+        if (!n) return null;
+        const hit = (members || []).find(c => castNameMatches(c, n));
+        if (hit) return isDirectorRole(hit.priority) ? null : hit;
+        const star = (members || []).find(c => c.priority === 'star' || c.is_user) || getStarMember(this.storage);
+        if (star && this._starCreditNeedles().has(n.toLowerCase())) return star;
+        return null;
+    }
+
+    _creditIdentityKeys(credit, members = this._castMembers()) {
+        const keys = new Set();
+        const add = s => {
+            const t = String(s || '').trim().toLowerCase();
+            if (t) keys.add(t);
+        };
+        add(credit?.name);
+        let member = null;
+        if (credit?.characterId) {
+            add(`id:${credit.characterId}`);
+            member = (members || []).find(c => c.id === credit.characterId) || null;
+        }
+        if (!member && credit?.name) member = this._memberForCreditName(credit.name, members);
+        if (member) {
+            add(`id:${member.id}`);
+            add(member.name);
+            for (const a of member.aliases || []) add(a);
+            if (member.priority === 'star' || member.is_user) {
+                for (const extra of this._starCreditNeedles()) add(extra);
+            }
+        }
+        return keys;
+    }
+
+    _creditsOverlap(a, b, members) {
+        const A = this._creditIdentityKeys(a, members);
+        const B = this._creditIdentityKeys(b, members);
+        for (const k of A) {
+            if (k.startsWith('id:') && B.has(k)) return true;
+        }
+        for (const k of A) {
+            if (!k.startsWith('id:') && B.has(k)) return true;
+        }
+        return false;
+    }
+
+    _dedupeCredits(list, members = this._castMembers()) {
+        const out = [];
+        for (const raw of list || []) {
+            const cr = this._normalizeCredit(raw, members);
+            if (!cr) continue;
+            const hit = out.findIndex(x => this._creditsOverlap(x, cr, members));
+            if (hit < 0) {
+                out.push(cr);
+                continue;
+            }
+            const prev = out[hit];
+            const merged = this._normalizeCredit({
+                characterId: prev.characterId || cr.characterId || null,
+                name: prev.characterId ? prev.name : (cr.characterId ? cr.name : prev.name || cr.name),
+                role: prev.characterId ? prev.role : (cr.characterId ? cr.role : prev.role || cr.role),
+            }, members);
+            if (merged) out[hit] = merged;
+        }
+        return out;
+    }
+
     _liveCreditRole(credit, members = this._castMembers()) {
         if (credit?.characterId) {
             const m = members.find(c => c.id === credit.characterId);
             if (m) return m.priority;
         }
         if (credit?.name) {
-            const m = members.find(c => castNameMatches(c, credit.name));
+            const m = this._memberForCreditName(credit.name, members);
             if (m) return m.priority;
         }
-        return credit?.role || 'supporting';
+        return unlinkedCreditRole(credit?.role) || 'cameo';
     }
 
     _addNpcToCast(name, { priority = 'supporting' } = {}) {
@@ -1267,7 +1455,8 @@ async _findProfiles(rawSettings = null) {
         if (!n) return null;
         const cast = this.storage.getChat('cast', { characters: [] });
         cast.characters ??= [];
-        const existing = cast.characters.find(c => castNameMatches(c, n));
+        const existing = this._memberForCreditName(n, cast.characters)
+            || cast.characters.find(c => castNameMatches(c, n));
         if (existing) return existing;
         const character = {
             id: uid(),
@@ -1300,18 +1489,23 @@ async _findProfiles(rawSettings = null) {
         let characterId = raw.characterId ?? null;
         if (characterId) {
             const m = members.find(c => c.id === characterId);
-            if (!m) return name ? { characterId: null, name, role: role || 'supporting' } : null;
+            if (!m) {
+                if (!name) return null;
+                const roleOut = unlinkedCreditRole(role);
+                return roleOut ? { characterId: null, name, role: roleOut } : null;
+            }
             if (isDirectorRole(m.priority)) return null;
             return { characterId: m.id, name: m.name, role: m.priority };
         }
         if (name) {
-            const m = members.find(c => castNameMatches(c, name));
+            const m = this._memberForCreditName(name, members);
             if (m) {
                 if (isDirectorRole(m.priority)) return null;
                 return { characterId: m.id, name: m.name, role: m.priority };
             }
-            if (isDirectorRole(role)) return null;
-            return { characterId: null, name, role: role || 'supporting' };
+            const roleOut = unlinkedCreditRole(role);
+            if (!roleOut) return null;
+            return { characterId: null, name, role: roleOut };
         }
         return null;
     }
@@ -1364,7 +1558,7 @@ async _findProfiles(rawSettings = null) {
         if ((!c.credits || !c.credits.length) && Array.isArray(c.roles) && c.roles.length) {
             c.credits = c.roles.map(role => ({ characterId: null, name: '', role }));
         }
-        c.credits  = (c.credits || []).map(cr => this._normalizeCredit(cr, members)).filter(Boolean);
+        c.credits  = this._dedupeCredits(c.credits || [], members);
         c.sponsors = (c.sponsors || []).map(sp => this._normalizeSponsor(sp)).filter(Boolean);
         if (!c.summary && c.content) c.summary = c.content;
         if (c.keywords && typeof c.keywords === 'object' && !Array.isArray(c.keywords)) {
@@ -1383,10 +1577,11 @@ async _findProfiles(rawSettings = null) {
         // Character keyword tags are obsolete — fold into Credits, then clear.
         const legacyChars = [...(c.keywordFacets.characters || [])].map(s => String(s).trim()).filter(Boolean);
         for (const name of legacyChars) {
-            if (c.credits.some(cr => (cr.name || '').toLowerCase() === name.toLowerCase())) continue;
+            if (this._dedupeCredits([...c.credits, { name }], members).length === c.credits.length) continue;
             const n = this._normalizeCredit({ name }, members);
             if (n) c.credits.push(n);
         }
+        c.credits = this._dedupeCredits(c.credits, members);
         c.keywordFacets.characters = [];
         const fromFacets = flattenFacets(c.keywordFacets);
         const seen = new Set(fromFacets.map(k => k.toLowerCase()));
@@ -1397,6 +1592,7 @@ async _findProfiles(rawSettings = null) {
         }
         c.keywords = flattenFacets(c.keywordFacets);
         c.quotes   = Array.isArray(c.quotes) ? c.quotes : [];
+        c.connectionLog = normalizeConnLog(c.connectionLog);
         c.aliases  = Array.isArray(c.aliases)  ? c.aliases  : [];
         c.spanParts = (c.spanParts && typeof c.spanParts === 'object')
             ? {
@@ -1981,9 +2177,18 @@ async _findProfiles(rawSettings = null) {
     }
 
     _castPromptBlock() {
-        const members = this._castMembers();
+        const members = this._actingCast();
         if (!members.length) return '(no cast list)';
-        return members.map(m => `${m.name} (${priorityLabel(m.priority) || m.priority || 'supporting'})`).join(', ');
+        const star = getStarMember(this.storage);
+        const lines = members.map(m => {
+            const aliases = [...(m.aliases || [])].map(a => String(a).trim()).filter(Boolean);
+            const aliasBit = aliases.length ? `; also: ${aliases.join(', ')}` : '';
+            return `- ${m.name} (${priorityLabel(m.priority) || m.priority || 'supporting'}${aliasBit})`;
+        });
+        const starNote = star
+            ? `\nStar = ${star.name} only. Do not add a second credit for {{user}} / You / a persona name.`
+            : '';
+        return `${lines.join('\n')}${starNote}`;
     }
 
     _visibleTreeUids() {
@@ -2019,13 +2224,22 @@ async _findProfiles(rawSettings = null) {
         if (!Number.isFinite(t)) return fn();
         const oaiPrev = oai_settings?.temp_openai;
         const tgPrev = textgenerationwebui_settings?.temp;
+        const restore = () => {
+            if (oai_settings && oaiPrev !== undefined) oai_settings.temp_openai = oaiPrev;
+            if (textgenerationwebui_settings && tgPrev !== undefined) textgenerationwebui_settings.temp = tgPrev;
+        };
+        // A normal (non-quiet) generation started meanwhile — give it the user's temperature back.
+        const onUserGeneration = (type, _opts, dryRun) => {
+            if (!dryRun && type !== 'quiet') restore();
+        };
         try {
             if (oai_settings) oai_settings.temp_openai = t;
             if (textgenerationwebui_settings) textgenerationwebui_settings.temp = t;
+            eventSource.on(event_types.GENERATION_STARTED, onUserGeneration);
             return await fn();
         } finally {
-            if (oai_settings && oaiPrev !== undefined) oai_settings.temp_openai = oaiPrev;
-            if (textgenerationwebui_settings && tgPrev !== undefined) textgenerationwebui_settings.temp = tgPrev;
+            eventSource.removeListener?.(event_types.GENERATION_STARTED, onUserGeneration);
+            restore();
         }
     }
 
@@ -2036,19 +2250,22 @@ async _findProfiles(rawSettings = null) {
         const trimmed = this._truncateToTokenBudget(userPrompt, maxIn);
         const temp = db.settings.aiTemperature;
         try {
-            return await this._withProfile(db.settings.aiProfile, () =>
+            const out = await this._withProfile(db.settings.aiProfile, () =>
                 this._withTemperature(temp, () =>
-                    generateRaw({
+                    pinnedGenerateRaw({
                         prompt: trimmed,
                         systemPrompt,
-                        instructOverride: true,
-                        quietToLoud: true,
-                        responseLength: maxOut > 0 ? maxOut : null,
+                        responseLength: maxOut > 0 ? maxOut : FILING_RESPONSE_LENGTH,
                         jsonSchema,
-                        trimNames: false,
                     }),
                 ),
             );
+            // Chat-switch guard: agent passes write cards into the active chat.
+            if (this._agentChatToken && (getContext()?.chatMetadata ?? null) !== this._agentChatToken) {
+                this._agentCancelled = true;
+                throw new Error('Cancelled.');
+            }
+            return out;
         } catch (err) {
             if (this._agentCancelled || String(err?.message || err).toLowerCase().includes('abort') || String(err?.message || err).toLowerCase().includes('cancel')) {
                 throw new Error('Cancelled.');
@@ -2356,6 +2573,7 @@ async _findProfiles(rawSettings = null) {
                 const y = Number(this._timelineAnchorParts()?.year);
                 if (Number.isFinite(y) && y > 0) return y;
             } catch { /* ignore */ }
+            if (this._lockPresentYear()) return '';
             return new Date().getFullYear();
         })();
         const vis = (id, label) => `
@@ -2538,6 +2756,20 @@ async _findProfiles(rawSettings = null) {
         syncFields();
     }
 
+    _lockPresentYear(db = this._db()) {
+        return db.settings.lockPresentYear !== false;
+    }
+
+    _tlRange(db = this._db()) {
+        const r = db.settings.tlRange && typeof db.settings.tlRange === 'object' ? db.settings.tlRange : {};
+        return {
+            startYear: Number.isFinite(Number(r.startYear)) ? Number(r.startYear) : null,
+            startSeason: String(r.startSeason || ''),
+            endMode: r.endMode === 'beyond' ? 'beyond' : 'present',
+            endYear: Number.isFinite(Number(r.endYear)) ? Number(r.endYear) : null,
+        };
+    }
+
     _parseCardTime(card, opts = {}) {
         const anchorParts = opts.anchorParts !== undefined
             ? opts.anchorParts
@@ -2564,6 +2796,15 @@ async _findProfiles(rawSettings = null) {
             });
             if (present?.parts && typeof present.parts === 'object') fromPresent = present.parts;
         } catch { /* ignore */ }
+        if (this._lockPresentYear()) {
+            const y = Number(fromPresent?.year);
+            return {
+                year: Number.isFinite(y) && y > 0 ? y : null,
+                monthIndex: fromPresent?.monthIndex ?? null,
+                seasonId: fromPresent?.seasonId || null,
+                day: fromPresent?.day ?? null,
+            };
+        }
         let fromView = null;
         try {
             const wrap = this._tlWrap;
@@ -2743,6 +2984,30 @@ async _findProfiles(rawSettings = null) {
             min -= pad;
             max += pad;
         }
+        const range = this._tlRange();
+        if (family !== 'date' && (range.startYear != null || range.endMode === 'present' || range.endYear != null)) {
+            if (range.startYear != null) {
+                const start = calendarSort({
+                    year: range.startYear,
+                    seasonId: range.startSeason || null,
+                    monthIndex: range.startSeason ? null : 0,
+                    day: 1,
+                }, cal);
+                if (Number.isFinite(start)) min = start;
+            }
+            if (range.endMode === 'present') {
+                try {
+                    const present = this.getTimelinePresent();
+                    if (present && Number.isFinite(present.sort) && present.scale !== 'date') {
+                        max = present.sort;
+                    }
+                } catch { /* ignore */ }
+            } else if (range.endYear != null) {
+                const end = calendarSort({ year: range.endYear, monthIndex: Math.max(0, (cal.monthsPerYear || 12) - 1), day: 28 }, cal);
+                if (Number.isFinite(end)) max = end;
+            }
+            if (!(max > min)) max = min + unit * 6;
+        }
         return { min, max, family, calendarScale, empty: false };
     }
 
@@ -2753,26 +3018,8 @@ async _findProfiles(rawSettings = null) {
     // ── Connection profile switcher ─────────────────────────────
 
     async _withProfile(profileId, fn) {
-        if (!profileId) return fn();
-        const mgr = window.connection_manager ?? window.connectionManager ?? null;
-        if (!mgr) { log('No connection manager — using current'); return fn(); }
-
-        const prev = mgr.getCurrentProfile?.() ?? mgr.activeProfile ?? null;
-        try {
-            await (mgr.setProfile ?? mgr.applyProfile)?.call(mgr, profileId);
-            log('Switched profile →', profileId);
-        } catch (e) { log('Profile switch failed:', e.message); }
-
-        try {
-            return await fn();
-        } finally {
-            if (prev && prev !== profileId) {
-                try {
-                    await (mgr.setProfile ?? mgr.applyProfile)?.call(mgr, prev);
-                    log('Restored profile →', prev);
-                } catch (e) { log('Profile restore failed:', e.message); }
-            }
-        }
+        // Delegates to the shared, serialized Connection Manager switcher.
+        return withConnectionProfile(profileId, fn);
     }
 
    // ── Render ────────────────────────────────────────────────────
@@ -2825,12 +3072,13 @@ _buildResizeHandle(treePanel) {
     handle.className = 'stm-resize-handle';
 
     let startX, startW;
-    const onMove = e => {
+    const onMove = rafMove(e => {
         const w = Math.max(140, Math.min(420, startW + e.clientX - startX));
         treePanel.style.width = w + 'px';
         this._db().settings.treeWidth = w;
-    };
+    });
     const onUp = () => {
+        onMove.flush();
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup',   onUp);
         document.body.style.userSelect = '';
@@ -2867,6 +3115,9 @@ _buildToolbar(db) {
         <span class="stm-tl-zoom-label" data-role="tl-zoom-label" title="Current time scale — wheel to zoom, drag to pan">${Math.round(this._tlZoomValue(db) * 100)}%</span>
         <button class="stm-btn" data-a="tl-in" title="Zoom in (mouse wheel zooms; drag to pan)">+</button>
         <button class="stm-btn" data-a="tl-home" title="Center on the narrative present">⌂</button>
+        <label class="stm-tb-lock" title="New and vague dates inherit the present year, not the wall clock">
+            <input type="checkbox" data-a="tl-lock-year" ${this._lockPresentYear(db) ? 'checked' : ''}> Lock year
+        </label>
         <details class="stm-tl-show-pop stm-tl-goto-pop">
             <summary title="Jump the view to a year / season / month">Go to</summary>
             <div class="stm-tl-show-pop-body stm-tl-goto-body">
@@ -2914,6 +3165,11 @@ _buildToolbar(db) {
         if (btn.dataset.a === 'tl-out') this._tlNudgeZoom(1 / 1.35);
         if (btn.dataset.a === 'tl-in') this._tlNudgeZoom(1.35);
         if (btn.dataset.a === 'tl-home') this._tlGoHome();
+        if (btn.dataset.a === 'tl-lock-year') {
+            const on = btn.querySelector('input')?.checked;
+            db2.settings.lockPresentYear = !!on;
+            this._save(db2);
+        }
         if (btn.dataset.a === 'tl-calendar') this._openSettings({ focus: 'calendar' });
         if (btn.dataset.a === 'tl-audit') this._auditTimelineAlign();
         if (btn.dataset.a === 'tl-add-event') this._openTimelineEventDialog();
@@ -3243,8 +3499,8 @@ _tlSetPresentFromParts(parts = {}) {
             seasonPhase: null,
             day: Math.max(1, Number(parts.day) || 1),
             week: null,
-            hour: Math.max(0, Number(parts.hour) || 0),
-            scale: Number(parts.hour) ? 'hour' : (Number(parts.day) > 1 ? 'day' : 'month'),
+            hour: Number.isFinite(Number(parts.hour)) ? Math.max(0, Number(parts.hour)) : null,
+            scale: Number.isFinite(Number(parts.hour)) ? 'hour' : (Number(parts.day) > 1 ? 'day' : 'month'),
         };
     }
     let key = '';
@@ -3431,7 +3687,39 @@ _calendarFormHTML(cal) {
                 ${this._tlShowChecksHTML(show, { idPrefix: 'stm-cfg-tl-show' })}
             </div>
         </details>
+        ${this._tlRangeFormHTML()}
         <p class="stm-hint">Examples: “${esc(L.day)} 3”, “${esc(cal.seasons[0]?.label || L.season)} 12”, “${esc(cal.monthNames[0] || L.month)} 12”, “${esc(formatCalendarYear(12, cal))}”.</p>`;
+}
+
+_tlRangeFormHTML() {
+    const db = this._db();
+    const r = this._tlRange(db);
+    const cal = this._cal();
+    const seasonOpts = [`<option value="">— Season —</option>`]
+        .concat(cal.seasons.map(s => `<option value="${esc(s.id)}" ${r.startSeason === s.id ? 'selected' : ''}>${esc(s.label)}</option>`))
+        .join('');
+    return `
+        <div class="stm-form-row">
+            <label><input type="checkbox" id="stm-lock-year" ${this._lockPresentYear(db) ? 'checked' : ''}> Lock year to present</label>
+            <p class="stm-settings-hint">New cards, Agent spans, and vague dates inherit the Script present year — not the real-world calendar.</p>
+        </div>
+        <div class="stm-form-row stm-form-row--2">
+            <div>
+                <label>Timeline starts</label>
+                <div class="stm-cal-picker-row">
+                    <select id="stm-tl-start-season">${seasonOpts}</select>
+                    <input type="number" id="stm-tl-start-year" min="0" max="999999" placeholder="Year" value="${r.startYear ?? ''}">
+                </div>
+            </div>
+            <div>
+                <label>Timeline ends</label>
+                <select id="stm-tl-end-mode">
+                    <option value="present" ${r.endMode === 'present' ? 'selected' : ''}>At present</option>
+                    <option value="beyond" ${r.endMode === 'beyond' ? 'selected' : ''}>Beyond present</option>
+                </select>
+                <input type="number" id="stm-tl-end-year" min="0" max="999999" placeholder="End year (optional)" value="${r.endYear ?? ''}" ${r.endMode === 'beyond' ? '' : 'hidden'}>
+            </div>
+        </div>`;
 }
 
 _readCalendarFromForm(root) {
@@ -3751,7 +4039,8 @@ _buildTimeline(db) {
                 <p class="stm-tl-dock-hint">Undated, or taken off with ⇤. Drag ⠿ onto the line, or use ＋.</p>
                 <div class="stm-tl-dock-list" data-role="tl-dock-list"></div>
             </div>
-        </div>`;
+        </div>
+        <input type="range" class="stm-tl-scrub" data-role="tl-scrub" min="0" max="1000" value="500" title="Pan the timeline">`;
     wrap.querySelector('[data-a="tl-hint-dismiss"]')?.addEventListener('click', () => {
         const db2 = this._db();
         db2.settings.tlHintDismissed = true;
@@ -3765,6 +4054,12 @@ _buildTimeline(db) {
     wrap._tlVert = vert;
     this._tlWrap = wrap;
     this._tlPinSizeCache = new WeakMap();
+    wrap.querySelector('[data-role="tl-scrub"]')?.addEventListener('input', e => {
+        const domain = wrap._tlDomain || this._timelineDomain(cards);
+        const t = Number(e.target.value) / 1000;
+        if (!Number.isFinite(t) || !Number.isFinite(domain.min) || !Number.isFinite(domain.max)) return;
+        this._tlCenterOnSort(domain.min + t * (domain.max - domain.min));
+    });
 
     if (!cards.length) {
         const empty = document.createElement('p');
@@ -3917,12 +4212,13 @@ _bindTimelineDockDrag(e, card) {
     const place = (x, y) => { ghost.style.left = `${x}px`; ghost.style.top = `${y}px`; };
     place(e.clientX, e.clientY);
     const inRect = (x, y, r) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-    const onMove = ev => {
+    const onMove = rafMove(ev => {
         place(ev.clientX, ev.clientY);
         const over = !!vp && inRect(ev.clientX, ev.clientY, vp.getBoundingClientRect());
         ghost.classList.toggle('stm-tl-dock-ghost--over', over);
-    };
+    });
     const onUp = ev => {
+        onMove.flush();
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
         ghost.remove();
@@ -4111,7 +4407,7 @@ _bindTimelineViewport(wrap, vert) {
         let moved = false;
         vp.classList.add('stm-tl--panning');
         vp.setPointerCapture?.(e.pointerId);
-        const onMove = ev => {
+        const onMove = rafMove(ev => {
             const cur = vert ? ev.clientY : ev.clientX;
             if (Math.abs(cur - startClient) > 2) moved = true;
             const z = this._tlZoomValue();
@@ -4119,8 +4415,9 @@ _bindTimelineViewport(wrap, vert) {
             const domain = wrap._tlDomain || this._timelineDomain(wrap._tlCards || []);
             this._tlPan = this._tlClampPan(basePan + (cur - startClient), size, z, domain);
             this._tlRepaint({ light: true });
-        };
+        });
         const onUp = () => {
+            onMove.flush();
             vp.classList.remove('stm-tl--panning');
             window.removeEventListener('pointermove', onMove);
             window.removeEventListener('pointerup', onUp);
@@ -4139,6 +4436,17 @@ _bindTimelineViewport(wrap, vert) {
         this._tlRo.observe(vp);
     }
     requestAnimationFrame(() => this._tlRepaint());
+}
+
+_tlSyncScrubber(wrap, domain, size, zoom) {
+    const scrub = wrap?.querySelector('[data-role="tl-scrub"]');
+    if (!scrub || !domain || !(domain.max > domain.min)) return;
+    const sort = Number.isFinite(this._tlFocusSort)
+        ? this._tlFocusSort
+        : this._tlSortFromScreenPx(size / 2, zoom, this._tlPan);
+    const t = (sort - domain.min) / (domain.max - domain.min);
+    const next = String(Math.round(Math.max(0, Math.min(1, t)) * 1000));
+    if (scrub.value !== next) scrub.value = next;
 }
 
 /**
@@ -4181,6 +4489,7 @@ _tlRepaintNow({ forceAnchor = false, light = false } = {}) {
     this._tlMaxZoomCached = this._tlComputeMaxZoom(size, domain);
     const zoom = this._tlZoomValue();
     this._tlPan = this._tlClampPan(this._tlPan ?? 0, size, zoom, domain);
+    this._tlSyncScrubber(wrap, domain, size, zoom);
 
     // The scale-name label is written by _tlPaintTicksAndNow (it knows the
     // current major unit); the light path below also re-runs that painter.
@@ -4604,7 +4913,7 @@ _bindTimelinePin(item, card, vert) {
         item.classList.add('stm-tl-item--drag');
         groupItems.forEach(el => el.classList.add('stm-tl-item--drag'));
 
-        const onMove = ev => {
+        const onMove = rafMove(ev => {
             if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 3) moved = true;
             const vp = item.closest('.stm-tl');
             if (!vp || !Number.isFinite(primaryStart)) return;
@@ -4621,8 +4930,9 @@ _bindTimelinePin(item, card, vert) {
                 const stem = Number(el.dataset.stem) || TL_PIN_BASE_STEM + 24;
                 this._tlPositionPin(el, { sort, side, stem, shift: 0, lane: side * 0.4 }, vert, zoom);
             }
-        };
+        });
         const onUp = () => {
+            onMove.flush();
             handle.removeEventListener('pointermove', onMove);
             handle.removeEventListener('pointerup', onUp);
             groupItems.forEach(el => el.classList.remove('stm-tl-item--drag'));
@@ -5348,7 +5658,9 @@ _buildCardDrawer() {
         return;
     }
     if (empty) empty.style.display = 'none';
-    stack.forEach((card, i) => list.appendChild(this._buildCard(card, i, stack.length)));
+    const frag = document.createDocumentFragment();
+    stack.forEach((card, i) => frag.appendChild(this._buildCard(card, i, stack.length)));
+    list.appendChild(frag); // one insertion instead of one per card
     list.querySelector('.stm-card--focused, .stm-card--editing')
         ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
@@ -5419,11 +5731,10 @@ _normalizeAgentCard(raw) {
         return { text: s.replace(/^["“]|["”]$/g, ''), character: '' };
     }).filter(q => q.text);
     const creditLines = asStringList(pickField(raw, 'Credits', 'credits'));
-    const credits = creditLines.map(line => {
-        if (line && typeof line === 'object') return this._normalizeCredit(line, members);
-        const parsed = parseCreditLine(line);
-        return parsed ? this._normalizeCredit(parsed, members) : null;
-    }).filter(Boolean);
+    const credits = this._dedupeCredits(creditLines.map(line => {
+        if (line && typeof line === 'object') return line;
+        return parseCreditLine(line);
+    }).filter(Boolean), members);
     const summary = String(pickField(raw, 'Summary', 'summary') || '').trim();
     const spanRaw = pickField(raw, 'Span', 'span');
     const span = spanRaw != null && String(spanRaw).trim() && String(spanRaw).toLowerCase() !== 'null'
@@ -5431,9 +5742,8 @@ _normalizeAgentCard(raw) {
     // Character names belong in Credits, not keyword tags (aliases live on Cast).
     const charNames = asStringList(pickField(raw, 'Characters', 'characters'));
     for (const name of charNames) {
-        if (credits.some(c => (c.name || '').toLowerCase() === name.toLowerCase())) continue;
-        const n = this._normalizeCredit({ name }, members);
-        if (n) credits.push(n);
+        const extra = this._normalizeCredit({ name }, members);
+        if (extra) credits.push(extra);
     }
     const keywordFacets = normalizeFacets({
         location: asStringList(pickField(raw, 'Location', 'location')),
@@ -5448,14 +5758,12 @@ _normalizeAgentCard(raw) {
     const seenKw = new Set(flattenFacets(keywordFacets).map(k => k.toLowerCase()));
     for (const k of extraKw) {
         if (seenKw.has(k.toLowerCase())) continue;
-        const asChar = credits.some(c => c.name && k.toLowerCase().includes(c.name.toLowerCase()))
-            || this._castMembers().some(m => castNameMatches(m, k)
-                || (m.aliases || []).some(a => k.toLowerCase().includes(String(a).toLowerCase())));
+        const asMember = this._memberForCreditName(k, members);
+        const asChar = asMember
+            || credits.some(c => c.name && k.toLowerCase().includes(String(c.name).toLowerCase()));
         if (asChar) {
-            if (!credits.some(c => (c.name || '').toLowerCase() === k.toLowerCase())) {
-                const n = this._normalizeCredit({ name: k }, members);
-                if (n) credits.push(n);
-            }
+            const n = this._normalizeCredit({ name: k }, members);
+            if (n) credits.push(n);
         } else {
             keywordFacets.objects.push(k);
         }
@@ -5464,7 +5772,9 @@ _normalizeAgentCard(raw) {
     const keywords = flattenFacets(keywordFacets);
     const path = String(pickField(raw, 'Path', 'path', 'parent') || '').trim();
     const timeKey = (keywordFacets.datetime[0] || span || '').trim();
-    const parsed = pickParseableTimeKey({ timeKey, keywordFacets, span }, this.state?.settings?.calendar);
+    const parsed = pickParseableTimeKey({ timeKey, keywordFacets, span }, this.state?.settings?.calendar, {
+        anchorParts: this._timelineAnchorParts(),
+    });
     const parentUid = this._ensureFolderPath(path);
     // Agent always creates leaf cards; Path only chooses the folder they live under.
     return {
@@ -5478,7 +5788,7 @@ _normalizeAgentCard(raw) {
         summary,
         content: summary,
         quotes,
-        credits,
+        credits: this._dedupeCredits(credits, members),
         keywordFacets,
         keywords,
         parentUid,
@@ -5515,7 +5825,28 @@ _ingestAgentCards(raw, { sourceEntries = null, mode = 'agent', maxCards = 0 } = 
 }
 
 _agentUserPreamble() {
-    return `CAST:\n${this._castPromptBlock()}\n\nSCRIPT SHELF (Path must match a FOLDER line, or ""):\n${this._shelfIndexText()}\n`;
+    return `CAST:\n${this._castPromptBlock()}\n\n${this._presentLockNote()}\n\nSCRIPT SHELF (Path must match a FOLDER line, or ""):\n${this._shelfIndexText()}\n`;
+}
+
+_presentLockNote() {
+    const parts = this._timelineAnchorParts();
+    const y = Number(parts?.year);
+    const cal = this._cal();
+    let when = '';
+    if (Number.isFinite(y) && y > 0) {
+        const season = parts?.seasonId
+            ? (cal.seasons.find(s => s.id === parts.seasonId)?.label || parts.seasonId)
+            : '';
+        when = `${season ? `${season} ` : ''}${formatCalendarYear(y, cal)}`;
+    }
+    if (this._lockPresentYear()) {
+        return when
+            ? `PRESENT (year locked): ${when}. Span and DateTime MUST use this year unless the source explicitly names a different year. Never invent a real-world or random year.`
+            : 'PRESENT year is unset. Leave Span empty rather than inventing a year.';
+    }
+    return when
+        ? `PRESENT: ${when}. Prefer this year for undated events.`
+        : '';
 }
 
 _formatEntriesBlock(entries) {
@@ -5728,7 +6059,7 @@ async _runLoreGroupAgent(entries, onPass) {
 
 _openAgentDialog(opts = {}) {
     const open = async () => {
-        await this._loadWIBooks();
+        await this._loadWIBooks(null, { force: true }); // the Agent needs the current books
         this._openAgentDialogNow(opts);
     };
     open();
@@ -6158,6 +6489,7 @@ _openAgentDialogNow(opts = {}) {
     runBtn.addEventListener('click', async () => {
         persistBudget();
         this._agentCancelled = false;
+        this._agentChatToken = getContext()?.chatMetadata ?? null;
         setRunning(true);
         const onPass = (pass, total, phase) => {
             if (phase === 'group') beatHold = total > 1 ? `Grouping pass ${pass} of ${total}…` : 'Grouping scenes…';
@@ -6486,7 +6818,7 @@ _readFacets(el) {
         const role = this._liveCreditRole(cr, members);
         const id = cr.characterId || '';
         const name = cr.name || '(unnamed)';
-        return `<button type="button" class="stm-credit-name-btn" data-id="${esc(id)}" data-name="${esc(name)}" title="${esc(priorityLabel(role) || role)}">
+        return `<button type="button" class="stm-credit-name-btn" data-id="${esc(id)}" data-name="${esc(name)}" title="${esc(creditRoleLabel(role))}">
             <span class="stm-credit-name">${esc(name)}</span>
           </button>`;
       }).join('');
@@ -6500,7 +6832,7 @@ _readFacets(el) {
         const npc = !cr.characterId;
         return `<span class="stm-credit-chip${npc ? ' stm-credit-chip--npc' : ''}" data-id="${esc(cr.characterId || '')}" data-name="${esc(cr.name || '')}">
             <span class="stm-credit-name">${esc(cr.name || '(unnamed)')}</span>
-            <span class="stm-credit-pri">${esc(priorityLabel(role) || role)}</span>
+            <span class="stm-credit-pri">${esc(creditRoleLabel(role))}</span>
             ${npc ? `<button type="button" class="stm-credit-cast" title="Add to Cast">Cast</button>` : ''}
             <button type="button" class="stm-pill-x stm-credit-x" title="Remove">×</button>
         </span>`;
@@ -6675,9 +7007,25 @@ _readFacets(el) {
       ${this._quotesViewHTML(card)}
       ${this._creditChipsHTML(card, { editable: false })}
       ${this._sponsorsHTML(card, { editable: false })}
+      ${this._connLogHTML(card)}
       ${this._keywordPillsHTML(card, { open: false })}
       ${this._sourceStampHTML(card)}
       ${flags}`;
+  }
+
+  _connLogHTML(card) {
+    const log = normalizeConnLog(card.connectionLog);
+    if (!log.length) return '';
+    const rows = [...log].reverse().map(m => {
+      const when = formatConnAt(m.at);
+      let iso = '';
+      try { if (m.at) iso = new Date(m.at).toISOString(); } catch { /* ignore */ }
+      return `<li>${when ? `<time datetime="${esc(iso)}">${esc(when)}</time>` : ''}${esc(formatConnMark(m))}</li>`;
+    }).join('');
+    return `<details class="stm-conn-log">
+      <summary>Ties · ${log.length}</summary>
+      <ol class="stm-conn-log-list">${rows}</ol>
+    </details>`;
   }
 
   _sourceStampHTML(card) {
@@ -6852,6 +7200,7 @@ _readFacets(el) {
       if (e.target.closest('.stm-kw-drop')) return;
       if (e.target.closest('.stm-credit-wrap')) return;
       if (e.target.closest('.stm-sponsor-wrap')) return;
+      if (e.target.closest('.stm-conn-log')) return;
       if (e.target.closest('.stm-credit-menu')) return;
       if (e.target.closest('.stm-sponsor-menu')) return;
       if (e.target.closest('button')) return;
@@ -7076,13 +7425,21 @@ _readFacets(el) {
     }));
 
     const addChip = (name, id, role) => {
-      const already = credited().some(c => (id && c.id === id) || c.name === name.toLowerCase());
+      const member = (id && this._actingCast().find(m => m.id === id))
+        || this._memberForCreditName(name, this._actingCast());
+      const cid = member?.id || id || '';
+      const cname = member?.name || name;
+      const crole = member?.priority || role || 'cameo';
+      const already = credited().some(c =>
+        (cid && c.id === cid)
+        || this._creditsOverlap({ characterId: c.id, name: c.name }, { characterId: cid, name: cname }, this._actingCast())
+      );
       if (already) return;
       chips.querySelector('.stm-settings-hint')?.remove();
-      chips.insertAdjacentHTML('beforeend', `<span class="stm-credit-chip${!id ? ' stm-credit-chip--npc' : ''}" data-id="${esc(id || '')}" data-name="${esc(name)}">
-            <span class="stm-credit-name">${esc(name)}</span>
-            <span class="stm-credit-pri">${esc(priorityLabel(role) || role || 'Supporting')}</span>
-            ${!id ? `<button type="button" class="stm-credit-cast" title="Add to Cast">Cast</button>` : ''}
+      chips.insertAdjacentHTML('beforeend', `<span class="stm-credit-chip${!cid ? ' stm-credit-chip--npc' : ''}" data-id="${esc(cid)}" data-name="${esc(cname)}">
+            <span class="stm-credit-name">${esc(cname)}</span>
+            <span class="stm-credit-pri">${esc(creditRoleLabel(crole))}</span>
+            ${!cid ? `<button type="button" class="stm-credit-cast" title="Add to Cast">Cast</button>` : ''}
             <button type="button" class="stm-pill-x stm-credit-x" title="Remove">×</button>
         </span>`);
     };
@@ -7123,14 +7480,14 @@ _readFacets(el) {
       )].filter(n =>
         needle && n.toLowerCase().includes(needle)
         && !taken.some(t => t.name === n.toLowerCase())
-        && !this._actingCast().some(m => (m.name || '').toLowerCase() === n.toLowerCase())
+        && !this._memberForCreditName(n)
       );
       const rows = [
         ...members.map(m => `<button type="button" class="stm-suggest-item" data-id="${esc(m.id)}" data-name="${esc(m.name)}" data-role="${esc(m.priority)}">${esc(m.name)} <em>${esc(priorityLabel(m.priority))}</em></button>`),
-        ...extras.slice(0, 8).map(n => `<button type="button" class="stm-suggest-item stm-suggest-npc" data-name="${esc(n)}">${esc(n)} <em>NPC — add extra</em></button>`),
+        ...extras.slice(0, 8).map(n => `<button type="button" class="stm-suggest-item stm-suggest-npc" data-name="${esc(n)}">${esc(n)} <em>Cameo</em></button>`),
       ];
       if (needle && !members.some(m => (m.name || '').toLowerCase() === needle) && !taken.some(t => t.name === needle)) {
-        rows.push(`<button type="button" class="stm-suggest-item stm-suggest-npc" data-name="${esc(q.trim())}">Add “${esc(q.trim())}” as extra</button>`);
+        rows.push(`<button type="button" class="stm-suggest-item stm-suggest-npc" data-name="${esc(q.trim())}">Add “${esc(q.trim())}” as cameo</button>`);
         rows.push(`<button type="button" class="stm-suggest-item stm-suggest-cast" data-name="${esc(q.trim())}">Cast “${esc(q.trim())}” now</button>`);
       }
       suggest.innerHTML = rows.join('') || `<span class="stm-settings-hint">No matches.</span>`;
@@ -7144,8 +7501,8 @@ _readFacets(el) {
       e.preventDefault();
       const name = search.value.trim();
       if (!name) return;
-      const m = this._actingCast().find(c => (c.name || '').toLowerCase() === name.toLowerCase());
-      addChip(m?.name || name, m?.id || '', m?.priority || 'supporting');
+      const m = this._memberForCreditName(name);
+      addChip(m?.name || name, m?.id || '', m?.priority || 'cameo');
       search.value = '';
       hideSuggest();
     });
@@ -7158,7 +7515,7 @@ _readFacets(el) {
         const added = this._addNpcToCast(name);
         addChip(added.name, added.id, added.priority);
       } else {
-        addChip(name, item.dataset.id || '', item.dataset.role || 'supporting');
+        addChip(name, item.dataset.id || '', item.dataset.role || 'cameo');
       }
       if (search) search.value = '';
       hideSuggest();
@@ -7350,12 +7707,12 @@ _readFacets(el) {
       const name = (chip.dataset.name || '').trim();
       if (!name) return;
       const id = chip.dataset.id || null;
-      const m = id ? members.find(x => x.id === id) : members.find(x => (x.name || '').toLowerCase() === name.toLowerCase());
+      const m = (id && members.find(x => x.id === id)) || this._memberForCreditName(name, members);
       if (m && isDirectorRole(m.priority)) return;
       credits.push({
-        characterId: m?.id || id || null,
+        characterId: m?.id || null,
         name: m?.name || name,
-        role: m?.priority || 'supporting',
+        role: m?.priority || 'cameo',
       });
     });
     const sponsors = [];
@@ -7407,7 +7764,7 @@ _readFacets(el) {
       content  : (q('summary')?.value || '').trim(),
       pinned   : !!q('pinned')?.checked,
       active   : !!q('active')?.checked,
-      credits,
+      credits: this._dedupeCredits(credits, members),
       sponsors: isEventCard(card) ? (card.sponsors || []) : sponsors,
     };
     if (isEventCard(card)) {
@@ -7717,6 +8074,9 @@ _readFacets(el) {
         this._rerender();
     });
 
+    overlay.querySelector('#stm-tl-end-mode')?.addEventListener('change', e => {
+        overlay.querySelector('#stm-tl-end-year')?.toggleAttribute('hidden', e.target.value !== 'beyond');
+    });
     overlay.querySelector('#stm-cfg-save').addEventListener('click', () => {
         const newLevels = normalizeLevels(readLevelRows());
         if (!newLevels.length) { alert('At least one level is required.'); return; }
@@ -7727,6 +8087,15 @@ _readFacets(el) {
         db2.settings.levels = normalizeLevels(newLevels);
         db2.settings.calendar       = this._readCalendarFromForm(overlay);
         db2.settings.tlShow         = this._readTlShowFromRoot(overlay);
+        db2.settings.lockPresentYear = overlay.querySelector('#stm-lock-year')?.checked !== false;
+        const startY = overlay.querySelector('#stm-tl-start-year')?.value;
+        const endY = overlay.querySelector('#stm-tl-end-year')?.value;
+        db2.settings.tlRange = {
+            startYear: startY === '' || startY == null ? null : Number(startY),
+            startSeason: overlay.querySelector('#stm-tl-start-season')?.value || '',
+            endMode: overlay.querySelector('#stm-tl-end-mode')?.value === 'beyond' ? 'beyond' : 'present',
+            endYear: endY === '' || endY == null ? null : Number(endY),
+        };
         db2.settings.aiProfile      = overlay.querySelector('#stm-ai-profile').value;
         db2.settings.aiMaxInputTokens  = Math.max(256, parseInt(overlay.querySelector('#stm-ai-in').value, 10) || 8000);
         db2.settings.aiMaxOutputTokens = Math.max(128, parseInt(overlay.querySelector('#stm-ai-out').value, 10) || 2048);
@@ -8321,6 +8690,37 @@ _readFacets(el) {
   list-style: none;
 }
 .stm-source-stamp summary::-webkit-details-marker { display: none; }
+.stm-conn-log {
+  margin-top: 6px;
+  font-size: 10px;
+  color: #6b4f1e;
+  opacity: 0.72;
+  border-top: 1px dashed rgba(138, 106, 61, 0.35);
+  padding-top: 4px;
+}
+.stm-conn-log[open] { opacity: 1; }
+.stm-conn-log summary {
+  cursor: pointer;
+  list-style: none;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 9px;
+  color: #8a6a3d;
+}
+.stm-conn-log summary::-webkit-details-marker { display: none; }
+.stm-conn-log-list {
+  margin: 4px 0 0;
+  padding-left: 1.15em;
+  line-height: 1.4;
+  color: #4a3a1e;
+}
+.stm-conn-log-list time {
+  display: inline-block;
+  min-width: 7.6em;
+  margin-right: 6px;
+  color: #8a6a3d;
+  font-variant-numeric: tabular-nums;
+}
 .stm-source-stamp-mark {
   font-weight: 700;
   margin-right: 4px;
@@ -9523,6 +9923,26 @@ _readFacets(el) {
   line-height: 1;
   padding: 2px 6px;
 }
+.stm-tl-scrub {
+  flex-shrink: 0;
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  accent-color: #c9a24a;
+  background: #1a1208;
+  cursor: pointer;
+}
+.stm-tb-lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #c9a24a;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.stm-tb-lock input { margin: 0; }
 .stm-tl-legend-x:hover { color: #c8aa6e; border-color: #c8aa6e; }
 .stm-tl-zoom-label {
   font-size: 11px;

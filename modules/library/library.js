@@ -18,6 +18,7 @@ import { Module } from '../../lib/module.js';
 import { getCastMembers, getCastRecords, castNameMatches, normalizeAliases } from '../../lib/castCatalog.js';
 import { collectActiveLocationTags } from '../../lib/compass/state.js';
 import { bindLocationTagEditor, locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
+import { rafMove } from '../../lib/uiPerf.js';
 
 const SEED_SECTIONS = [
   { title: 'Places & Geography', icon: '⛰', blurb: 'Cities, rooms, roads, the shape of the map.' },
@@ -1964,7 +1965,7 @@ export class LibraryModule extends Module {
     const from = el.closest('[data-section]')?.dataset.section || '';
     let dragging = false;
     let ghost = null;
-    const move = ev => {
+    const move = rafMove(ev => {
       if (!dragging) {
         if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) < 6) return;
         dragging = true;
@@ -1982,8 +1983,9 @@ export class LibraryModule extends Module {
         ghost.style.top = `${ev.clientY + 8}px`;
       }
       this._highlightCubbyAt(ev.clientX, ev.clientY);
-    };
+    });
     const up = ev => {
+      move.flush();
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', up);
