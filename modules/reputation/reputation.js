@@ -17,7 +17,12 @@ import {
   interviewsVisibleOnSheet,
   characterHouseIds,
 } from '../../lib/motivationCatalog.js';
-import { getSceneCards, creditedScenes, sceneLabel } from '../../lib/scriptCatalog.js';
+import { applyStandingNudge, applyStandingDelta, resolveIntelSubject } from '../../lib/intelBridge.js';
+import { appendNowLedger } from '../../lib/nowSidecar.js';
+import { getSceneCards, sceneLabel } from '../../lib/scriptCatalog.js';
+import { getCabinet, filesForHouse } from '../../lib/fileCabinet.js';
+import { foldPersonNodes } from '../../lib/reel.js';
+import { showtimeAlert, showtimeConfirm } from '../../lib/dialogs.js';
 
 const NOTICE_CATS = [
   { id: 'group',      label: 'Affiliation', color: '#3d7a68', bg: '#d4ebe3' },
@@ -115,6 +120,11 @@ export class ReputationModule extends Module {
         this._motRerender = setTimeout(() => {
           if (this.container) this.render(this.container);
         }, 160);
+      });
+      this.bus.on('reputation.slateApply', (payload) => {
+        try { this._applySlateRep(payload); } catch (err) {
+          console.warn('[Showtime/Reputation] slate', err);
+        }
       });
     }
   }
@@ -244,6 +254,7 @@ export class ReputationModule extends Module {
     }
     if (this._syncHouseWeb()) changed = true;
     if (this._syncSecretWeb()) changed = true;
+    if (foldPersonNodes(s, getCastMembers(this.storage))) changed = true;
     if (changed) this.saveState();
   }
 
@@ -474,6 +485,99 @@ export class ReputationModule extends Module {
     return { created: true, node };
   }
 
+  _ensureGroupNode(houseId) {
+    if (!houseId) return { created: false };
+    const existing = this._nodes().find(n => n.category === 'group' && n.houseId === houseId);
+    if (existing) return { created: false, node: existing };
+    const h = this._house(houseId);
+    if (!h) return { created: false };
+    const self = this._nodes().find(n => n.kind === 'self');
+    const pos = this._orbit(this._nodes().length);
+    const node = {
+      id: `h_${h.id}`,
+      kind: 'notice',
+      auto: true,
+      category: 'group',
+      houseId: h.id,
+      characterId: '',
+      name: h.alias || h.name,
+      description: h.duty || '',
+      notes: '',
+      standing: clamp(h.standing),
+      x: pos.x,
+      y: pos.y,
+      links: [],
+      readings: [],
+    };
+    this.state.personal.push(node);
+    if (self) this._ensureLink(self.id, node.id);
+    return { created: true, node };
+  }
+
+  _nodeForSubject(sub) {
+    if (!sub?.id) return null;
+    if (sub.type === 'house') return this._ensureGroupNode(sub.id).node || null;
+    return this._ensurePersonNode(sub.id).node || this._findPersonNode(sub.id);
+  }
+
+  _applySlateRep(payload = {}) {
+    const fromSub = payload.from?.id
+      ? payload.from
+      : resolveIntelSubject(this.storage, payload.fromName || payload.from);
+    const toSub = payload.to?.id
+      ? payload.to
+      : resolveIntelSubject(this.storage, payload.toName || payload.to);
+    if (!fromSub?.id || !toSub?.id) return;
+    const fromNode = this._nodeForSubject(fromSub);
+    const toNode = this._nodeForSubject(toSub);
+    if (!fromNode || !toNode || fromNode.id === toNode.id) return;
+    const rec = this._readingToward(fromNode, toNode.id);
+    const current = rec?.standing;
+    const nudged = payload.standingMode
+      ? applyStandingDelta(current, { delta: payload.delta, mode: payload.standingMode })
+      : applyStandingNudge(current, payload.direction);
+    const take = String(payload.take || payload.cause || rec?.take || '').trim();
+    const patch = {
+      take,
+      aware: 'knows',
+      description: payload.cause || undefined,
+    };
+    if (!nudged.takeOnly) patch.standing = nudged.standing ?? 0;
+    this._upsertReading(fromNode, toNode.id, patch);
+    if (nudged.bandChanged && !payload.silent) {
+      const fromName = fromSub.label || fromNode.name || 'Someone';
+      const toName = toSub.label || toNode.name || 'Someone';
+      const band = standingInfo(nudged.standing ?? patch.standing ?? 0).label;
+      try {
+        appendNowLedger(this.storage, {
+          kind: 'standing',
+          text: `Standing: ${fromName} toward ${toName} · ${band}`,
+        });
+      } catch { /* ignore */ }
+      const nextStanding = nudged.standing ?? patch.standing ?? 0;
+      const prevStanding = Number.isFinite(Number(current)) ? Number(current) : 0;
+      this.bus?.emit('showtime.notice', {
+        kind: 'reputation',
+        items: [{
+          text: `Standing · ${fromName} → ${toName} (${band})`,
+          mark: nextStanding > prevStanding ? '+' : (nextStanding < prevStanding ? '-' : '!'),
+          nodeId: fromNode.id,
+        }],
+      });
+    }
+    if (fromNode.category === 'group' && fromNode.houseId && this._isStarNode(toNode) && !nudged.takeOnly) {
+      const h = this._house(fromNode.houseId);
+      if (h) {
+        h.standing = patch.standing;
+        if (take) h.opinion = take;
+      }
+    }
+    try { this._syncSecretWeb(); } catch { /* ignore */ }
+    this.saveState();
+    this.bus?.emit('reputation.updated', {});
+    if (this.container) this.render(this.container);
+  }
+
   _syncSecretWeb() {
     let changed = false;
     for (const s of this._playSecrets()) {
@@ -628,7 +732,6 @@ export class ReputationModule extends Module {
     }
     clearTimeout(this._motRerender);
     clearTimeout(this._zoomSaveT);
-    if (this.container) await this.render(this.container);
   }
 
   _normalizeHouse(h) {
@@ -718,17 +821,35 @@ export class ReputationModule extends Module {
     return (this.storage.getChat('cast', { characters: [] }).characters ?? []).find(c => c.id === id) ?? null;
   }
 
+  _bustFace(url) {
+    const raw = String(url || '').trim();
+    if (!raw || !this._portraitBust) return raw;
+    if (/[?&]t=\d+/.test(raw)) return raw.replace(/([?&])t=\d+/, `$1t=${this._portraitBust}`);
+    return `${raw}${raw.includes('?') ? '&' : '?'}t=${this._portraitBust}`;
+  }
+
   _castPortrait(id) {
     if (!id) return '';
     const c = this._castChar(id);
     if (!c) {
       const m = this._memberById(id);
-      return m?.portrait || '';
+      return this._bustFace(m?.portrait || '');
     }
-    if (c.portrait) return c.portrait;
-    if (c.characterCardId) return `/thumbnail?type=avatar&file=${encodeURIComponent(c.characterCardId)}`;
-    if (c.personaId) {
-      try { return getThumbnailUrl('persona', c.personaId) || ''; }
+    if (c.personaId && (c.syncFromPersona !== false || !c.portrait)) {
+      try {
+        const live = getThumbnailUrl('persona', c.personaId, !!this._portraitBust);
+        if (live) return live;
+      } catch { /* the stored portrait still shows */ }
+    }
+    if (c.characterCardId && (c.syncFromCard !== false || !c.portrait)) {
+      try {
+        const live = getThumbnailUrl('avatar', c.characterCardId, !!this._portraitBust);
+        if (live) return live;
+      } catch { /* the stored portrait still shows */ }
+    }
+    if (c.portrait) return this._bustFace(c.portrait);
+    if (c.characterCardId) {
+      try { return getThumbnailUrl('avatar', c.characterCardId, !!this._portraitBust) || ''; }
       catch { return ''; }
     }
     return '';
@@ -740,7 +861,7 @@ export class ReputationModule extends Module {
     let url = '';
     if (node.category === 'group' && node.houseId) {
       const house = this._house(node.houseId);
-      if (house?.badge) url = house.badge;
+      if (house?.badge) url = this._bustFace(house.badge);
     }
     if (!url) {
       const id = node.characterId || (node.kind === 'self' ? this._starMember()?.id : '');
@@ -750,6 +871,12 @@ export class ReputationModule extends Module {
     return url;
   }
 
+  _refreshFaces() {
+    this._portraitBust = Date.now();
+    this._paintBubbles();
+    this._fillCard();
+  }
+
   _bubbleLabel(n) {
     if (n.category === 'group' && n.houseId) {
       const house = this._house(n.houseId);
@@ -757,6 +884,15 @@ export class ReputationModule extends Module {
       if (house?.name) return house.name;
     }
     return n.name || '?';
+  }
+
+  /** Notice title, with the cast name in front when the bubble was renamed. */
+  _personLabel(n) {
+    if (!n) return '';
+    const title = this._bubbleLabel(n);
+    const castName = String(this._castChar(this._castIdFor(n))?.name || '').trim();
+    if (castName && castName !== title) return `${castName} · ${title}`;
+    return title;
   }
 
   _canAudit() {
@@ -787,7 +923,7 @@ export class ReputationModule extends Module {
       const list = groups[id] ?? [];
       if (!list.length) return '';
       return `<optgroup label="${esc(label)}">${list.map(n =>
-        `<option value="${n.id}" ${n.id === selectedId ? 'selected' : ''}>${esc(n.name || label)}</option>`,
+        `<option value="${n.id}" ${n.id === selectedId ? 'selected' : ''}>${esc(this._personLabel(n) || label)}</option>`,
       ).join('')}</optgroup>`;
     }).join('');
   }
@@ -987,16 +1123,18 @@ export class ReputationModule extends Module {
     return rows;
   }
 
-  _upsertReading(from, targetId, { take, aware, standing, intro, description } = {}) {
+  _upsertReading(from, targetId, { take, aware, standing, intro, description, history, baseline, stampUid } = {}) {
     if (!from || !targetId || from.id === targetId) return null;
     if (from.category === 'rumor') return null;
     const to = this._node(targetId);
     if (to?.category === 'rumor') return null;
     from.readings ??= [];
     let rec = from.readings.find(r => r.targetId === targetId);
+    let created = false;
     if (!rec) {
       rec = { targetId, aware: aware || 'knows', take: take || '' };
       from.readings.push(rec);
+      created = true;
     } else {
       if (aware) rec.aware = aware;
       if (take != null) rec.take = take;
@@ -1004,6 +1142,21 @@ export class ReputationModule extends Module {
     if (standing != null && Number.isFinite(Number(standing))) rec.standing = clamp(standing);
     if (intro != null) rec.intro = String(intro || 'none');
     if (description != null) rec.description = String(description || '').trim();
+    if (history != null) rec.history = String(history || '').trim();
+    if (baseline != null) rec.baseline = String(baseline || '').trim();
+    if (stampUid != null) {
+      const raw = String(stampUid || '').trim();
+      if (!raw || raw === 'none') {
+        rec.stampUid = '';
+        rec.noScript = true;
+      } else {
+        rec.stampUid = raw;
+        rec.noScript = false;
+      }
+    } else if (created && !rec.noScript) {
+      const hyd = this._connLogStampUid(from, to);
+      if (hyd) rec.stampUid = hyd;
+    }
     this._ensureLink(from.id, targetId);
     return rec;
   }
@@ -1018,11 +1171,16 @@ export class ReputationModule extends Module {
     if ((!intro || intro === 'none') && (center.id === 'self' || this._isStarNode(center))) {
       intro = n.intro;
     }
+    const introRaw = intro || 'none';
+    const hyd = this._hydrateReadingFields(rec, introRaw);
     return {
       center,
       rec,
-      intro: intro || 'none',
-      description: String(rec?.description || '').trim(),
+      intro: introRaw,
+      description: hyd.desc,
+      history: hyd.history,
+      baseline: hyd.baseline,
+      stampUid: this._readingStampUid(n, center, rec),
     };
   }
 
@@ -1190,18 +1348,209 @@ export class ReputationModule extends Module {
     return { kind: 'none', label: '', raw: 'none' };
   }
 
-  _introOptionsHTML(n, towardId = null) {
-    const cur = this._introInfo(n, towardId).raw || 'none';
+  _scenePickLists(n) {
     const cid = n.characterId || (n.kind === 'self' ? getStarMember(this.storage)?.id || '' : '');
-    const credited = creditedScenes(this.storage, cid, n.name);
+    const all = getSceneCards(this.storage);
+    const needle = String(n?.name || '').trim().toLowerCase();
+    const credited = all.filter(s => (s.card?.credits || []).some(cr =>
+      (cid && cr.characterId === cid)
+      || (needle && String(cr.name || '').trim().toLowerCase() === needle),
+    ));
     const creditedIds = new Set(credited.map(s => s.uid));
-    const others = getSceneCards(this.storage).filter(s => !creditedIds.has(s.uid));
+    const others = all.filter(s => !creditedIds.has(s.uid)).slice(-20);
+    return { credited, others };
+  }
+
+  _introOptionsHTML(n, towardId = null, lists = null) {
+    const cur = this._introInfo(n, towardId).raw || 'none';
+    const pack = lists || this._scenePickLists(n);
+    const credited = pack.credited || [];
+    let others = pack.others || [];
+    const curUid = cur.startsWith('scene:') ? cur.slice(6) : '';
+    if (curUid && ![...credited, ...others].some(s => s.uid === curUid)) {
+      const label = sceneLabel(this.storage, curUid);
+      others = [{ uid: curUid, title: label || curUid, code: '' }, ...others];
+    }
     const opt = s => `<option value="scene:${esc(s.uid)}" ${cur === `scene:${s.uid}` ? 'selected' : ''}>${esc(s.code ? `${s.code} · ${s.title}` : s.title)}</option>`;
     return `
       <option value="none" ${cur === 'none' ? 'selected' : ''}>— None —</option>
       <option value="pre" ${cur === 'pre' ? 'selected' : ''}>Pre-established · beyond this story</option>
       ${credited.length ? `<optgroup label="Credited scenes">${credited.map(opt).join('')}</optgroup>` : ''}
       ${others.length ? `<optgroup label="Other scenes">${others.map(opt).join('')}</optgroup>` : ''}`;
+  }
+
+  _hydrateReadingFields(rec, introRaw) {
+    const intro = introRaw || rec?.intro || 'none';
+    const desc = String(rec?.description || '').trim();
+    const history = String(rec?.history || '').trim() || (intro === 'pre' ? desc : '');
+    const baseline = String(rec?.baseline || '').trim() || (intro !== 'pre' ? desc : '');
+    return { history, baseline, desc };
+  }
+
+  /** Latest Script card whose connectionLog mentions this pair. */
+  _connLogStampUid(fromNode, towardNode) {
+    if (!fromNode || !towardNode) return '';
+    const idsA = new Set([fromNode.id, fromNode.characterId].filter(Boolean).map(String));
+    const idsB = new Set([towardNode.id, towardNode.characterId].filter(Boolean).map(String));
+    if (!idsA.size || !idsB.size) return '';
+    let cards = [];
+    try {
+      cards = this.storage.getChat('script', { cards: [] }).cards || [];
+    } catch {
+      return '';
+    }
+    let bestUid = '';
+    let bestAt = -1;
+    for (const c of cards) {
+      const log = c?.connectionLog;
+      if (!Array.isArray(log) || !c.uid) continue;
+      for (const e of log) {
+        if (!e || typeof e !== 'object') continue;
+        const at = Number(e.at) || 0;
+        const who = String(e.whoId || '');
+        const other = String(e.otherId || '');
+        const hit = (idsA.has(who) && idsB.has(other)) || (idsB.has(who) && idsA.has(other));
+        if (!hit || at < bestAt) continue;
+        bestAt = at;
+        bestUid = c.uid;
+      }
+    }
+    return bestUid;
+  }
+
+  _readingStampUid(fromNode, towardNode, rec) {
+    if (rec?.noScript) return 'none';
+    const filed = String(rec?.stampUid || '').trim();
+    if (filed && filed !== 'none') return filed;
+    return this._connLogStampUid(fromNode, towardNode);
+  }
+
+  _stampOptionsHTML(n, selectedUid, lists = null) {
+    const sel = String(selectedUid || '');
+    const pack = lists || this._scenePickLists(n);
+    const credited = pack.credited || [];
+    let others = pack.others || [];
+    const opt = s => `<option value="${esc(s.uid)}" ${sel === s.uid ? 'selected' : ''}>${esc(s.code ? `${s.code} · ${s.title}` : s.title)}</option>`;
+    const known = sel === 'none' || [...credited, ...others].some(s => s.uid === sel);
+    return `
+      <option value="none" ${sel === 'none' ? 'selected' : ''}>No script</option>
+      ${sel && !known ? `<option value="${esc(sel)}" selected>${esc(sceneLabel(this.storage, sel) || sel)}</option>` : ''}
+      ${credited.length ? `<optgroup label="Credited scenes">${credited.map(opt).join('')}</optgroup>` : ''}
+      ${others.length ? `<optgroup label="Other scenes">${others.map(opt).join('')}</optgroup>` : ''}`;
+  }
+
+  _stampChipHTML(uid) {
+    if (uid === 'none') {
+      return `<span class="rep-stamp-chip" title="Formed in the current scene, or somewhere that is not in the script drawer">No script</span>`;
+    }
+    if (!uid) return '';
+    const label = sceneLabel(this.storage, uid);
+    if (!label) return '';
+    return `<span class="rep-stamp-chip" title="Where this take was formed">Script · ${esc(label)}</span>`;
+  }
+
+  _relationSheetHTML(n) {
+    const center = this._center();
+    if (!n || !center || n.id === center.id || n.category === 'rumor') return '';
+    const linked = this._linkedTo(center.id, n.id);
+    const rec = this._readingToward(n, center.id);
+    const intro = this._introInfo(n, center.id).raw || 'none';
+    const hyd = this._hydrateReadingFields(rec, intro);
+    const stampUid = this._readingStampUid(n, center, rec);
+    const reverse = this._readingToward(center, n.id);
+    const hasIntro = intro && intro !== 'none';
+    const revStamp = this._readingStampUid(center, n, reverse);
+    const towardFull = this._effectiveReadingToward(n, center.id);
+    const rumorChips = towardFull?.rumors?.length
+      ? `<div class="rep-rumor-feed">${towardFull.rumors.map(r =>
+          `<span class="rep-in-chip" title="${esc(r.text || '')}">⌘ ${esc(r.name)}${r.text ? ` — ${esc(r.text.slice(0, 80))}` : ''}</span>`).join('')}</div>`
+      : '';
+    const lists = this._scenePickLists(n);
+    const revLists = this._scenePickLists(center);
+    return `
+      <div class="rep-rel-sheet">
+        <div class="rep-dossier-actions">
+          ${linked
+            ? `<button type="button" class="rep-stamp danger" data-action="sever-link">Sever connection with ${esc(center.name)}</button>`
+            : `<button type="button" class="rep-stamp" data-action="link-center">Connect to ${esc(center.name)}</button>`}
+        </div>
+        <div class="rep-field">
+          <label>Introduction <span class="rep-hint">with ${esc(center.name)}</span></label>
+          <select data-field="rel-intro">${this._introOptionsHTML(n, center.id, lists)}</select>
+        </div>
+        ${intro === 'pre' ? `
+        <div class="rep-field">
+          <label>How they met</label>
+          <textarea data-field="rel-history" rows="2" placeholder="How and when they met">${esc(hyd.history)}</textarea>
+        </div>` : ''}
+        <div class="rep-field">
+          <label>Current baseline</label>
+          <textarea data-field="rel-baseline" rows="2" placeholder="How things stand now">${esc(hyd.baseline)}</textarea>
+        </div>
+        ${this._standingBarHTML(rec?.standing ?? 0, {
+          fromName: n.name,
+          toName: center.name,
+          takeField: 'rel-take',
+          takeValue: rec?.take || '',
+        })}
+        <div class="rep-field">
+          <label>Script <span class="rep-hint">a filed scene, or No script if this take is from the current scene</span></label>
+          <div class="rep-rel-stamp-row">
+            ${this._stampChipHTML(stampUid)}
+            <select data-field="rel-stamp">${this._stampOptionsHTML(n, stampUid, lists)}</select>
+          </div>
+        </div>
+        ${rumorChips}
+        ${this._secretChipsHTML(this._secretsObserverKnowsAbout(n, center), 'Holds on them')}
+        ${hasIntro ? `
+          ${this._standingBarHTML(reverse?.standing ?? 0, {
+            fromName: center.name,
+            toName: n.name,
+            field: 'from-center-standing',
+            hint: `What ${center.name} thinks of ${n.name}.`,
+            takeField: 'rel-rev-take',
+            takeValue: reverse?.take || '',
+          })}
+          <div class="rep-field">
+            <label>Script <span class="rep-hint">${esc(center.name)}’s take — No script if it is not in the drawer</span></label>
+            <div class="rep-rel-stamp-row">
+              ${this._stampChipHTML(revStamp)}
+              <select data-field="rel-rev-stamp">${this._stampOptionsHTML(center, revStamp, revLists)}</select>
+            </div>
+          </div>`
+        : `<div class="rep-card-muted">Set Introduction (pre-established or a scene) before filing what ${esc(center.name)} thinks of ${esc(n.name)}.</div>`}
+      </div>
+    `;
+  }
+
+  /** Read-only twin of `_relationSheetHTML` — view mode never mounts inputs. */
+  _relationReadHTML(n) {
+    const rel = this._relationWithCenter(n);
+    if (!rel) return this._opinionCardHTML(n);
+    const intro = this._introInfo(n);
+    return `
+      <div class="rep-rel-read">
+        ${intro.kind !== 'none' ? `
+          <div class="rep-field">
+            <label>Introduction <span class="rep-hint">with ${esc(rel.center.name)}</span></label>
+            <div class="rep-card-peek">${esc(intro.kind === 'pre' ? 'Pre-established · beyond this story' : intro.label)}</div>
+          </div>` : `<div class="rep-card-muted">No introduction with ${esc(rel.center.name)} yet — tap Edit to file one.</div>`}
+        ${intro.kind === 'pre' ? `
+          <div class="rep-field">
+            <label>How they met</label>
+            ${rel.history
+              ? `<div class="rep-card-peek">${esc(rel.history)}</div>`
+              : `<div class="rep-card-muted">Not filed yet — tap Edit.</div>`}
+          </div>` : ''}
+        <div class="rep-field">
+          <label>Current baseline</label>
+          ${rel.baseline
+            ? `<div class="rep-card-peek">${esc(rel.baseline)}</div>`
+            : `<div class="rep-card-muted">Not filed yet — tap Edit.</div>`}
+        </div>
+        ${this._opinionCardHTML(n)}
+      </div>
+    `;
   }
 
   /** Centered/focused cast may only see a secret if they are tagged as knowing it. */
@@ -1321,6 +1670,7 @@ export class ReputationModule extends Module {
             <span class="rep-zoom-label" data-role="zoom-label">${Math.round((this.state.webZoom || 1) * 100)}%</span>
             <button type="button" class="rep-zoom-btn" data-zoom="in" title="Zoom in">+</button>
             <button type="button" class="rep-zoom-btn" data-zoom="reset" title="Reset">⌂</button>
+            <button type="button" class="rep-zoom-btn" data-action="refresh-faces" title="Refresh profile images">↻</button>
           </div>
         </div>
         <div class="rep-dossier" data-role="dossier" ${hideCard ? 'hidden' : ''}>
@@ -1394,7 +1744,7 @@ export class ReputationModule extends Module {
     return cat.color;
   }
 
-  _standingBarHTML(value, { fromName, toName, field = 'toward-standing', hint = '' } = {}) {
+  _standingBarHTML(value, { fromName, toName, field = 'toward-standing', hint = '', takeField = '', takeValue = '' } = {}) {
     const v = clamp(value);
     const info = standingInfo(v);
     const labelRole = field === 'from-center-standing' ? 'from-center-stand-label' : 'stand-label';
@@ -1405,6 +1755,7 @@ export class ReputationModule extends Module {
           <input type="range" min="-100" max="100" step="1" data-field="${esc(field)}" value="${v}">
           <span class="rep-stand-label" data-role="${esc(labelRole)}" style="color:${info.color}">${esc(info.label)} · ${v}</span>
         </div>
+        ${takeField ? `<textarea data-field="${esc(takeField)}" rows="2" placeholder="What they think of ${esc(toName)}">${esc(takeValue || '')}</textarea>` : ''}
         <div class="rep-hint">${esc(hint || 'Standing toward the Star colors that bubble’s ring on the web.')}</div>
       </div>`;
   }
@@ -1624,10 +1975,17 @@ export class ReputationModule extends Module {
     if (lab) lab.textContent = `${Math.round(z * 100)}%`;
   }
 
-  /** Keeps the world covering the viewport; centres it when zoomed out past the edges. */
+  /**
+   * Keeps a bubble near the edge of the world able to sit on the rings.
+   * Centres the whole world when it already fits in the viewport.
+   */
   _clampPan(p, m, z = this._zoomValue()) {
-    const axis = (v, size, view) =>
-      size <= view ? (view - size) / 2 : Math.min(0, Math.max(view - size, v));
+    const axis = (v, size, view) => {
+      if (size <= view) return (view - size) / 2;
+      const min = view / 2 - size;
+      const max = view / 2;
+      return Math.min(max, Math.max(min, v));
+    };
     return {
       x: axis(p?.x ?? 0, m.ww * z, m.vw),
       y: axis(p?.y ?? 0, m.wh * z, m.vh),
@@ -1807,6 +2165,7 @@ export class ReputationModule extends Module {
     const center = this._center();
     const centerId = center && n.id !== center.id ? center.id : '';
     const rec = centerId ? this._readingToward(n, centerId) : null;
+    const rev = centerId ? this._readingToward(center, n.id) : null;
     return {
       name: n.name,
       description: n.description,
@@ -1817,16 +2176,21 @@ export class ReputationModule extends Module {
       houseId: n.houseId,
       intro: n.intro,
       _relCenterId: centerId,
+      _linked: centerId ? this._linkedTo(n.id, centerId) : false,
       _hadRel: !!rec,
       _rel: rec ? { ...rec } : null,
+      _hadRev: !!rev,
+      _rev: rev ? { ...rev } : null,
     };
   }
 
   _restoreNoticeSnapshot(node, snap) {
     if (!node || !snap) return;
-    const { _rel, _relCenterId, _hadRel, ...fields } = snap;
+    const { _rel, _relCenterId, _hadRel, _linked, _hadRev, _rev, ...fields } = snap;
     Object.assign(node, fields);
     if (!_relCenterId) return;
+    if (_linked) this._ensureLink(node.id, _relCenterId);
+    else this._removeLink(node.id, _relCenterId);
     node.readings ??= [];
     const i = node.readings.findIndex(r => r.targetId === _relCenterId);
     if (_hadRel && _rel) {
@@ -1834,6 +2198,17 @@ export class ReputationModule extends Module {
       else node.readings.push({ ..._rel });
     } else if (!_hadRel && i >= 0) {
       node.readings.splice(i, 1);
+    }
+    const center = this._node(_relCenterId);
+    if (center) {
+      center.readings ??= [];
+      const ri = center.readings.findIndex(r => r.targetId === node.id);
+      if (_hadRev && _rev) {
+        if (ri >= 0) center.readings[ri] = { ..._rev };
+        else center.readings.push({ ..._rev });
+      } else if (!_hadRev && ri >= 0) {
+        center.readings.splice(ri, 1);
+      }
     }
   }
 
@@ -1852,7 +2227,6 @@ export class ReputationModule extends Module {
     const org = isSelf ? 'STAR' : cat.label.toUpperCase();
     return `
       <div class="rep-card${mode === 'edit' ? ' editing' : ''}${mode === 'connections' ? ' linking' : ''}">
-        <div class="rep-card-punches"><span></span><span></span><span></span></div>
         <div class="rep-card-body">
           <div class="rep-card-top">
             <span class="rep-card-org">${esc(org)}</span>
@@ -1863,7 +2237,9 @@ export class ReputationModule extends Module {
                 <button type="button" class="rep-stamp" data-card="connections" title="View connections">⚭</button>
                 ${linkedToFocus
                   ? `<button type="button" class="rep-stamp danger" data-action="sever-link" title="Sever thread to the centered bubble">Sever</button>`
-                  : ''}
+                  : (!focused && n.category !== 'rumor' && this.state.focusId
+                    ? `<button type="button" class="rep-stamp" data-action="link-center" title="Connect to the centered bubble">Connect</button>`
+                    : '')}
                 ${focused && (n.kind === 'self' || n.category === 'individual')
                   ? `<button type="button" class="rep-audit" data-action="audit" title="Audit connection">Audit</button>`
                   : focused ? '' : `<button type="button" class="rep-stamp" data-card="focus" title="Focus this notice">◎</button>`}
@@ -1901,18 +2277,16 @@ export class ReputationModule extends Module {
           : this._linkedTo(this.state.focusId, n.id)
             ? `<span class="rep-card-flag">Direct · inspecting</span>`
             : `<span class="rep-card-flag dim">Indirect · inspecting</span>`}
-        ${!focused && intro.kind !== 'none' ? `<span class="rep-card-intro">${esc(intro.label)}</span>` : ''}
+        ${!focused && intro.kind !== 'none' && !this._linkedTo(this.state.focusId, n.id)
+          ? `<span class="rep-card-intro">${esc(intro.label)}</span>` : ''}
         ${!focused && intro.kind === 'none' ? `<span class="rep-card-intro dim">No introduction with ${esc(rel?.center?.name || 'center')} yet</span>` : ''}
       </div>
-      ${!focused && rel?.description
-        ? `<div class="rep-card-peek"><span class="rep-dos-k">Relationship</span> ${esc(rel.description)}</div>`
-        : ''}
-      ${this._opinionCardHTML(n)}
-      ${!focused && !hasReading
-        ? `<div class="rep-dossier-actions">
-            <button type="button" class="rep-stamp" data-action="add-reading-toward" title="File what they think of the centered bubble">+ Reading</button>
-          </div>`
-        : ''}
+      ${!focused && this._linkedTo(this.state.focusId, n.id)
+        ? this._relationReadHTML(n)
+        : `${!focused && rel?.description
+            ? `<div class="rep-card-peek"><span class="rep-dos-k">Relationship</span> ${esc(rel.description)}</div>`
+            : ''}
+          ${this._opinionCardHTML(n)}`}
       ${this._secretsBlockHTML(n)}
       ${this._interviewsBlockHTML(n)}
       ${tags.length ? `<div class="rep-card-affils">${tags.map(t =>
@@ -1987,7 +2361,6 @@ export class ReputationModule extends Module {
 
   _renderCardEdit(n) {
     const isSelf = n.kind === 'self';
-    const cast = getCastMembers(this.storage).filter(c => c.priority !== 'director');
     const houses = this.state.house ?? [];
     const center = this._center();
     if (n.category === 'rumor') {
@@ -2007,26 +2380,8 @@ export class ReputationModule extends Module {
       `;
       return this._cardShell(n, { mode: 'edit', inner });
     }
-    const rel = this._relationWithCenter(n);
-    const toward = center && n.id !== center.id ? this._effectiveReadingToward(n, center.id) : null;
-    const standVal = toward?.standing != null ? toward.standing : 0;
-    const fromCenter = center && n.id !== center.id ? this._effectiveReadingToward(center, n.id) : null;
-    const fromCenterVal = fromCenter?.standing != null ? fromCenter.standing : 0;
-    const hasReading = !!(toward && (String(toward.take || '').trim() || toward.standing != null));
     const inner = `
-      <div class="rep-field"><label>Name</label>
-        <input type="text" data-field="name" value="${esc(n.name)}" ${isSelf ? 'readonly' : ''}></div>
-      ${n.category === 'individual' ? `
-      <div class="rep-field">
-        <label>Cast / credit</label>
-        <select data-field="characterId">
-          <option value="">— Not linked —</option>
-          ${cast.map(m =>
-            `<option value="${esc(m.id)}" ${n.characterId === m.id ? 'selected' : ''}>${esc(m.name)} (${esc(priorityLabel(m.priority))})</option>`,
-          ).join('')}
-        </select>
-      </div>` : ''}
-      ${n.category === 'group' ? `
+      ${n.category === 'group' && !n.houseId ? `
       <div class="rep-field">
         <label>Affiliation</label>
         <select data-field="houseId">
@@ -2037,30 +2392,9 @@ export class ReputationModule extends Module {
         </select>
         ${houses.length ? '' : `<div class="rep-card-muted">No affiliations yet — add one on the Affiliations tab.</div>`}
       </div>` : ''}
-      ${center && n.id !== center.id ? `
-      <div class="rep-field">
-        <label>Introduction <span class="rep-hint">with ${esc(center.name)}</span></label>
-        <select data-field="rel-intro">${this._introOptionsHTML(n, center.id)}</select>
-      </div>
-      <div class="rep-field">
-        <label>Relationship <span class="rep-hint">with ${esc(center.name)}</span></label>
-        <textarea data-field="rel-description" placeholder="How they know each other, history, favors…">${esc(rel?.description || '')}</textarea>
-      </div>
-      ${this._standingBarHTML(standVal, { fromName: n.name, toName: center.name })}
-      ${this._hasIntro(n)
-        ? this._standingBarHTML(fromCenterVal, {
-          fromName: center.name,
-          toName: n.name,
-          field: 'from-center-standing',
-          hint: 'Manual: what the centered bubble thinks of this one.',
-        })
-        : `<div class="rep-card-muted">Set Introduction first (pre-established or a scene) to file what ${esc(center.name)} thinks of ${esc(n.name)}.</div>`}
-      ${!hasReading
-        ? `<div class="rep-dossier-actions">
-            <button type="button" class="rep-stamp" data-action="add-reading-toward">+ Reading</button>
-          </div>`
-        : `<div class="rep-card-muted">Reading filed — edit the take under Connections (⚭).</div>`}
-      ` : `<div class="rep-card-muted">Centered — introductions, relationships, and readings are filed on other bubbles relative to this one.</div>`}
+      ${center && n.id !== center.id
+        ? this._relationSheetHTML(n)
+        : `<div class="rep-card-muted">Centered — introductions, relationships, and readings are filed on other bubbles relative to this one.</div>`}
       ${isSelf || n.auto ? '' : `
         <div class="rep-dossier-actions">
           <button type="button" class="rep-btn small danger" data-action="remove-notice">Remove</button>
@@ -2072,21 +2406,33 @@ export class ReputationModule extends Module {
   _renderCardConnections(n) {
     if (n.category === 'rumor') return this._cardShell(n, { mode: 'connections', inner: this._rumorConnectionsHTML(n) });
     const others = this._nodes().filter(x => x.id !== n.id);
-    const links = new Set(n.links ?? []);
-    const linked = others.filter(o => links.has(o.id));
-    const unlinked = others.filter(o => !links.has(o.id));
+    const linked = others.filter(o => this._linkedTo(n.id, o.id));
+    const unlinked = others.filter(o => !this._linkedTo(n.id, o.id));
     const center = this._center();
+    unlinked.sort((a, b) => {
+      if (center && a.id === center.id) return -1;
+      if (center && b.id === center.id) return 1;
+      return this._personLabel(a).localeCompare(this._personLabel(b));
+    });
+    const cast = this._castChar(this._castIdFor(n));
+    const needsCenter = !!(center && n.id !== center.id && !this._linkedTo(n.id, center.id));
     const towardCenter = center && n.id !== center.id ? this._effectiveReadingToward(n, center.id) : null;
     const filedToward = center && n.id !== center.id ? this._readingToward(n, center.id) : null;
     const incoming = n.id === center?.id ? this._inboundOpinions(n.id) : [];
     const inner = `
+      ${cast ? `<div class="rep-card-credit">Cast · ${esc(cast.name)} (${esc(priorityLabel(cast.priority))})</div>` : ''}
       ${others.length ? `
+        <div class="rep-card-muted">Threads live here. Standing, take, and how they met are on the relationship sheet.</div>
+        ${needsCenter ? `
+          <div class="rep-draft">
+            <button type="button" class="rep-stamp" data-action="link-center">Connect to ${esc(this._personLabel(center))}</button>
+          </div>` : ''}
         <div class="rep-field">
           <label>Threads</label>
           <div class="rep-saved-list">
             ${linked.length ? linked.map(o => `
               <div class="rep-saved">
-                <span class="rep-saved-name">${esc(o.name)}</span>
+                <span class="rep-saved-name">${esc(this._personLabel(o))}</span>
                 <button type="button" class="rep-btn small danger" data-action="toggle-link" data-id="${o.id}">×</button>
               </div>`).join('') : `<div class="rep-card-muted">No threads filed.</div>`}
           </div>
@@ -2095,7 +2441,7 @@ export class ReputationModule extends Module {
             <div class="rep-draft-k">Add connection</div>
             <select data-draft="thread">
               <option value="">— Connect to —</option>
-              ${unlinked.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}
+              ${unlinked.map(o => `<option value="${o.id}">${esc(this._personLabel(o))}${center && o.id === center.id ? ' · centered' : ''}</option>`).join('')}
             </select>
             <button type="button" class="rep-stamp" data-action="confirm-thread">Confirm</button>
           </div>` : ''}
@@ -2111,13 +2457,13 @@ export class ReputationModule extends Module {
           </div>
         </div>` : `
         <div class="rep-field">
-          <label>${esc(this._thinksLabel(n.name, center?.name))} <span class="rep-hint">this bubble only</span></label>
+          <label>${esc(this._thinksLabel(this._personLabel(n), this._personLabel(center)))} <span class="rep-hint">this bubble only</span></label>
           <div class="rep-saved-list">
             ${towardCenter ? this._renderReadingSaved(towardCenter, { droppable: !!filedToward }) : `<div class="rep-card-muted">No take on the centered bubble.</div>`}
           </div>
           ${!filedToward && center ? `
           <div class="rep-draft">
-            <div class="rep-draft-k">${esc(this._thinksLabel(n.name, center.name))}</div>
+            <div class="rep-draft-k">${esc(this._thinksLabel(this._personLabel(n), this._personLabel(center)))}</div>
             <input type="hidden" data-draft="reading-target" value="${esc(center.id)}">
             ${this._standingDraftHTML(0)}
             <input type="text" data-draft="reading-take" placeholder="How they take it (optional)">
@@ -2242,6 +2588,7 @@ export class ReputationModule extends Module {
             ? `<span class="rep-saved-meta" style="color:${info.color}">${esc(info.label)} · ${standing}</span>`
             : (rumors.length ? `<span class="rep-saved-meta">via rumor</span>` : '')}
           ${r.take ? `<span class="rep-saved-take">${esc(r.take)}</span>` : ''}
+          ${r.noScript ? `<span class="rep-saved-meta">${this._stampChipHTML('none')}</span>` : (r.stampUid ? `<span class="rep-saved-meta">${this._stampChipHTML(r.stampUid)}</span>` : '')}
           ${rumors.length ? `<span class="rep-saved-meta">${rumors.map(x => `⌘ ${esc(x.name)}`).join(' · ')}</span>` : ''}
         </div>
         ${droppable ? `<button type="button" class="rep-btn small danger" data-action="drop-reading">×</button>` : ''}
@@ -2273,6 +2620,7 @@ export class ReputationModule extends Module {
     root.querySelector('[data-zoom="in"]')?.addEventListener('click', () => this._setZoom(this._zoomValue() * 1.2));
     root.querySelector('[data-zoom="out"]')?.addEventListener('click', () => this._setZoom(this._zoomValue() / 1.2));
     root.querySelector('[data-zoom="reset"]')?.addEventListener('click', () => this._resetView());
+    root.querySelector('[data-action="refresh-faces"]')?.addEventListener('click', () => this._refreshFaces());
     if (web) {
       web.addEventListener('wheel', e => {
         e.preventDefault();
@@ -2291,8 +2639,26 @@ export class ReputationModule extends Module {
     }
   }
 
+  _hydrateSheetStamps(node) {
+    const center = this._center();
+    if (!center || !node || center.id === node.id) return false;
+    let dirty = false;
+    const rec = this._readingToward(node, center.id);
+    if (rec && !rec.noScript && !String(rec.stampUid || '').trim()) {
+      const hyd = this._connLogStampUid(node, center);
+      if (hyd) { rec.stampUid = hyd; dirty = true; }
+    }
+    const rev = this._readingToward(center, node.id);
+    if (rev && !rev.noScript && !String(rev.stampUid || '').trim()) {
+      const hyd = this._connLogStampUid(center, node);
+      if (hyd) { rev.stampUid = hyd; dirty = true; }
+    }
+    return dirty;
+  }
+
   _bindDossier(el, node) {
     if (!el || !node) return;
+    if (this._cardMode === 'edit' && el.querySelector('.rep-rel-sheet')) this._hydrateSheetStamps(node);
     el.querySelector('[data-card="edit"]')?.addEventListener('click', () => {
       this._editSnap = this._snapshotNotice(node);
       this._cardMode = 'edit';
@@ -2338,11 +2704,18 @@ export class ReputationModule extends Module {
         if (!center || center.id === node.id || node.category === 'rumor') return;
         this._upsertReading(node, center.id, { aware: 'knows', take: '' });
         this._ensureLink(node.id, center.id);
-        this._cardMode = 'connections';
         this.saveState();
         this._sizeWeb();
         this._fillCard();
       });
+    });
+    el.querySelector('[data-action="add-reading-reverse"]')?.addEventListener('click', () => {
+      const center = this._center();
+      if (!center || center.id === node.id || node.category === 'rumor') return;
+      this._upsertReading(center, node.id, { aware: 'knows', take: '' });
+      this.saveState();
+      this._sizeWeb();
+      this._fillCard();
     });
     el.querySelector('[data-action="sever-link"]')?.addEventListener('click', () => {
       const focusId = this.state.focusId;
@@ -2421,10 +2794,10 @@ export class ReputationModule extends Module {
             const duty = (house.duty || house.description || '').trim();
             if (duty && center && center.id !== node.id) {
               const rec = this._readingToward(node, center.id);
-              if (!String(rec?.description || '').trim()) {
-                this._upsertReading(node, center.id, { description: duty, aware: 'knows' });
-                const descEl = el.querySelector('[data-field="rel-description"]');
-                if (descEl && !(descEl.value || '').trim()) descEl.value = duty;
+              if (!String(rec?.description || '').trim() && !String(rec?.baseline || '').trim()) {
+                this._upsertReading(node, center.id, { description: duty, baseline: duty, aware: 'knows' });
+                const baseEl = el.querySelector('[data-field="rel-baseline"]');
+                if (baseEl && !(baseEl.value || '').trim()) baseEl.value = duty;
               }
             }
           }
@@ -2448,6 +2821,60 @@ export class ReputationModule extends Module {
           this._upsertReading(node, center.id, { description: inp.value, aware: 'knows' });
           this.saveState();
           this.bus.emit('reputation.updated', { node });
+          return;
+        }
+        if (inp.dataset.field === 'rel-history') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          const hadTake = !!el.querySelector('[data-field="rel-take"]');
+          this._upsertReading(node, center.id, { history: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node });
+          if (!hadTake) this._fillCard();
+          return;
+        }
+        if (inp.dataset.field === 'rel-baseline') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          const hadTake = !!el.querySelector('[data-field="rel-take"]');
+          this._upsertReading(node, center.id, { baseline: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node });
+          if (!hadTake) this._fillCard();
+          return;
+        }
+        if (inp.dataset.field === 'rel-take') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          this._upsertReading(node, center.id, { take: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node });
+          return;
+        }
+        if (inp.dataset.field === 'rel-stamp') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          this._upsertReading(node, center.id, { stampUid: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node });
+          this._fillCard();
+          return;
+        }
+        if (inp.dataset.field === 'rel-rev-take') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          this._upsertReading(center, node.id, { take: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node: center });
+          return;
+        }
+        if (inp.dataset.field === 'rel-rev-stamp') {
+          const center = this._center();
+          if (!center || center.id === node.id) return;
+          this._upsertReading(center, node.id, { stampUid: inp.value, aware: 'knows' });
+          this.saveState();
+          this.bus.emit('reputation.updated', { node: center });
+          this._fillCard();
           return;
         }
         if (inp.dataset.field === 'toward-standing') {
@@ -2480,6 +2907,14 @@ export class ReputationModule extends Module {
         this._paintBubbles();
       });
     });
+    el.querySelector('[data-action="link-center"]')?.addEventListener('click', () => {
+      const center = this._center();
+      if (!center || center.id === node.id) return;
+      this._ensureLink(node.id, center.id);
+      this.saveState();
+      this._sizeWeb();
+      this._fillCard();
+    });
     el.querySelector('[data-action="confirm-thread"]')?.addEventListener('click', () => {
       const id = el.querySelector('[data-draft="thread"]')?.value;
       if (!id) return;
@@ -2509,15 +2944,11 @@ export class ReputationModule extends Module {
       const center = this._center();
       const targetId = el.querySelector('[data-draft="reading-target"]')?.value;
       if (!targetId || !center || targetId !== center.id) return;
-      node.readings ??= [];
-      if (!node.readings.some(r => r.targetId === targetId)) {
-        node.readings.push({
-          targetId,
-          aware: 'knows',
-          standing: clamp(el.querySelector('[data-draft="reading-standing"]')?.value ?? 0),
-          take: el.querySelector('[data-draft="reading-take"]')?.value.trim() || '',
-        });
-      }
+      this._upsertReading(node, targetId, {
+        aware: 'knows',
+        standing: clamp(el.querySelector('[data-draft="reading-standing"]')?.value ?? 0),
+        take: el.querySelector('[data-draft="reading-take"]')?.value.trim() || '',
+      });
       this.saveState();
       this.bus.emit('reputation.updated', { node });
       this._sizeWeb();
@@ -2535,8 +2966,8 @@ export class ReputationModule extends Module {
         this._fillCard();
       });
     });
-    el.querySelector('[data-action="remove-notice"]')?.addEventListener('click', () => {
-      if (!confirm(`Drop the notice for ${node.name}?`)) return;
+    el.querySelector('[data-action="remove-notice"]')?.addEventListener('click', async () => {
+      if (!await showtimeConfirm(`Drop the notice for ${node.name}?`, { title: 'DROP NOTICE', danger: true, confirmLabel: 'Drop' })) return;
       this._removeNotice(node.id);
     });
   }
@@ -2630,7 +3061,8 @@ export class ReputationModule extends Module {
   _linkedTo(aId, bId) {
     if (!aId || !bId || aId === bId) return false;
     const a = this._node(aId);
-    return !!(a?.links ?? []).includes(bId);
+    const b = this._node(bId);
+    return !!((a?.links ?? []).includes(bId) || (b?.links ?? []).includes(aId));
   }
 
   _removeLink(aId, bId) {
@@ -2649,11 +3081,11 @@ export class ReputationModule extends Module {
     if (!a || !b) return;
     a.links ??= [];
     b.links ??= [];
-    if (a.links.includes(bId)) {
+    if (a.links.includes(bId) || b.links.includes(aId)) {
       this._removeLink(aId, bId);
     } else {
       a.links.push(bId);
-      b.links.push(aId);
+      if (!b.links.includes(aId)) b.links.push(aId);
     }
     this.bus.emit('reputation.updated', { node: a });
   }
@@ -2700,7 +3132,7 @@ export class ReputationModule extends Module {
     `);
     backdrop.querySelector('[data-action="run-audit"]').addEventListener('click', async () => {
       const targetId = backdrop.querySelector('[data-field="target"]').value;
-      if (!targetId) { alert('Choose a bubble to evaluate.'); return; }
+      if (!targetId) { void showtimeAlert('Choose a bubble to evaluate.', { title: 'CONNECTION AUDIT' }); return; }
       const btn = backdrop.querySelector('[data-action="run-audit"]');
       await this._runConnectionAudit(focus, this._node(targetId), btn);
       backdrop.remove();
@@ -2745,7 +3177,7 @@ export class ReputationModule extends Module {
 
       const chatToken = getContext()?.chatMetadata ?? null;
       const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
-        leanQuietGenerate(prompt, { kind: 'voice', fallback: { quietPrompt: prompt, trimToSentence: true } })) ?? '').trim();
+        leanQuietGenerate(prompt, { kind: 'voice', fallback: null })) ?? '').trim();
       if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
       if (!response) throw new Error('Empty audit reply.');
       const take = response.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3).join(' ');
@@ -2766,7 +3198,7 @@ export class ReputationModule extends Module {
       this._fillCard();
     } catch (err) {
       console.error('[Reputation audit]', err);
-      alert(`Audit failed: ${err.message}`);
+      void showtimeAlert(`Audit failed: ${err.message}`, { title: 'REPUTATION AUDIT', danger: true });
     } finally {
       btn.disabled = false;
       btn.textContent = orig;
@@ -2802,7 +3234,7 @@ export class ReputationModule extends Module {
 
       const chatToken = getContext()?.chatMetadata ?? null;
       const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
-        leanQuietGenerate(prompt, { kind: 'voice', fallback: { quietPrompt: prompt, trimToSentence: false } })) ?? '').trim();
+        leanQuietGenerate(prompt, { kind: 'voice', fallback: null })) ?? '').trim();
       if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
       if (!response) throw new Error('Empty audit reply.');
       const parsed = parseStandingTake(response);
@@ -2819,7 +3251,7 @@ export class ReputationModule extends Module {
       this.render(this.container);
     } catch (err) {
       console.error('[Reputation house audit]', err);
-      alert(`Audit failed: ${err.message}`);
+      void showtimeAlert(`Audit failed: ${err.message}`, { title: 'HOUSE AUDIT', danger: true });
     } finally {
       btn.disabled = false;
       btn.textContent = orig;
@@ -2828,10 +3260,12 @@ export class ReputationModule extends Module {
 
   _addNotice() {
     const houses = this.state.house ?? [];
-    const hubId = this.state.focusId || 'self';
+    const center = this._center() || this._nodes().find(n => n.kind === 'self');
+    const centerName = center?.name || 'Centered';
+    const centerLists = center ? this._scenePickLists(center) : { credited: [], others: [] };
     const backdrop = this._buildModal(`
       <div class="rep-modal-title">CONNECTION</div>
-      <div class="rep-modal-subtitle">— Post it on the web —</div>
+      <div class="rep-modal-subtitle">— Connect to ${esc(centerName)} —</div>
       <div class="rep-field">
         <label>Kind</label>
         <div class="rep-cat-row">
@@ -2858,7 +3292,11 @@ export class ReputationModule extends Module {
         ${houses.length ? '' : `<div class="rep-card-muted">File an Affiliation dossier first.</div>`}
       </div>
       <div class="rep-locked" data-role="house-preview" hidden></div>
+      <div class="rep-field" data-role="name-wrap"><label>Name</label>
+        <input type="text" data-field="name" placeholder="Person, mill, rumor..."></div>
       <div data-role="rumor-wrap" style="display:none">
+        <div class="rep-field"><label>The rumor</label>
+          <textarea data-field="description" placeholder="What people are saying…"></textarea></div>
         <div class="rep-field">
           <label>Origin</label>
           <select data-field="originId">
@@ -2887,13 +3325,53 @@ export class ReputationModule extends Module {
           </div>
         </div>
       </div>
-      <div class="rep-field" data-role="name-wrap"><label>Name</label>
-        <input type="text" data-field="name" placeholder="Person, mill, rumor..."></div>
-      <div class="rep-field" data-role="desc-wrap"><label data-role="desc-label">Description (optional)</label>
-        <textarea data-field="description"></textarea></div>
+      <div class="rep-rel-sheet" data-role="rel-wrap">
+        <div class="rep-field">
+          <label>Introduction <span class="rep-hint">with ${esc(centerName)}</span></label>
+          <select data-field="rel-intro"></select>
+        </div>
+        <div class="rep-field" data-role="rel-history-wrap" style="display:none">
+          <label>How they met</label>
+          <textarea data-field="rel-history" rows="2" placeholder="How and when they met"></textarea>
+        </div>
+        <div class="rep-field">
+          <label>Current baseline</label>
+          <textarea data-field="rel-baseline" rows="2" placeholder="How things stand now"></textarea>
+        </div>
+        ${this._standingBarHTML(0, {
+          fromName: 'This notice',
+          toName: centerName,
+          field: 'toward-standing',
+          takeField: 'rel-take',
+          takeValue: '',
+        })}
+        <div class="rep-field">
+          <label>Script <span class="rep-hint">a filed scene, or No script if this take is from the current scene</span></label>
+          <div class="rep-rel-stamp-row">
+            <select data-field="rel-stamp"></select>
+          </div>
+        </div>
+        <div data-role="rel-rev-wrap" style="display:none">
+          ${this._standingBarHTML(0, {
+            fromName: centerName,
+            toName: 'this notice',
+            field: 'from-center-standing',
+            hint: `What ${centerName} thinks of them.`,
+            takeField: 'rel-rev-take',
+            takeValue: '',
+          })}
+          <div class="rep-field">
+            <label>Script <span class="rep-hint">${esc(centerName)}’s take — No script if it is not in the drawer</span></label>
+            <div class="rep-rel-stamp-row">
+              <select data-field="rel-rev-stamp">${this._stampOptionsHTML(center, 'none', centerLists)}</select>
+            </div>
+          </div>
+        </div>
+        <div class="rep-card-muted" data-role="rel-rev-hint">Set Introduction (pre-established or a scene) before filing what ${esc(centerName)} thinks of them.</div>
+      </div>
       <div class="rep-modal-actions">
         <button type="button" class="rep-btn" data-action="cancel">Cancel</button>
-        <button type="button" class="rep-btn" data-action="save">Post</button>
+        <button type="button" class="rep-btn" data-action="save">Confirm</button>
       </div>
     `);
     let category = 'individual';
@@ -2917,6 +3395,54 @@ export class ReputationModule extends Module {
         ${house.duty ? `<div class="rep-locked-duty">${esc(house.duty)}</div>` : ''}
       `;
     };
+    const draftName = () => {
+      if (category === 'group') {
+        const house = this._house(backdrop.querySelector('[data-field="houseId"]')?.value);
+        return house?.alias || house?.name || 'this notice';
+      }
+      return backdrop.querySelector('[data-field="name"]')?.value.trim() || 'this notice';
+    };
+    const syncRelLabels = () => {
+      const who = draftName();
+      const towardRange = backdrop.querySelector('[data-field="toward-standing"]');
+      const towardLab = towardRange?.closest('.rep-field')?.querySelector('label');
+      if (towardLab) towardLab.textContent = this._thinksLabel(who, centerName);
+      const revRange = backdrop.querySelector('[data-field="from-center-standing"]');
+      const revField = revRange?.closest('.rep-field');
+      const revLab = revField?.querySelector('label');
+      if (revLab) revLab.textContent = this._thinksLabel(centerName, who);
+      const revTake = backdrop.querySelector('[data-field="rel-rev-take"]');
+      if (revTake) revTake.placeholder = `What they think of ${who}`;
+      const revHint = revField?.querySelector('.rep-hint');
+      if (revHint) revHint.textContent = `What ${centerName} thinks of ${who}.`;
+    };
+    const syncSceneSelects = () => {
+      const cid = category === 'individual' ? (backdrop.querySelector('[data-field="characterId"]')?.value || '') : '';
+      const who = draftName();
+      const probe = { id: '', kind: 'notice', category, characterId: cid, name: who === 'this notice' ? '' : who, readings: [] };
+      const lists = this._scenePickLists(probe);
+      const introSel = backdrop.querySelector('[data-field="rel-intro"]');
+      if (introSel) {
+        const cur = introSel.value || 'none';
+        introSel.innerHTML = this._introOptionsHTML(probe, center?.id, lists);
+        if ([...introSel.options].some(o => o.value === cur)) introSel.value = cur;
+      }
+      const stampSel = backdrop.querySelector('[data-field="rel-stamp"]');
+      if (stampSel) {
+        const cur = stampSel.value || 'none';
+        stampSel.innerHTML = this._stampOptionsHTML(probe, cur, lists);
+      }
+    };
+    const syncIntro = () => {
+      const intro = backdrop.querySelector('[data-field="rel-intro"]')?.value || 'none';
+      const hasIntro = intro && intro !== 'none';
+      const histWrap = backdrop.querySelector('[data-role="rel-history-wrap"]');
+      if (histWrap) histWrap.style.display = intro === 'pre' ? '' : 'none';
+      const revWrap = backdrop.querySelector('[data-role="rel-rev-wrap"]');
+      if (revWrap) revWrap.style.display = hasIntro ? '' : 'none';
+      const revHint = backdrop.querySelector('[data-role="rel-rev-hint"]');
+      if (revHint) revHint.style.display = hasIntro ? 'none' : '';
+    };
     const syncCat = () => {
       backdrop.querySelectorAll('.rep-cat-btn').forEach(b => b.classList.toggle('on', b.dataset.cat === category));
       const houseMode = category === 'group';
@@ -2925,21 +3451,58 @@ export class ReputationModule extends Module {
       backdrop.querySelector('[data-role="house-wrap"]').style.display = houseMode ? '' : 'none';
       backdrop.querySelector('[data-role="rumor-wrap"]').style.display = rumorMode ? '' : 'none';
       backdrop.querySelector('[data-role="name-wrap"]').style.display = houseMode ? 'none' : '';
-      backdrop.querySelector('[data-role="desc-wrap"]').style.display = houseMode ? 'none' : '';
-      const descLab = backdrop.querySelector('[data-role="desc-label"]');
-      if (descLab) descLab.textContent = rumorMode ? 'The rumor' : 'Description (optional)';
+      const relWrap = backdrop.querySelector('[data-role="rel-wrap"]');
+      if (relWrap) relWrap.style.display = rumorMode ? 'none' : '';
       if (!houseMode) fillPreview(null);
       else fillPreview(this._house(backdrop.querySelector('[data-field="houseId"]').value));
+      syncRelLabels();
+      syncSceneSelects();
     };
+    syncSceneSelects();
+    syncIntro();
+    syncRelLabels();
     backdrop.querySelectorAll('.rep-cat-btn').forEach(b => {
       b.addEventListener('click', () => { category = b.dataset.cat; syncCat(); });
     });
     backdrop.querySelector('[data-field="characterId"]')?.addEventListener('change', e => {
       const m = getCastMembers(this.storage).find(c => c.id === e.target.value);
       if (m?.name) backdrop.querySelector('[data-field="name"]').value = m.name;
+      syncRelLabels();
+      syncSceneSelects();
+    });
+    backdrop.querySelector('[data-field="name"]')?.addEventListener('input', () => {
+      syncRelLabels();
+    });
+    backdrop.querySelector('[data-field="name"]')?.addEventListener('change', () => {
+      syncSceneSelects();
     });
     backdrop.querySelector('[data-field="houseId"]')?.addEventListener('change', e => {
-      fillPreview(this._house(e.target.value));
+      const house = this._house(e.target.value);
+      fillPreview(house);
+      const duty = (house?.duty || house?.description || '').trim();
+      const baseEl = backdrop.querySelector('[data-field="rel-baseline"]');
+      if (duty && baseEl && !baseEl.value.trim()) baseEl.value = duty;
+      syncRelLabels();
+      syncSceneSelects();
+    });
+    backdrop.querySelector('[data-field="rel-intro"]')?.addEventListener('change', syncIntro);
+    backdrop.querySelector('[data-field="toward-standing"]')?.addEventListener('input', e => {
+      const v = clamp(e.currentTarget.value);
+      const info = standingInfo(v);
+      const lab = backdrop.querySelector('[data-role="stand-label"]');
+      if (lab) {
+        lab.textContent = `${info.label} · ${v}`;
+        lab.style.color = info.color;
+      }
+    });
+    backdrop.querySelector('[data-field="from-center-standing"]')?.addEventListener('input', e => {
+      const v = clamp(e.currentTarget.value);
+      const info = standingInfo(v);
+      const lab = backdrop.querySelector('[data-role="from-center-stand-label"]');
+      if (lab) {
+        lab.textContent = `${info.label} · ${v}`;
+        lab.style.color = info.color;
+      }
     });
     backdrop.querySelector('[data-action="add-supporter"]')?.addEventListener('click', () => {
       const id = backdrop.querySelector('[data-draft="new-supporter"]')?.value;
@@ -2949,7 +3512,9 @@ export class ReputationModule extends Module {
     });
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       let name = backdrop.querySelector('[data-field="name"]').value.trim();
-      let description = backdrop.querySelector('[data-field="description"]').value.trim();
+      let description = category === 'rumor'
+        ? (backdrop.querySelector('[data-field="description"]')?.value.trim() || '')
+        : '';
       const characterId = category === 'individual'
         ? (backdrop.querySelector('[data-field="characterId"]')?.value || '')
         : '';
@@ -2960,16 +3525,18 @@ export class ReputationModule extends Module {
       const targetId = category === 'rumor' ? (backdrop.querySelector('[data-field="targetId"]')?.value || '') : '';
       if (category === 'group') {
         const house = this._house(houseId);
-        if (!house) { alert('Choose an affiliation from the list.'); return; }
+        if (!house) { void showtimeAlert('Choose an affiliation from the list.', { title: 'CONNECTION' }); return; }
         if (this._nodes().some(n => n.category === 'group' && n.houseId === houseId)) {
-          alert('That affiliation is already on the web.');
+          void showtimeAlert('That affiliation is already on the web.', { title: 'CONNECTION' });
           return;
         }
         name = house.alias || house.name;
         description = house.duty || house.description || '';
       }
-      if (category === 'rumor' && !name) { alert('Name the rumor.'); return; }
-      if (!name) { alert('Name is required.'); return; }
+      if (category === 'rumor' && !name) { void showtimeAlert('Name the rumor.', { title: 'RUMOR' }); return; }
+      if (!name) { void showtimeAlert('Name is required.', { title: 'CONNECTION' }); return; }
+      const hub = center || this._nodes().find(n => n.kind === 'self');
+      const hubId = hub?.id || 'self';
       const pos = this._orbit(this._nodes().length);
       const node = {
         id: uid(),
@@ -2989,9 +3556,48 @@ export class ReputationModule extends Module {
         links: [hubId],
         readings: [],
       };
-      const hub = this._node(hubId) || this._nodes().find(n => n.kind === 'self');
       if (hub) { hub.links ??= []; if (!hub.links.includes(node.id)) hub.links.push(node.id); }
       this.state.personal.push(node);
+      if (category !== 'rumor' && hub && hub.id !== node.id) {
+        const intro = backdrop.querySelector('[data-field="rel-intro"]')?.value || 'none';
+        const history = intro === 'pre'
+          ? (backdrop.querySelector('[data-field="rel-history"]')?.value.trim() || '')
+          : '';
+        const baseline = backdrop.querySelector('[data-field="rel-baseline"]')?.value.trim() || '';
+        const take = backdrop.querySelector('[data-field="rel-take"]')?.value.trim() || '';
+        const standing = clamp(backdrop.querySelector('[data-field="toward-standing"]')?.value ?? 0);
+        const stampUid = backdrop.querySelector('[data-field="rel-stamp"]')?.value || 'none';
+        this._upsertReading(node, hub.id, {
+          aware: 'knows',
+          intro,
+          history,
+          baseline,
+          description: baseline || history || description,
+          standing,
+          take,
+          stampUid,
+        });
+        if (node.category === 'group' && node.houseId && this._isStarNode(hub)) {
+          const house = this._house(node.houseId);
+          if (house) {
+            house.standing = standing;
+            if (take) house.opinion = take;
+          }
+        }
+        if (intro && intro !== 'none') {
+          const revStanding = clamp(backdrop.querySelector('[data-field="from-center-standing"]')?.value ?? 0);
+          const revTake = backdrop.querySelector('[data-field="rel-rev-take"]')?.value.trim() || '';
+          const revStamp = backdrop.querySelector('[data-field="rel-rev-stamp"]')?.value || 'none';
+          if (revTake || revStanding !== 0 || (revStamp && revStamp !== 'none')) {
+            this._upsertReading(hub, node.id, {
+              aware: 'knows',
+              standing: revStanding,
+              take: revTake,
+              stampUid: revStamp,
+            });
+          }
+        }
+      }
       if (originId) this._ensureLink(node.id, originId);
       if (targetId) this._ensureLink(node.id, targetId);
       if (category === 'rumor') {
@@ -3232,8 +3838,23 @@ export class ReputationModule extends Module {
         ${this._houseConnectionsHTML(h, { composing: true })}
       </div>
       ${this._karmaHTML(h)}
+      ${this._houseCabinetHTML(h)}
       ${h.notes ? `<div class="rep-dos-notes">${esc(h.notes)}</div>` : ''}
     `;
+  }
+
+  _houseCabinetHTML(h) {
+    const files = filesForHouse(getCabinet(this.storage).files, h.id);
+    return `
+      <div class="rep-dos-block">
+        <div class="rep-dos-k">File Cabinet</div>
+        ${files.length ? `<div class="rep-file-list">${files.map(f => `
+          <button type="button" class="rep-file-row" data-action="open-file" data-id="${esc(f.id)}">
+            <span>${esc(f.title)}</span>
+            <span class="rep-card-muted">${esc(f.form)}${f.physical ? ' · physical' : ''}${String(f.html || '').trim() ? '' : ' · stub'}</span>
+          </button>`).join('')}</div>`
+        : `<div class="rep-card-muted">No papers in this drawer.</div>`}
+      </div>`;
   }
 
   _renderHouseEdit(h) {
@@ -3321,6 +3942,12 @@ export class ReputationModule extends Module {
         e.stopPropagation();
         this._runHouseAudit(h, e.currentTarget);
       });
+      card.querySelectorAll('[data-action="open-file"]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
+          this.bus?.emit('library.openCabinet', { fileId: btn.dataset.id, houseId: h.id });
+        });
+      });
       card.querySelector('[data-action="edit-house"]')?.addEventListener('click', e => {
         e.stopPropagation();
         this._houseSnap = JSON.parse(JSON.stringify({
@@ -3350,9 +3977,9 @@ export class ReputationModule extends Module {
         this.saveState();
         this.render(this.container);
       });
-      card.querySelector('[data-action="remove-house"]')?.addEventListener('click', e => {
+      card.querySelector('[data-action="remove-house"]')?.addEventListener('click', async e => {
         e.stopPropagation();
-        if (!confirm(`File away the dossier for ${h.name}?`)) return;
+        if (!await showtimeConfirm(`File away the dossier for ${h.name}?`, { title: 'REMOVE HOUSE DOSSIER', danger: true, confirmLabel: 'Remove' })) return;
         this.state.house = this.state.house.filter(x => x.id !== h.id);
         for (const n of this._nodes()) {
           if (n.houseId === h.id) n.houseId = '';
@@ -3502,7 +4129,7 @@ export class ReputationModule extends Module {
     `);
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const name = backdrop.querySelector('[data-field="name"]').value.trim();
-      if (!name) { alert('Name is required.'); return; }
+      if (!name) { void showtimeAlert('Name is required.', { title: 'HOUSE DOSSIER' }); return; }
       const house = {
         id: uid(),
         name,

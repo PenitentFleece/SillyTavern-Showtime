@@ -12,10 +12,11 @@ import { loadWorldInfo, METADATA_KEY }
 import { oai_settings } from '../../../../../openai.js';
 import { textgenerationwebui_settings } from '../../../../../textgen-settings.js';
 import { Module } from '../../lib/module.js';
-import { withConnectionProfile } from '../../lib/connectionProfile.js';
+import { withConnectionProfile, withShowtimeProfile, houseProfileId } from '../../lib/connectionProfile.js';
 import { pinnedGenerateRaw, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
 import { getCastMembers, priorityLabel, castNameMatches, PRIORITIES, getStarMember } from '../../lib/castCatalog.js';
-import { rafMove } from '../../lib/uiPerf.js';
+import { rafMove, runIdle, marqueeIsHidden } from '../../lib/uiPerf.js';
+import { showtimeAlert, showtimeConfirm } from '../../lib/dialogs.js';
 import {
     cardLevelId,
     DEFAULT_SCRIPT_LEVELS,
@@ -36,6 +37,7 @@ import {
     libraryEntryKey,
     librarySections,
     listLibraryLeaves,
+    matchStampLeaf,
     listVisibleLibraryLeaves,
     reconcileSceneStamps,
     sceneCodesFromTags,
@@ -52,6 +54,7 @@ import {
     addCalendarSort,
     alignCalendarSort,
     calendarSort,
+    calendarDaysPerMonth,
     earthDateSort,
     formatCalendarYear,
     formatSceneDate,
@@ -64,10 +67,14 @@ import {
     partsFromCalendarSort,
     partsFromEarthMs,
     pickParseableTimeKey,
+    parseSpanDates,
+    seasonForMonth,
     timelineUnitSort,
     wallClockParts,
 } from '../../lib/calendarTime.js';
-import { bindLocationCatalogPicker } from '../../lib/locationCatalog.js';
+import { bindLocationCatalogPicker, locationChoices } from '../../lib/locationCatalog.js';
+import { ensureCompass } from '../../lib/compass/state.js';
+import { syncScriptLibraryUnlisted, unlistedLocationChoices } from '../../lib/compass/unlisted.js';
 import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
 import {
     formatConnAt,
@@ -75,6 +82,24 @@ import {
     normalizeConnLog,
     runScriptConnTrack,
 } from '../../lib/scriptConnTrack.js';
+import { smokeDagWalkPure } from '../../lib/dagWalk.js';
+import {
+    expandScriptSeeds,
+    normalizeSpine,
+    shelfOrderedUids,
+    shelfPredecessor,
+    smokeScriptDagPure,
+    spineWouldCycle,
+} from '../../lib/scriptDag.js';
+import { collectWorldIndexSceneSeeds } from '../../lib/worldIndex.js';
+import {
+    SHOWTIME_MEMORY_PRESET_KEY,
+    SHOWTIME_MEMORY_PROMPT,
+    buildShowtimeMemoryPrompt,
+    parseMemoryBookContent,
+    applyMemoryBookIntel,
+    smokeMemoryBookPromptPure,
+} from '../../lib/memoryBookPrompt.js';
 
 // ─────────────────────────────────────────────────────────────
 //  Constants
@@ -117,8 +142,8 @@ const KEYWORD_FACETS = [
     { id: 'datetime',   label: 'Date / Time', tag: 'Date' },
 ];
 
-/** Facets editable as Script keywords (credits cover cast; no character tags). */
-const KEYWORD_EDIT_FACETS = KEYWORD_FACETS.filter(f => f.id !== 'characters');
+/** Facets editable as Script keywords (credits cover cast; span covers time). */
+const KEYWORD_EDIT_FACETS = KEYWORD_FACETS.filter(f => f.id !== 'characters' && f.id !== 'datetime');
 
 function emptyFacets() {
     return { location: [], objects: [], characters: [], datetime: [] };
@@ -372,8 +397,8 @@ ${AGENT_CARD_FIELDS}
 Field rules:
 - Title: Clear, concise card title.
 - Span: Time/date range in this world's calendar (e.g. "Day 3–5", "Spring 1942", or custom season/month names). Use "" if none exists.
-- Summary: One rough paragraph, narrative and atmospheric.
-- Highlights: 2–5 memorable quotes or key lines, formatted like short review blurbs.
+- Summary: Roughly two narrative paragraphs (about 120–220 words), atmospheric, cause → consequence.
+- Highlights: 2–5 memorable quotes, each formatted \`Name: Quote\`.
 - Credits: One entry per character except the Director. Format: "Name (Role)" using star, lead, major, supporting, foil, cameo, narrator, ensemble. Never credit the Director. Credit the Star once, using the CAST primary name (Star is {{user}} — do not also list {{user}}, You, or a persona alias as a second credit). Names that appear in the scene but are not on CAST must be (cameo), never (supporting).
 - Keywords: 4–8 trigger phrases for injection (places, objects, themes — not cast nicknames; cast goes in Credits).
 - Path: Existing SCRIPT SHELF folder path where this card belongs (e.g. "Act I / Night of the Fire"). Use "" for the shelf root. Never invent a path that is not listed.
@@ -392,6 +417,7 @@ const AGENT_LOREBOOK_GROUP_RULES = `LOREBOOK AUDIT — PASS 1 (grouping):
 const AGENT_LOREBOOK_BUILD_RULES = `LOREBOOK AUDIT — PASS 2 (build one card):
 - You are given ONE scene group’s source clippings (and optional TitleHint / Path / Keywords seeds).
 - Emit exactly ONE ScriptCard using the standard field names.
+- If a clipping uses Showtime memory headings (Timeframe, Locations, Cast, Cameos, Essential Beats, Highlighted Quotes, Conditions, Relationships, Reading, Hooks, Items / Documents), map those onto Span, Location, Credits, Summary, Highlights (\`Name: Quote\`), notes, Objects.
 - Do not invent origin/source fields — the host stamps which entries belong to this card.
 - Prefer the seed TitleHint / Path / Keywords when they fit; refine Keywords from the clippings.`;
 
@@ -404,7 +430,8 @@ const AGENT_LORE_ENTRIES_AUDIT = `AUDIT ENTRIES (mandatory):
 const AGENT_CHAT_RULES = `CHAT RULES (mandatory):
 - Group consecutive messages into scene ScriptCards (same location, conflict, or beat).
 - Do NOT emit one card per message.
-- Merge related material into narrative ScriptCards.`;
+- Merge related material into narrative ScriptCards.
+- Highlights must be \`Name: Quote\`. Credits list Cast plus Cameos. Span is the Timeframe.`;
 
 function asIndexList(raw) {
     if (raw == null) return [];
@@ -459,7 +486,7 @@ function normalizeSourceStamp(raw) {
         parentUid   string | null   uid of parent card (tree grouping)
 
         title       string
-        span        string | null   e.g. "Day 1–3", "Arc 2", "Year 452"
+        span        string | null   timeframe (written on the card; also timeline placement)
         timestamp   number | null   unix ms — chronological sort for timeline
 
         summary     string          short header (optional)
@@ -471,6 +498,8 @@ function normalizeSourceStamp(raw) {
         keywords    string[]        trigger words for keyword injection
         aliases     string[]        extra keys (scanned with keywords)
         tags        string[]
+        followsUids string[]        plot spine: attach after that chain (or merge back)
+        dependsUids string[]        plot spine: simultaneous elsewhere (that card can carry its own Follows)
         pinned      boolean         always inject when active (WI constant)
         active      boolean
         scanDepth   number | null   optional per-card scan override
@@ -525,6 +554,8 @@ function makeCard(overrides = {}) {
         keywordFacets: emptyFacets(),
         aliases:    [],
         tags:       [],
+        followsUids: [],
+        dependsUids: [],
         pinned:     false,
         active:     true,
         scanDepth:  null,
@@ -668,6 +699,7 @@ hide() { if (this._panel) this._panel.style.display = 'none'; }
     mount(container) {
         this._panel = container;
         log('Mounted');
+        this._scheduleSTHydrate();
         this._rerender();
     }
 
@@ -675,15 +707,28 @@ hide() { if (this._panel) this._panel.style.display = 'none'; }
     log('Initializing…');
     this._migrateLegacyIfNeeded();
     this._clearLegacyInjection();
-    await this._probeSTIntegrations();
+    this._profiles = this._profiles || [];
+    this._wiBooks = this._wiBooks || [];
     this._registerInjection();
     this.bus?.on('cast.added',   () => this._onCastCatalogChanged());
     this.bus?.on('cast.updated', () => this._onCastCatalogChanged());
     this.bus?.on('cast.removed', () => this._onCastCatalogChanged());
     this.bus?.on('reputation.updated', () => this._scheduleConnTrack());
     this.bus?.on('reputation.removed', () => this._scheduleConnTrack());
-    this._scheduleConnTrack();
+    const dagSmoke = smokeDagWalkPure() || smokeScriptDagPure();
+    if (dagSmoke) console.warn('[Showtime/ScriptDag] smoke failed:', dagSmoke);
+    const memSmoke = smokeMemoryBookPromptPure();
+    if (memSmoke) console.warn('[Showtime/MemoryBook] smoke failed:', memSmoke);
+    this._ensureMemoryPreset();
     if (this._panel) this._rerender();
+}
+
+_ensureMemoryPreset() {
+    import('../../../../SillyTavern-MemoryBooks/summaryPromptManager.js').then(async (mod) => {
+        if (typeof mod.isValid !== 'function' || typeof mod.upsertPreset !== 'function') return;
+        if (await mod.isValid(SHOWTIME_MEMORY_PRESET_KEY)) return;
+        await mod.upsertPreset(SHOWTIME_MEMORY_PRESET_KEY, SHOWTIME_MEMORY_PROMPT, 'Showtime Script');
+    }).catch(() => { /* MemoryBooks is optional */ });
 }
 
 _onCastCatalogChanged() {
@@ -701,7 +746,7 @@ _runConnTrack() {
         const chat = getContext()?.chat;
         const { dirty, stamped } = runScriptConnTrack(this.storage, { chat });
         if (!dirty) return;
-        this.saveState();
+        if (stamped) this.saveState();
         if (!stamped) return;
         this.bus?.emit('showtime.stateChanged');
         if (this._panel && !this._editingCardUid) this._rerender();
@@ -715,11 +760,30 @@ async onChatChanged() {
     clearTimeout(this._connTrackT);
     this._cardsNormalized = false;
     this._migrateLegacyIfNeeded();
-    await this._loadWIBooks();
+    clearTimeout(this._connTrackT);
+    if (!marqueeIsHidden() && this._panel) {
+      this._scheduleSTHydrate();
+      this._connTrackT = setTimeout(() => this._runConnTrack(), 8000);
+    }
+}
+
+_scheduleSTHydrate() {
+    if (this._stHydrateBusy || this._stHydrateQueued) return;
+    this._stHydrateQueued = true;
+    const run = () => {
+        this._stHydrateQueued = false;
+        this._stHydrateBusy = true;
+        this._hydrateSTIntegrations()
+            .catch(err => console.warn('[Showtime/Script] hydrate', err))
+            .finally(() => { this._stHydrateBusy = false; });
+    };
+    runIdle(run, 1800);
+}
+
+async _hydrateSTIntegrations() {
+    await this._loadWIBooks(null, { force: false });
     this._profiles = await this._findProfiles();
-    this.bus?.emit('showtime.stateChanged');
-    this._scheduleConnTrack();
-    if (this._panel) this._rerender();
+    if (this._panel) this._refreshDrawer?.();
 }
 
     // ── ST Integration Probe ────────────────────────────────────
@@ -774,7 +838,6 @@ async _probeSTIntegrations() {
 
     // extension_settings shape
     log('extension_settings keys:', Object.keys(extension_settings ?? {}));
-    log('extension_settings (full):', JSON.parse(JSON.stringify(extension_settings ?? {})));
 
     // localStorage scan
     const lsHits = Object.keys(localStorage).filter(k =>
@@ -1032,6 +1095,8 @@ async _findProfiles(rawSettings = null) {
         this.injector.register({
             id: 'script.lore',
             always: true,
+            // Walks every scene card. Chat load must not do that; generation will.
+            heavy: true,
             buildText: () => {
                 const db = this._db();
                 return this._buildInjectionText(this._getInjectionCandidates(db));
@@ -1089,13 +1154,9 @@ async _findProfiles(rawSettings = null) {
             })
             : [];
 
-        const recent = s.injectRecentN > 0
-            ? active.filter(c => !c.pinned && !isEventCard(c) && !this._cardKeys(c).length).slice(-s.injectRecentN)
-            : [];
-
         const seen = new Set();
-        const out = [...pinned, ...keyed, ...recent].filter(c => {
-            if (seen.has(c.uid)) return false;
+        const out = [...pinned, ...keyed].filter(c => {
+            if (seen.has(c.uid) || this._isFolder(c, db)) return false;
             seen.add(c.uid);
             return true;
         });
@@ -1104,6 +1165,45 @@ async _findProfiles(rawSettings = null) {
                 if (seen.has(ev.uid)) continue;
                 seen.add(ev.uid);
                 out.push(ev);
+            }
+        }
+
+        const present = this.getTimelinePresent();
+        let wiSeeds = [];
+        try { wiSeeds = collectWorldIndexSceneSeeds(this.storage); } catch { wiSeeds = []; }
+        const seedUids = [...out.map(c => c.uid), present?.sourceUid, ...wiSeeds].filter(Boolean);
+        const placeOf = (c) => this._timelinePlace(c);
+        const walkable = active.filter(c => !this._isFolder(c, db));
+        const expanded = expandScriptSeeds(walkable, seedUids, {
+            back: 2,
+            forward: 1,
+            cap: 8,
+            placeOf,
+            presentSort: Number.isFinite(Number(present?.sort)) ? Number(present.sort) : null,
+        });
+        const byUid = new Map(walkable.map(c => [c.uid, c]));
+        for (const uid of wiSeeds) {
+            const card = byUid.get(uid);
+            if (!card || seen.has(card.uid)) continue;
+            seen.add(card.uid);
+            out.push(card);
+        }
+        for (const uid of expanded.extra) {
+            const card = byUid.get(uid);
+            if (!card || seen.has(card.uid)) continue;
+            seen.add(card.uid);
+            out.push(card);
+        }
+
+        const recentN = Math.max(0, Number(s.injectRecentN) || 0);
+        const padN = recentN > expanded.extra.length ? recentN - expanded.extra.length : 0;
+        if (padN > 0) {
+            const recent = active
+                .filter(c => !c.pinned && !isEventCard(c) && !this._isFolder(c, db) && !this._cardKeys(c).length && !seen.has(c.uid))
+                .slice(-padN);
+            for (const c of recent) {
+                seen.add(c.uid);
+                out.push(c);
             }
         }
         return out;
@@ -1211,7 +1311,7 @@ async _findProfiles(rawSettings = null) {
             const eventHead = isEventCard(c)
                 ? `[${c.eventScale === 'personal' ? 'Personal Event' : 'World Event'} · ${c.title}${c.span || c.timeKey ? ` | ${c.span || c.timeKey}` : ''}]`
                 : `[${c.title}${c.span ? ` | ${c.span}` : ''}]`;
-            const lines = [eventHead];
+            const lines = ['Lived record. This is what happened. Do not mention a script, card, lorebook, or production code.', eventHead];
             if (isEventCard(c) && c.eventRecurring) {
                 const rule = EVENT_RECUR_OPTS.find(o => o.id === c.eventRecur)?.label || 'Recurring';
                 lines.push(`Recurring: ${rule}.`);
@@ -1230,11 +1330,11 @@ async _findProfiles(rawSettings = null) {
                     const name = cr.name || cr.character || '';
                     const role = creditRoleLabel(this._liveCreditRole(cr, this._castMembers()) || cr.role);
                     if (!name && !role) return '';
-                    return name && role ? `${name} (${role})` : (name || role);
+                    return name || '';
                 })
                 .filter(Boolean)
                 .join(', ');
-            if (creditStr) lines.push('Characters: ' + creditStr);
+            if (creditStr) lines.push('There: ' + creditStr);
             const sponsorStr = (c.sponsors || [])
                 .map(sp => this._liveSponsor(sp))
                 .filter(Boolean)
@@ -1246,7 +1346,7 @@ async _findProfiles(rawSettings = null) {
             if (stampedLore) {
                 for (const lore of this._resolveStampLore(c)) {
                     lines.push(`---`);
-                    lines.push(`[Lore · ${lore.title}${lore.book ? ` · ${lore.book}` : ''}]`);
+                    lines.push(lore.title ? `Remembered: ${lore.title}` : 'Remembered:');
                     lines.push(lore.content.length > 280 ? `${lore.content.slice(0, 279).trimEnd()}…` : lore.content);
                 }
             }
@@ -1289,28 +1389,9 @@ async _findProfiles(rawSettings = null) {
         }
         const out = [];
         const seen = new Set();
+        const books = this._wiBooks || [];
         for (const e of stamp.entries) {
-            let leaf = leaves.find(l => e.key && l.key === e.key);
-            if (!leaf && e.book && e.uid != null) {
-                leaf = leaves.find(l => l.book === e.book && String(l.uid) === String(e.uid));
-            }
-            if (!leaf && e.book && e.title) {
-                leaf = leaves.find(l => l.book === e.book && l.title === e.title);
-            }
-            if (!leaf && e.book) {
-                const book = (this._wiBooks || []).find(b => b.name === e.book);
-                const raw = book?.entries?.find(x =>
-                    (e.uid != null && String(x.uid) === String(e.uid))
-                    || (e.title && String(x.comment || '').trim() === e.title));
-                if (raw) {
-                    leaf = {
-                        key: libraryEntryKey(e.book, raw.uid),
-                        title: String(raw.comment || e.title || 'Untitled').trim(),
-                        book: e.book,
-                        content: String(raw.content || ''),
-                    };
-                }
-            }
+            const leaf = matchStampLeaf(e, leaves, books);
             const content = String(leaf?.content || '').trim();
             const key = leaf?.key || `${e.book}|${e.uid}|${e.title}`;
             if (!content || seen.has(key)) continue;
@@ -1469,6 +1550,7 @@ async _findProfiles(rawSettings = null) {
             syncFromCard: false,
             wardrobe: [],
             props: [],
+            outfits: [],
             condition: '',
             plotHooks: [],
             genreNotes: '',
@@ -1583,6 +1665,12 @@ async _findProfiles(rawSettings = null) {
         }
         c.credits = this._dedupeCredits(c.credits, members);
         c.keywordFacets.characters = [];
+        const legacyDates = [...(c.keywordFacets.datetime || [])].map(s => String(s).trim()).filter(Boolean);
+        if (!String(c.span || '').trim() && legacyDates[0]) c.span = legacyDates[0];
+        const dateSet = new Set(legacyDates.map(s => s.toLowerCase()));
+        c.keywordFacets.datetime = [];
+        c.keywordFacets.objects = (c.keywordFacets.objects || []).filter(k => !dateSet.has(String(k).toLowerCase()));
+        c.keywords = (c.keywords || []).filter(k => !dateSet.has(String(k).toLowerCase()));
         const fromFacets = flattenFacets(c.keywordFacets);
         const seen = new Set(fromFacets.map(k => k.toLowerCase()));
         for (const k of c.keywords) {
@@ -1632,7 +1720,7 @@ async _findProfiles(rawSettings = null) {
         c.notes    = c.notes ?? '';
         c.sourceBook = c.sourceBook ? String(c.sourceBook) : null;
         c.sourceStamp = normalizeSourceStamp(c.sourceStamp);
-        c.timeKey  = String(c.span || c.timeKey || c.keywordFacets?.datetime?.[0] || '').trim();
+        c.timeKey  = String(c.span || c.timeKey || '').trim();
         c.timeLane = Number(c.timeLane) || 0;
         c.timeManual = !!c.timeManual;
         c.timeManualSort = Number.isFinite(Number(c.timeManualSort)) ? Number(c.timeManualSort) : null;
@@ -1642,6 +1730,7 @@ async _findProfiles(rawSettings = null) {
         if (c.timelineOff) { c.timeManual = false; c.timeManualSort = null; }
         c.coverImage = String(c.coverImage || c.cover || '').trim();
         c.coverPlacement = c.coverPlacement === 'below' ? 'below' : 'above';
+        normalizeSpine(c);
         return c;
     }
 
@@ -1664,8 +1753,11 @@ async _findProfiles(rawSettings = null) {
             let dirty = false;
             db.cards = db.cards.map(c => {
                 if ((c.roles?.length && !c.credits?.length) || (!c.content && c.summary)) dirty = true;
+                if ((c.keywordFacets?.datetime || []).length) dirty = true;
                 return this._normalizeCard(c, members);
             });
+            const allowed = new Set(db.cards.filter(c => c.kind !== 'folder').map(c => c.uid));
+            db.cards.forEach(c => normalizeSpine(c, { allowed }));
             this._cardsNormalized = true;
             if (dirty) this.saveState();
         }
@@ -1676,7 +1768,18 @@ async _findProfiles(rawSettings = null) {
 
     _save(_db) {
         this.saveState();
+        this._syncUnlistedPlaces();
         this.bus?.emit('showtime.stateChanged');
+    }
+
+    _syncUnlistedPlaces() {
+        try {
+            const bst = this.storage.getChat('backstage', {});
+            const compass = ensureCompass(bst);
+            if (syncScriptLibraryUnlisted(compass, this.storage)) {
+                try { this.storage.saveChat(); } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
     }
 
     _boundChatBook() {
@@ -2075,6 +2178,94 @@ async _findProfiles(rawSettings = null) {
         return sceneCode(card, this._db());
     }
 
+    _spineSceneOptions(card) {
+        return this._db().cards.filter(c =>
+            c?.uid && c.uid !== card?.uid && !this._isFolder(c) && c.kind !== 'folder');
+    }
+
+    _spineCardLabel(c) {
+        if (!c) return '';
+        const code = this._orgCode(c);
+        const title = c.title || '(untitled)';
+        return code ? `${code} ${title}` : title;
+    }
+
+    _shelfPredCard(card) {
+        if (!card?.uid || this._isFolder(card)) return null;
+        const pred = shelfPredecessor(shelfOrderedUids(this._db().cards), card.uid);
+        return pred ? this._getCard(pred) : null;
+    }
+
+    _spineSimulCards(card) {
+        if (!card?.uid) return [];
+        const seen = new Set();
+        const out = [];
+        const add = (c) => {
+            if (!c?.uid || c.uid === card.uid || seen.has(c.uid) || this._isFolder(c)) return;
+            seen.add(c.uid);
+            out.push(c);
+        };
+        for (const id of card.dependsUids || []) add(this._getCard(id));
+        for (const c of this._db().cards) {
+            if ((c.dependsUids || []).includes(card.uid)) add(c);
+        }
+        return out;
+    }
+
+    _spineAfterLine(card) {
+        const bits = [];
+        const pred = this._shelfPredCard(card);
+        if (pred) bits.push(`after ${this._spineCardLabel(pred)}`);
+        const simul = this._spineSimulCards(card);
+        if (simul.length) bits.push(`with ${simul.map(c => this._spineCardLabel(c)).join(', ')} (elsewhere)`);
+        if (!bits.length) return '';
+        return `<div class="stm-spine-after">${esc(bits.join(' · '))}</div>`;
+    }
+
+    _spineChipHTML(c, name) {
+        return `<span class="stm-spine-chip" data-uid="${esc(c.uid)}">
+            <input type="hidden" name="${name}" value="${esc(c.uid)}">
+            ${esc(this._spineCardLabel(c))}
+            <button type="button" class="stm-pill-x stm-spine-x" title="Remove">×</button>
+        </span>`;
+    }
+
+    _spinePickerHTML(card) {
+        const pred = this._shelfPredCard(card);
+        const after = pred ? `after ${this._spineCardLabel(pred)}` : 'start of the shelf timeline';
+        const picker = (name, selected, placeholder) => {
+            const chips = (selected || [])
+                .map(id => this._getCard(id))
+                .filter(c => c && !this._isFolder(c))
+                .map(c => this._spineChipHTML(c, name))
+                .join('');
+            return `<div class="stm-spine-pick-wrap" data-spine="${esc(name)}">
+                <div class="stm-spine-chips">${chips}</div>
+                <div class="stm-spine-tools">
+                    <input type="text" class="stm-spine-search" placeholder="${esc(placeholder)}" autocomplete="off">
+                    <div class="stm-spine-suggest" hidden></div>
+                </div>
+            </div>`;
+        };
+        return `<div class="stm-spine-block">
+            <div class="stm-spine-after">Default: ${esc(after)}</div>
+            <div class="stm-form-row">
+                <label>Follows <span class="stm-hint">(attach after that chain, or merge back)</span></label>
+                ${picker('followsUid', card.followsUids, 'Search a scene to follow…')}
+            </div>
+            <div class="stm-form-row">
+                <label>Depends <span class="stm-hint">(elsewhere at this beat; that card can carry its own Follows)</span></label>
+                ${picker('dependsUid', card.dependsUids, 'Search a simultaneous scene…')}
+            </div>
+        </div>`;
+    }
+
+    _readSpineUids(el, name) {
+        return [...el.querySelectorAll(`input[type="hidden"][name="${name}"]`)]
+            .map(i => String(i.value || '').trim())
+            .filter(Boolean);
+    }
+
     /** Assign levelId/kind for a move under destParentUid. Returns false if illegal. */
     _applyLevelForParent(card, destParentUid) {
         const db = this._db();
@@ -2250,7 +2441,7 @@ async _findProfiles(rawSettings = null) {
         const trimmed = this._truncateToTokenBudget(userPrompt, maxIn);
         const temp = db.settings.aiTemperature;
         try {
-            const out = await this._withProfile(db.settings.aiProfile, () =>
+            const out = await withShowtimeProfile(this.storage, 'script', () =>
                 this._withTemperature(temp, () =>
                     pinnedGenerateRaw({
                         prompt: trimmed,
@@ -2259,6 +2450,7 @@ async _findProfiles(rawSettings = null) {
                         jsonSchema,
                     }),
                 ),
+                { override: db.settings.aiProfile },
             );
             // Chat-switch guard: agent passes write cards into the active chat.
             if (this._agentChatToken && (getContext()?.chatMetadata ?? null) !== this._agentChatToken) {
@@ -2308,11 +2500,21 @@ async _findProfiles(rawSettings = null) {
             if (mode === 'name-desc') return byName(b, a);
             if (mode === 'new') return (b.createdAt || 0) - (a.createdAt || 0);
             if (mode === 'old') return (a.createdAt || 0) - (b.createdAt || 0);
-            if (mode === 'location' || mode === 'datetime' || mode === 'characters' || mode === 'objects') {
+            if (mode === 'location' || mode === 'characters' || mode === 'objects') {
                 const d = folderRank(a) - folderRank(b);
                 if (d) return d;
                 const ka = facetKey(a, mode);
                 const kb = facetKey(b, mode);
+                if (ka && kb) return ka.localeCompare(kb) || byName(a, b);
+                if (ka) return -1;
+                if (kb) return 1;
+                return byName(a, b);
+            }
+            if (mode === 'datetime') {
+                const d = folderRank(a) - folderRank(b);
+                if (d) return d;
+                const ka = String(a.span || a.timeKey || '').toLowerCase();
+                const kb = String(b.span || b.timeKey || '').toLowerCase();
                 if (ka && kb) return ka.localeCompare(kb) || byName(a, b);
                 if (ka) return -1;
                 if (kb) return 1;
@@ -2346,6 +2548,8 @@ async _findProfiles(rawSettings = null) {
             let key = '(unfiled)';
             if (facetId === 'characters') {
                 key = (c.credits || []).find(cr => (cr.name || '').trim())?.name?.trim() || '(unfiled)';
+            } else if (facetId === 'datetime') {
+                key = String(c.span || c.timeKey || '').trim() || '(unfiled)';
             } else {
                 key = (c.keywordFacets?.[facetId]?.[0] || '').trim() || '(unfiled)';
             }
@@ -2385,6 +2589,9 @@ async _findProfiles(rawSettings = null) {
                 ...(card.credits || []).map(cr => cr.name).filter(Boolean),
                 card.title || '',
             ];
+        }
+        if (facetId === 'datetime') {
+            return [card.span, card.timeKey, card.title].filter(Boolean);
         }
         if (facetId && card.keywordFacets?.[facetId]) {
             return [...(card.keywordFacets[facetId] || []), card.title || ''];
@@ -2482,7 +2689,7 @@ async _findProfiles(rawSettings = null) {
     }
 
     _cardTimeKey(card) {
-        return String(card.span || card.timeKey || card.keywordFacets?.datetime?.[0] || '').trim();
+        return String(card.span || card.timeKey || '').trim();
     }
 
     _cal() {
@@ -2504,48 +2711,407 @@ async _findProfiles(rawSettings = null) {
         const hit = pickParseableTimeKey({
             span: card.span,
             timeKey: card.timeKey,
-            keywordFacets: card.keywordFacets,
         }, cal);
         return hit
             ? `<span class="stm-cal-hint-ok">Places on timeline · ${esc(hit.key)} (${esc(hit.parsed.scale)}${hit.range ? ' range' : ''})</span>`
-            : `<span class="stm-cal-hint-miss">No parseable placement yet — open Set Time or type a span.</span>`;
+            : `<span class="stm-cal-hint-miss">No parseable placement yet — click span to pick days.</span>`;
     }
 
-    _setTimeDetailsHTML(card, { open = false } = {}) {
-        return `<details class="stm-set-time"${open ? ' open' : ''}>
-            <summary>Set Time</summary>
-            <div class="stm-set-time-body">
-              ${this._calendarPickerHTML({
-                  inputName: 'span',
-                  scaleFilter: false,
-                  spanParts: card.spanParts,
-              })}
+    _spanCalView(card) {
+        const cal = this._cal();
+        const anchor = this._timelineAnchorParts();
+        const hit = card ? this._parseCardTime(card, { fillMissing: false }) : null;
+        const parts = hit?.range?.start?.parts || hit?.parsed?.parts || {};
+        let year = Number(parts.year);
+        if (!Number.isFinite(year) || year < 0) year = Number(anchor.year);
+        if (!Number.isFinite(year) || year < 0) year = 1;
+        let month = parts.monthIndex;
+        if (month == null && parts.seasonId) {
+            const season = cal.seasons.find(s => s.id === parts.seasonId);
+            month = season ? Math.max(0, (season.startMonth || 1) - 1) : null;
+        }
+        if (month == null) month = anchor.monthIndex;
+        if (month == null) month = 0;
+        month = Math.max(0, Math.min(cal.monthsPerYear - 1, Number(month) || 0));
+        return { year, month, parts, range: hit?.range && !hit.range.point ? hit.range : null };
+    }
+
+    _spanCalHTML(card, { inputName = 'span' } = {}) {
+        const cal = this._cal();
+        const view = this._spanCalView(card);
+        const days = calendarDaysPerMonth(cal);
+        const season = seasonForMonth(cal, view.month + 1);
+        const yearLabel = formatCalendarYear(view.year, cal) || `${cal.labels.year} ${view.year}`;
+        const monthName = cal.monthNames[view.month] || `${cal.labels.month} ${view.month + 1}`;
+        const seasons = cal.seasons.map(s =>
+            `<button type="button" class="stm-span-cal-chip${season?.id === s.id ? ' is-on' : ''}" data-span-cal="season" data-id="${esc(s.id)}">${esc(s.label)}</button>`
+        ).join('');
+        const monthChips = cal.monthsPerYear <= 12
+            ? cal.monthNames.map((n, i) =>
+                `<button type="button" class="stm-span-cal-chip${i === view.month ? ' is-on' : ''}" data-span-cal="goto-month" data-month="${i}">${esc(String(n || '').slice(0, 3))}</button>`
+            ).join('')
+            : '';
+        const cells = Array.from({ length: days }, (_, i) => {
+            const d = i + 1;
+            return `<button type="button" class="stm-span-cal-day" data-span-cal="day" data-day="${d}">${d}</button>`;
+        }).join('');
+        return `<div class="stm-span-cal" data-input="${esc(inputName)}" data-year="${view.year}" data-month="${view.month}">
+            <div class="stm-span-cal-nav">
+                <button type="button" class="stm-span-cal-step" data-span-cal="year-prev" title="Previous ${esc(cal.labels.year)}">◀</button>
+                <button type="button" class="stm-span-cal-title" data-span-cal="year">${esc(yearLabel)}</button>
+                <button type="button" class="stm-span-cal-step" data-span-cal="year-next" title="Next ${esc(cal.labels.year)}">▶</button>
             </div>
-          </details>`;
+            <div class="stm-span-cal-seasons">${seasons}</div>
+            <div class="stm-span-cal-nav">
+                <button type="button" class="stm-span-cal-step" data-span-cal="month-prev" title="Previous ${esc(cal.labels.month)}">◀</button>
+                <button type="button" class="stm-span-cal-title" data-span-cal="month">${esc(monthName)}</button>
+                <button type="button" class="stm-span-cal-step" data-span-cal="month-next" title="Next ${esc(cal.labels.month)}">▶</button>
+            </div>
+            ${monthChips ? `<div class="stm-span-cal-months">${monthChips}</div>` : ''}
+            <div class="stm-span-cal-grid">${cells}</div>
+            <p class="stm-settings-hint">Click days to add or remove. Shift-click fills a run. Year / month / season names set a coarser span.</p>
+        </div>`;
+    }
+
+    _spanPopHTML(card, { inputName = 'span' } = {}) {
+        return `<div class="stm-span-pop" hidden>
+            ${this._spanCalHTML(card, { inputName })}
+            <details class="stm-set-time">
+              <summary>More time (week, hour, fuzzy)</summary>
+              <div class="stm-set-time-body">
+                ${this._calendarPickerHTML({
+                    inputName,
+                    scaleFilter: false,
+                    spanParts: card?.spanParts,
+                    idPrefix: inputName === 'span' ? 'stm-tp' : 'stm-ev-tp',
+                })}
+              </div>
+            </details>
+          </div>`;
+    }
+
+    _spanFieldHTML(card, {
+        inputName = 'span',
+        inputId = '',
+        label = 'Span',
+        hint = '',
+        required = false,
+    } = {}) {
+        const idAttr = inputId ? ` id="${esc(inputId)}"` : '';
+        return `<div class="stm-form-row stm-span-field">
+            <label>${esc(label)}${required ? ' <span class="stm-required">*</span>' : ''}${hint ? ` <span class="stm-hint">${hint}</span>` : ''}</label>
+            <input type="text" name="${esc(inputName)}"${idAttr} value="${esc(card?.span || this._cardTimeKey(card) || '')}" placeholder="${esc(this._calendarTimePlaceholder())}" autocomplete="off">
+            <div class="stm-cal-hints">${this._calendarTimeHintsHTML(card || {})}</div>
+            ${this._spanPopHTML(card, { inputName })}
+          </div>`;
+    }
+
+    _setTimeDetailsHTML(card, { inputName = 'span' } = {}) {
+        return this._spanPopHTML(card, { inputName });
     }
 
     _bindCalendarTimeHints(formEl) {
+        this._bindSpanCal(formEl, { inputName: 'span' });
         this._bindCalendarPicker(formEl, {
             onPick: (key) => {
                 const input = formEl.querySelector('[name="span"]');
                 if (input) input.value = key;
-                const wrap = formEl.querySelector('.stm-kw-editor .stm-pills');
-                if (wrap) {
-                    wrap.querySelector('.stm-settings-hint')?.remove();
-                    const exists = [...wrap.querySelectorAll('.stm-pill-edit')].some(p =>
-                        p.dataset.facet === 'datetime' && String(p.dataset.value || '').toLowerCase() === key.toLowerCase());
-                    if (!exists) wrap.insertAdjacentHTML('beforeend', this._keywordEditChipHTML('datetime', key));
-                }
-                const hint = formEl.querySelector('.stm-cal-hint-ok, .stm-cal-hint-miss');
-                if (hint) {
-                    const range = parseTimeRange(key, this._cal());
-                    if (range) {
-                        hint.className = 'stm-cal-hint-ok';
-                        hint.textContent = `Places on timeline · ${key} (${range.scale}${range.point ? '' : ' range'})`;
-                    }
+                const host = formEl.querySelector('.stm-span-cal');
+                if (host) {
+                    this._spanCalHint(formEl, key);
+                    this._spanCalPaint(host, key);
                 }
             },
         });
+    }
+
+    _spanCalReadView(host) {
+        const cal = this._cal();
+        let year = Number(host.dataset.year);
+        if (!Number.isFinite(year) || year < 0) year = 1;
+        let month = Number(host.dataset.month);
+        if (!Number.isFinite(month)) month = 0;
+        month = Math.max(0, Math.min(cal.monthsPerYear - 1, month));
+        return { year, month };
+    }
+
+    _spanCalRefreshChrome(host) {
+        const cal = this._cal();
+        const { year, month } = this._spanCalReadView(host);
+        const season = seasonForMonth(cal, month + 1);
+        const yearBtn = host.querySelector('[data-span-cal="year"]');
+        const monthBtn = host.querySelector('[data-span-cal="month"]');
+        if (yearBtn) yearBtn.textContent = formatCalendarYear(year, cal) || `${cal.labels.year} ${year}`;
+        if (monthBtn) monthBtn.textContent = cal.monthNames[month] || `${cal.labels.month} ${month + 1}`;
+        host.querySelectorAll('[data-span-cal="season"]').forEach(btn => {
+            btn.classList.toggle('is-on', btn.dataset.id === season?.id);
+        });
+        host.querySelectorAll('[data-span-cal="goto-month"]').forEach(btn => {
+            btn.classList.toggle('is-on', Number(btn.dataset.month) === month);
+        });
+    }
+
+    _spanCalPaint(host, spanText) {
+        const cal = this._cal();
+        const { year, month } = this._spanCalReadView(host);
+        const items = parseSpanDates(spanText, cal, { fillMissing: false });
+        const days = new Set();
+        for (const hit of items) {
+            const p = hit.parts || {};
+            if (p.day == null || p.monthIndex == null) continue;
+            if (Number(p.monthIndex) !== month) continue;
+            if (p.year != null && Number(p.year) !== year) continue;
+            days.add(Number(p.day));
+        }
+        host.querySelectorAll('.stm-span-cal-day').forEach(btn => {
+            const d = Number(btn.dataset.day);
+            btn.classList.toggle('is-on', days.has(d));
+            btn.classList.remove('is-in');
+        });
+    }
+
+    _spanCalItems(spanText) {
+        return parseSpanDates(spanText, this._cal(), { fillMissing: false })
+            .map(hit => ({ ...(hit.parts || {}), scale: hit.scale || hit.parts?.scale || 'day' }))
+            .filter(p => p.day != null || p.monthIndex != null || p.seasonId || p.year != null);
+    }
+
+    _spanCalItemKey(p) {
+        if (p.day != null && p.monthIndex != null) {
+            return `d:${p.year ?? ''}@${p.monthIndex}@${p.day}`;
+        }
+        if (p.seasonId) return `s:${p.year ?? ''}@${p.seasonId}`;
+        if (p.monthIndex != null) return `m:${p.year ?? ''}@${p.monthIndex}`;
+        if (p.year != null) return `y:${p.year}`;
+        return '';
+    }
+
+    _spanCalFormatItems(items) {
+        const cal = this._cal();
+        const days = [];
+        const rest = [];
+        for (const p of items) {
+            if (p.day != null && p.monthIndex != null && !p.seasonId) days.push(p);
+            else rest.push(p);
+        }
+        const groups = new Map();
+        for (const p of days) {
+            const k = `${p.year ?? ''}@${p.monthIndex}`;
+            if (!groups.has(k)) groups.set(k, { year: p.year, monthIndex: p.monthIndex, days: [] });
+            groups.get(k).days.push(Number(p.day));
+        }
+        const bits = [];
+        for (const g of groups.values()) {
+            const ds = [...new Set(g.days)].sort((a, b) => a - b);
+            const monthName = cal.monthNames[g.monthIndex] || `${cal.labels.month} ${g.monthIndex + 1}`;
+            const yearBit = g.year != null ? ` ${formatCalendarYear(g.year, cal)}` : '';
+            bits.push(`${monthName} ${ds.join(', ')}${yearBit}`);
+        }
+        for (const p of rest) {
+            const key = formatTimeKey(p, cal);
+            if (key) bits.push(key);
+        }
+        return bits.join(', ');
+    }
+
+    _spanCalHint(root, key) {
+        const hint = root.querySelector('.stm-cal-hint-ok, .stm-cal-hint-miss');
+        if (!hint) return;
+        const cal = this._cal();
+        const list = parseSpanDates(key, cal);
+        const hit = pickParseableTimeKey({ span: key }, cal);
+        if (!key) {
+            hint.className = 'stm-cal-hint-miss';
+            hint.textContent = 'No parseable placement yet — click span to pick days.';
+            return;
+        }
+        if (list.length > 1) {
+            hint.className = 'stm-cal-hint-ok';
+            hint.textContent = `Places on timeline · ${key} (${list.length} days)`;
+            return;
+        }
+        hint.className = hit ? 'stm-cal-hint-ok' : 'stm-cal-hint-miss';
+        hint.textContent = hit
+            ? `Places on timeline · ${key} (${hit.parsed.scale}${hit.range ? ' range' : ''})`
+            : 'No parseable placement yet — click span to pick days.';
+    }
+
+    _spanCalCommit(root, host, items, { grain = 'day' } = {}) {
+        const inputName = host.dataset.input || 'span';
+        const input = root.querySelector(`[name="${CSS.escape(inputName)}"], #${CSS.escape(inputName)}`);
+        if (!input) return;
+        const key = this._spanCalFormatItems(items);
+        input.value = key;
+        host.dataset.grain = grain;
+        const first = items[0];
+        if (first) this._spanCalSyncPicker(root, first);
+        this._spanCalHint(root, key);
+        this._spanCalPaint(host, key);
+    }
+
+    _spanCalSyncPicker(root, parts) {
+        const picker = root.querySelector('.stm-cal-picker');
+        if (!picker) return;
+        const vis = (id, on) => {
+            const cb = picker.querySelector(`.stm-tp-vis[data-part="${id}"]`);
+            if (cb) cb.checked = !!on;
+        };
+        vis('year', parts.year != null);
+        vis('season', !!parts.seasonId);
+        vis('month', parts.monthIndex != null);
+        vis('week', false);
+        vis('day', parts.day != null);
+        vis('hour', false);
+        vis('phase', false);
+        const yearEl = picker.querySelector('.stm-tp-year');
+        if (yearEl && parts.year != null) yearEl.value = parts.year;
+        const monthEl = picker.querySelector('.stm-tp-month');
+        if (monthEl && parts.monthIndex != null) monthEl.value = String(parts.monthIndex);
+        const dayEl = picker.querySelector('.stm-tp-day');
+        if (dayEl && parts.day != null) dayEl.value = parts.day;
+        const seasonEl = picker.querySelector('.stm-tp-season');
+        if (seasonEl && parts.seasonId) seasonEl.value = parts.seasonId;
+        picker.querySelectorAll('.stm-tp-field').forEach(f => {
+            f.hidden = !picker.querySelector(`.stm-tp-vis[data-part="${f.dataset.for}"]`)?.checked;
+        });
+        const preview = picker.querySelector('.stm-tp-preview');
+        if (preview) preview.textContent = formatTimeKey(parts, this._cal()) || '—';
+    }
+
+    _spanCalWrite(root, host, parts, { grain = 'day' } = {}) {
+        this._spanCalCommit(root, host, [{ ...parts, scale: parts.scale || grain }], { grain });
+    }
+
+    _bindSpanCal(root, { inputName = 'span' } = {}) {
+        const host = root?.querySelector?.('.stm-span-cal');
+        if (!host || host.dataset.spanCalBound) return;
+        host.dataset.spanCalBound = '1';
+        if (inputName) host.dataset.input = inputName;
+        const cal = this._cal();
+        const field = host.closest('.stm-span-field') || root;
+        const pop = field.querySelector?.('.stm-span-pop') || host.closest('.stm-span-pop');
+        const input = () => field.querySelector(`[name="${CSS.escape(host.dataset.input || 'span')}"], #${CSS.escape(host.dataset.input || 'span')}`)
+            || root.querySelector(`[name="${CSS.escape(host.dataset.input || 'span')}"], #${CSS.escape(host.dataset.input || 'span')}`);
+        this._spanCalPaint(host, input()?.value || '');
+
+        const showPop = () => { if (pop) pop.hidden = false; };
+        const hidePop = () => { if (pop) pop.hidden = true; };
+        input()?.addEventListener('focus', showPop);
+        input()?.addEventListener('click', showPop);
+        pop?.addEventListener('mousedown', e => {
+            if (!e.target.closest('input, select, textarea')) e.preventDefault();
+        });
+        const onDoc = (e) => {
+            if (!host.isConnected) {
+                document.removeEventListener('pointerdown', onDoc);
+                return;
+            }
+            if (!pop || pop.hidden) return;
+            if (field.contains(e.target)) return;
+            hidePop();
+        };
+        document.addEventListener('pointerdown', onDoc);
+        input()?.addEventListener('keydown', e => {
+            if (e.key === 'Escape') { hidePop(); input()?.blur(); }
+        });
+
+        const shiftMonth = (delta) => {
+            let { year, month } = this._spanCalReadView(host);
+            month += delta;
+            while (month < 0) { month += cal.monthsPerYear; year -= 1; }
+            while (month >= cal.monthsPerYear) { month -= cal.monthsPerYear; year += 1; }
+            if (year < 0) year = 0;
+            host.dataset.year = String(year);
+            host.dataset.month = String(month);
+            this._spanCalRefreshChrome(host);
+            this._spanCalPaint(host, input()?.value || '');
+        };
+
+        const toggleDays = (daysToToggle, { fill = false } = {}) => {
+            const { year, month } = this._spanCalReadView(host);
+            let items = this._spanCalItems(input()?.value || '').filter(p => p.day != null && p.monthIndex != null);
+            const keyOf = (p) => this._spanCalItemKey(p);
+            const have = new Set(items.map(keyOf));
+            for (const day of daysToToggle) {
+                const next = { scale: 'day', year, monthIndex: month, day };
+                const k = keyOf(next);
+                if (fill) {
+                    if (!have.has(k)) {
+                        items.push(next);
+                        have.add(k);
+                    }
+                } else if (have.has(k)) {
+                    items = items.filter(p => keyOf(p) !== k);
+                    have.delete(k);
+                } else {
+                    items.push(next);
+                    have.add(k);
+                }
+            }
+            this._spanCalCommit(root, host, items, { grain: items.length > 1 ? 'days' : 'day' });
+        };
+
+        host.addEventListener('click', e => {
+            const btn = e.target.closest('[data-span-cal]');
+            if (!btn || !host.contains(btn)) return;
+            e.preventDefault();
+            const act = btn.dataset.spanCal;
+            const { year, month } = this._spanCalReadView(host);
+            if (act === 'year-prev') {
+                host.dataset.year = String(Math.max(0, year - 1));
+                this._spanCalRefreshChrome(host);
+                this._spanCalPaint(host, input()?.value || '');
+                return;
+            }
+            if (act === 'year-next') {
+                host.dataset.year = String(year + 1);
+                this._spanCalRefreshChrome(host);
+                this._spanCalPaint(host, input()?.value || '');
+                return;
+            }
+            if (act === 'month-prev') { shiftMonth(-1); return; }
+            if (act === 'month-next') { shiftMonth(1); return; }
+            if (act === 'goto-month') {
+                host.dataset.month = String(Number(btn.dataset.month) || 0);
+                this._spanCalRefreshChrome(host);
+                this._spanCalPaint(host, input()?.value || '');
+                return;
+            }
+            if (act === 'year') {
+                this._spanCalWrite(root, host, { scale: 'year', year }, { grain: 'year' });
+                return;
+            }
+            if (act === 'month') {
+                this._spanCalWrite(root, host, { scale: 'month', year, monthIndex: month }, { grain: 'month' });
+                return;
+            }
+            if (act === 'season') {
+                const s = cal.seasons.find(x => x.id === btn.dataset.id);
+                if (s) {
+                    host.dataset.month = String(Math.max(0, (Number(s.startMonth) || 1) - 1));
+                    this._spanCalRefreshChrome(host);
+                }
+                this._spanCalWrite(root, host, { scale: 'season', year, seasonId: btn.dataset.id }, { grain: 'season' });
+                return;
+            }
+            if (act === 'day') {
+                const day = Number(btn.dataset.day);
+                if (!Number.isFinite(day)) return;
+                const prev = Number(host.dataset.selDay);
+                if (e.shiftKey && Number.isFinite(prev) && prev > 0) {
+                    const lo = Math.min(prev, day);
+                    const hi = Math.max(prev, day);
+                    const run = [];
+                    for (let d = lo; d <= hi; d++) run.push(d);
+                    toggleDays(run, { fill: true });
+                } else {
+                    toggleDays([day]);
+                }
+                host.dataset.selDay = String(day);
+            }
+        });
+
+        input()?.addEventListener('input', () => this._spanCalPaint(host, input()?.value || ''));
     }
 
     /** Scale + part checkboxes (uncheck Year/Month etc. for fuzzy placement). */
@@ -2879,8 +3445,7 @@ async _findProfiles(rawSettings = null) {
                 || '';
             const hit = pickParseableTimeKey({
                 timeKey: eraVal,
-                keywordFacets: { datetime: eraVal ? [eraVal] : [] },
-                span: null,
+                span: eraVal || null,
             }, cal);
             if (!hit) continue;
             pins.push({
@@ -2891,8 +3456,8 @@ async _findProfiles(rawSettings = null) {
                 title: leaf.title || '(library)',
                 summary: String(leaf.content || '').replace(/\s+/g, ' ').slice(0, 200),
                 timeKey: hit.key,
-                keywordFacets: { datetime: [hit.key] },
-                span: null,
+                keywordFacets: { datetime: [] },
+                span: hit.key,
                 timeLocked: false,
                 timeManual: false,
                 timeLane: 0,
@@ -3022,11 +3587,29 @@ async _findProfiles(rawSettings = null) {
         return withConnectionProfile(profileId, fn);
     }
 
+    _houseScriptProfileId() {
+        return houseProfileId(this.storage, 'script');
+    }
+
+    _scriptProfileOpts(selected) {
+        const houseId = this._houseScriptProfileId();
+        const house = this._profiles.find(p => p.id === houseId);
+        const blank = house
+            ? `— House · ${house.name} —`
+            : '— Current (default) —';
+        return [
+            `<option value="">${esc(blank)}</option>`,
+            ...this._profiles.map(p =>
+                `<option value="${esc(p.id)}" ${selected === p.id ? 'selected' : ''}>${esc(p.name)}</option>`),
+        ].join('');
+    }
+
    // ── Render ────────────────────────────────────────────────────
 
 render(container) {
     this._panel = container;
     this._injectCSS();
+    this._scheduleSTHydrate();
     this._rerender();
 }
 
@@ -3113,6 +3696,7 @@ _buildToolbar(db) {
         <span class="stm-tb-sep"></span>
         <button class="stm-btn" data-a="tl-out" title="Zoom out (mouse wheel zooms; drag to pan)">−</button>
         <span class="stm-tl-zoom-label" data-role="tl-zoom-label" title="Current time scale — wheel to zoom, drag to pan">${Math.round(this._tlZoomValue(db) * 100)}%</span>
+        <span class="stm-tl-view-label" data-role="tl-view-label" title="Date at the center of this view"></span>
         <button class="stm-btn" data-a="tl-in" title="Zoom in (mouse wheel zooms; drag to pan)">+</button>
         <button class="stm-btn" data-a="tl-home" title="Center on the narrative present">⌂</button>
         <label class="stm-tb-lock" title="New and vague dates inherit the present year, not the wall clock">
@@ -3218,7 +3802,7 @@ _buildToolbar(db) {
     gotoBody?.querySelector('[data-a="tl-goto-present"]')?.addEventListener('click', () => {
         const present = this.getTimelinePresent();
         if (present?.sort == null) {
-            alert('No present marker yet — use Set, or lock / date a card.');
+            void showtimeAlert('No present marker yet — use Set, or lock / date a card.', { title: 'TIMELINE' });
             return;
         }
         this._tlCenterOnSort(present.sort);
@@ -3287,7 +3871,7 @@ _tlMaxZoom() {
 
 _tlComputeMaxZoom(size, domain) {
     const base = TL_ZOOM_MAX;
-    const pxPerUnit = this._tlPxPerUnit;
+    const pxPerUnit = this._tlBasePxPerUnit > 0 ? this._tlBasePxPerUnit : this._tlPxPerUnit;
     if (!(pxPerUnit > 0) || !domain || !(size > 0)) return base;
     const cal = this._cal();
     const show = this._tlShow();
@@ -3336,6 +3920,7 @@ _tlGoHome() {
     this._tlFocusSort = null;
     this._tlAnchorSort = null;
     this._tlPan = null;
+    this._tlBasePxPerUnit = null;
     const db = this._db();
     db.settings.tlZoomC = 1;
     this._save(db);
@@ -3585,9 +4170,9 @@ _auditTimelineAlign() {
     const bits = [];
     if (snapped) bits.push(`snapped ${snapped} offset pin${snapped === 1 ? '' : 's'}`);
     if (grouped) bits.push(`grouped ${grouped} vague date${grouped === 1 ? '' : 's'} on the present`);
-    alert(bits.length
+    void showtimeAlert(bits.length
         ? `Timeline audit — ${bits.join('; ')}.`
-        : 'Timeline audit — unlocked cards already sit on their true time.');
+        : 'Timeline audit — unlocked cards already sit on their true time.', { title: 'TIMELINE AUDIT' });
 }
 
 _openCalendarDialog() {
@@ -3884,11 +4469,7 @@ _openTimelineEventDialog() {
                     <label>Description</label>
                     <textarea id="stm-ev-desc" rows="4" placeholder="What happens, and what it changes…"></textarea>
                 </div>
-                <div class="stm-form-row">
-                    <label>Time / date <span class="stm-required">*</span></label>
-                    <input type="text" id="stm-ev-time" name="stm-ev-time" placeholder="${esc(this._calendarTimePlaceholder())}">
-                    ${this._calendarPickerHTML({ inputName: 'stm-ev-time', idPrefix: 'stm-ev-tp' })}
-                </div>
+                ${this._spanFieldHTML({}, { inputName: 'stm-ev-time', inputId: 'stm-ev-time', label: 'Time / date', required: true })}
                 <details class="stm-ev-seed">
                     <summary>Optional — seed from Library or an achievement</summary>
                     <div class="stm-form-row">
@@ -3910,6 +4491,7 @@ _openTimelineEventDialog() {
     overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
     overlay.querySelector('[data-a="cancel"]').addEventListener('click', close);
     this._bindEventScaleFields(overlay);
+    this._bindSpanCal(overlay, { inputName: 'stm-ev-time' });
     this._bindCalendarPicker(overlay, {
         onPick: (key) => {
             const input = overlay.querySelector('#stm-ev-time');
@@ -3950,7 +4532,7 @@ _openTimelineEventDialog() {
         if (fields.eventScale === 'personal'
             && !fields.eventImpact.castIds.length
             && !fields.eventImpact.houseIds.length) {
-            alert('Pick who this personal event impacts (cast or faction).');
+            void showtimeAlert('Pick who this personal event impacts (cast or faction).', { title: 'PERSONAL EVENT' });
             return;
         }
         const members = this._castMembers();
@@ -3984,7 +4566,7 @@ _openTimelineEventDialog() {
                 location: [],
                 objects: [],
                 characters: [],
-                datetime: [timeKey],
+                datetime: [],
             },
         });
         close();
@@ -4285,20 +4867,21 @@ _promoteLibraryPin(pin) {
     if (!pin?.sourceId) return;
     const db = this._db();
     if (db.cards.some(c => c.sourceKind === 'library' && c.sourceId === pin.sourceId)) {
-        alert('Already on the timeline as a Script card.');
+        void showtimeAlert('Already on the timeline as a Script card.', { title: 'TIMELINE' });
         return;
     }
     this._addCard({
         title: pin.title,
         summary: pin.summary || '',
         timeKey: pin.timeKey || '',
+        span: pin.timeKey || null,
         timeLocked: !!pin.timeKey,
         tags: ['library-event'],
         sourceKind: 'library',
         sourceId: pin.sourceId,
         keywordFacets: {
             location: [], objects: [], characters: [],
-            datetime: pin.timeKey ? [pin.timeKey] : [],
+            datetime: [],
         },
     });
     db.settings.view = 'timeline';
@@ -4336,14 +4919,19 @@ _tlEnsureAnchor(domain, vp, vert) {
         if (prev > 0 && size > 0 && prev !== size && this._tlPxPerUnit) {
             const ratio = size / prev;
             this._tlPxPerUnit *= ratio;
+            if (this._tlBasePxPerUnit > 0) this._tlBasePxPerUnit *= ratio;
             this._tlPan = (this._tlPan ?? 0) * ratio;
             this._tlAnchorVpSize = size;
+        }
+        if (!(this._tlBasePxPerUnit > 0) && this._tlPxPerUnit > 0) {
+            this._tlBasePxPerUnit = this._tlPxPerUnit;
         }
         return;
     }
     const span = Math.max(1e-6, domain.max - domain.min);
     const marginFrac = 0.18;
     this._tlPxPerUnit = (size * (1 - marginFrac * 2)) / span;
+    this._tlBasePxPerUnit = this._tlPxPerUnit;
     this._tlAnchorSort = domain.min;
     this._tlAnchorFamily = familyKey;
     this._tlAnchorVert = vert;
@@ -4359,6 +4947,42 @@ _tlEnsureAnchor(domain, vp, vert) {
     } catch { /* ignore */ }
     this._tlFocusSort = homeSort;
     this._tlPan = size / 2 - this._tlBasePx(homeSort) * zoom;
+}
+
+/**
+ * Domain-fit `_tlPxPerUnit` stays sub-pixel-per-day on a wide Earth span even
+ * at the zoom ceiling. When the user has zoomed in, blend toward a scale where
+ * the finest enabled mark is actually readable, keeping the viewport center.
+ */
+_tlApplyVisibleScale(domain, vp, vert) {
+    const size = this._tlMetrics(vp, vert).size;
+    const zoom = this._tlZoomValue();
+    const base = this._tlBasePxPerUnit;
+    if (!(base > 0) || !(size > 0) || this._tlAnchorSort == null || this._tlPan == null) return;
+
+    const centerSort = this._tlSortFromScreenPx(size / 2, zoom, this._tlPan);
+    const cal = this._cal();
+    const show = this._tlShow();
+    const finest = [...TL_ZOOM].reverse().find(z => show[z.id]) || TL_ZOOM[TL_ZOOM.length - 1];
+    const unitScale = domain.family === 'date' ? 'date' : (domain.calendarScale || 'day');
+    const finestUnit = timelineUnitSort(finest.id, unitScale, cal);
+
+    let px = base;
+    if (finestUnit > 0 && zoom > 1) {
+        const atZoom = finestUnit * base * zoom;
+        if (atZoom < TL_MAJOR_MIN_PX) {
+            const zMax = Math.max(1.000001, this._tlMaxZoom());
+            const t = Math.min(1, Math.max(0, Math.log(zoom) / Math.log(zMax)));
+            const needed = TL_MAJOR_MIN_PX / (finestUnit * zoom);
+            px = base + (Math.max(needed, base) - base) * t;
+        }
+    }
+
+    const prev = this._tlPxPerUnit;
+    this._tlPxPerUnit = px;
+    if (Number.isFinite(centerSort) && prev > 0 && Math.abs(px - prev) > prev * 1e-9) {
+        this._tlPan = size / 2 - (centerSort - this._tlAnchorSort) * px * zoom;
+    }
 }
 
 /** Soft bound that always includes content, the present marker, and extra sorts. */
@@ -4488,6 +5112,7 @@ _tlRepaintNow({ forceAnchor = false, light = false } = {}) {
     // current zoom against it (so a wide range can be driven down to fine dates).
     this._tlMaxZoomCached = this._tlComputeMaxZoom(size, domain);
     const zoom = this._tlZoomValue();
+    this._tlApplyVisibleScale(domain, vp, vert);
     this._tlPan = this._tlClampPan(this._tlPan ?? 0, size, zoom, domain);
     this._tlSyncScrubber(wrap, domain, size, zoom);
 
@@ -4592,6 +5217,20 @@ _tlPaintTicksAndNow(board, domain, vp, vert, zoom) {
     if (zoomLab) {
         zoomLab.textContent = major.label;
         zoomLab.title = `${major.label} scale · ${Math.round(zoom * 100)}%`;
+    }
+    const viewLab = this._panel?.querySelector('[data-role="tl-view-label"]');
+    if (viewLab) {
+        const mid = this._tlSortFromScreenPx(size / 2, zoom, this._tlPan);
+        let viewTick = major;
+        for (let i = candidates.length - 1; i >= 0; i--) {
+            if (unitPx(candidates[i]) >= 8) {
+                viewTick = candidates[i];
+                break;
+            }
+        }
+        viewLab.textContent = Number.isFinite(mid)
+            ? (formatTimelineTick(mid, viewTick.id, unitScale, cal) || '')
+            : '';
     }
 
     const majorIdx = candidates.findIndex(z => z.id === major.id);
@@ -5135,9 +5774,9 @@ _buildTreePanel(db) {
     });
     org.querySelector('.stm-org-select').addEventListener('click', () => this._toggleSelectAll());
     org.querySelector('.stm-org-move').addEventListener('click', () => this._openBulkMoveDialog());
-    org.querySelector('.stm-org-del').addEventListener('click', () => {
+    org.querySelector('.stm-org-del').addEventListener('click', async () => {
         if (!this._checkedUids.size) return;
-        if (!confirm(`Delete ${this._checkedUids.size} selected item(s)? Children of deleted folders are reparented.`)) return;
+        if (!await showtimeConfirm(`Delete ${this._checkedUids.size} selected item(s)? Children of deleted folders are reparented.`, { title: 'DELETE ITEMS', danger: true, confirmLabel: 'Delete' })) return;
         this._bulkDelete(this._checkedUids);
         this._rerender();
     });
@@ -5261,9 +5900,9 @@ _buildTreeNode(node, depth, db) {
         this._openRenameDialog(card);
     });
 
-    item.querySelector('.stm-ti-delete').addEventListener('click', e => {
+    item.querySelector('.stm-ti-delete').addEventListener('click', async e => {
         e.stopPropagation();
-        if (!confirm(`Delete "${card.title || 'this card'}" and reparent its children?`)) return;
+        if (!await showtimeConfirm(`Delete "${card.title || 'this card'}" and reparent its children?`, { title: 'DELETE CARD', danger: true, confirmLabel: 'Delete' })) return;
         this._deleteCard(card.uid);
         if (this._selectedUid === card.uid) this._selectedUid = card.parentUid || null;
         if (this._focusedUid === card.uid) this._focusedUid = null;
@@ -5485,7 +6124,7 @@ _openNewFolderDialog() {
     const defaultParent = this._resolveFolderCreateParent();
     const defaultLevel = this._nextLevelId(defaultParent, { forFolder: true });
     if (!defaultLevel) {
-        alert('No deeper folder level left in this hierarchy. Add a level in Configure, or nest under a shallower folder.');
+        void showtimeAlert('No deeper folder level left in this hierarchy. Add a level in Configure, or nest under a shallower folder.', { title: 'NEW FOLDER' });
         return;
     }
 
@@ -5558,7 +6197,7 @@ _openNewFolderDialog() {
         const parentUid = parentEl.value || null;
         const parent = parentUid ? this._getCard(parentUid) : null;
         const lid = this._nextLevelId(parent, { forFolder: true }) || kindEl.value;
-        if (!lid) { alert('Cannot nest a folder there.'); return; }
+        if (!lid) { void showtimeAlert('Cannot nest a folder there.', { title: 'NEW FOLDER' }); return; }
         const card = this._addCard({
             levelId  : lid,
             kind     : 'folder',
@@ -5720,24 +6359,27 @@ _normalizeAgentCard(raw) {
     const members = this._castMembers();
     const title = String(pickField(raw, 'Title', 'title') || '').trim();
     if (!title) return null;
+    const mem = parseMemoryBookContent(String(pickField(raw, 'Content', 'content', 'body') || ''));
     const highlights = asStringList(pickField(raw, 'Highlights', 'highlights', 'quotes'));
-    const quotes = highlights.map(h => {
+    const quotes = [...highlights, ...(mem.quotes || []).map(q => q.character ? `${q.character}: ${q.text}` : q.text)].map(h => {
         if (h && typeof h === 'object') {
             return { text: String(h.text || h.quote || '').trim(), character: String(h.character || h.name || '').trim() };
         }
         const s = String(h).trim();
-        const qm = s.match(/^(.+?):\s*[“"'](.+)[”"']\s*$/) || s.match(/^(.+?)\s+[“"'](.+)[”"']\s*$/);
-        if (qm) return { text: qm[2].trim(), character: qm[1].trim() };
+        const qm = s.match(/^(.+?):\s*[“"'](.+)[”"']\s*$/)
+            || s.match(/^(.+?)\s+[“"'](.+)[”"']\s*$/)
+            || s.match(/^(.+?):\s*(.+)$/);
+        if (qm) return { text: qm[2].replace(/^["“]|["”]$/g, '').trim(), character: qm[1].trim() };
         return { text: s.replace(/^["“]|["”]$/g, ''), character: '' };
     }).filter(q => q.text);
-    const creditLines = asStringList(pickField(raw, 'Credits', 'credits'));
+    const creditLines = asStringList(pickField(raw, 'Credits', 'credits')).concat(mem.credits || []);
     const credits = this._dedupeCredits(creditLines.map(line => {
         if (line && typeof line === 'object') return line;
         return parseCreditLine(line);
     }).filter(Boolean), members);
-    const summary = String(pickField(raw, 'Summary', 'summary') || '').trim();
-    const spanRaw = pickField(raw, 'Span', 'span');
-    const span = spanRaw != null && String(spanRaw).trim() && String(spanRaw).toLowerCase() !== 'null'
+    const summary = String(pickField(raw, 'Summary', 'summary') || mem.summary || '').trim();
+    const spanRaw = pickField(raw, 'Span', 'span') || mem.span;
+    let span = spanRaw != null && String(spanRaw).trim() && String(spanRaw).toLowerCase() !== 'null'
         ? String(spanRaw).trim() : null;
     // Character names belong in Credits, not keyword tags (aliases live on Cast).
     const charNames = asStringList(pickField(raw, 'Characters', 'characters'));
@@ -5745,19 +6387,23 @@ _normalizeAgentCard(raw) {
         const extra = this._normalizeCredit({ name }, members);
         if (extra) credits.push(extra);
     }
+    const dateField = asStringList(pickField(raw, 'DateTime', 'datetime', 'Date / Time', 'Time'));
     const keywordFacets = normalizeFacets({
-        location: asStringList(pickField(raw, 'Location', 'location')),
-        objects: asStringList(pickField(raw, 'Objects', 'objects')),
+        location: asStringList(pickField(raw, 'Location', 'location')).concat(mem.locations || []),
+        objects: asStringList(pickField(raw, 'Objects', 'objects')).concat(mem.items || []),
         characters: [],
-        datetime: asStringList(pickField(raw, 'DateTime', 'datetime', 'Date / Time')),
+        datetime: [],
         ...normalizeFacets(pickField(raw, 'keywordFacets', 'keyword_facets')),
     });
     keywordFacets.characters = [];
-    if (span && !keywordFacets.datetime.length) keywordFacets.datetime = [span];
+    keywordFacets.datetime = [];
+    if (!span && dateField[0]) span = dateField[0];
     const extraKw = keywordStrings(pickField(raw, 'Keywords', 'keywords'));
     const seenKw = new Set(flattenFacets(keywordFacets).map(k => k.toLowerCase()));
     for (const k of extraKw) {
         if (seenKw.has(k.toLowerCase())) continue;
+        if (dateField.some(d => d.toLowerCase() === k.toLowerCase())) continue;
+        if (span && k.toLowerCase() === String(span).toLowerCase()) continue;
         const asMember = this._memberForCreditName(k, members);
         const asChar = asMember
             || credits.some(c => c.name && k.toLowerCase().includes(String(c.name).toLowerCase()));
@@ -5771,11 +6417,14 @@ _normalizeAgentCard(raw) {
     }
     const keywords = flattenFacets(keywordFacets);
     const path = String(pickField(raw, 'Path', 'path', 'parent') || '').trim();
-    const timeKey = (keywordFacets.datetime[0] || span || '').trim();
-    const parsed = pickParseableTimeKey({ timeKey, keywordFacets, span }, this.state?.settings?.calendar, {
+    const timeKey = String(span || '').trim();
+    const parsed = pickParseableTimeKey({ timeKey, span }, this.state?.settings?.calendar, {
         anchorParts: this._timelineAnchorParts(),
     });
     const parentUid = this._ensureFolderPath(path);
+    const condNotes = (mem.conditions || []).map(c => `Condition: ${c}`).join('\n');
+    const readNotes = (mem.readings || []).map(r => `Reading: ${r}`).join('\n');
+    const notes = [condNotes, readNotes].filter(Boolean).join('\n');
     // Agent always creates leaf cards; Path only chooses the folder they live under.
     return {
         kind: 'card',
@@ -5787,11 +6436,13 @@ _normalizeAgentCard(raw) {
         timeManual: false,
         summary,
         content: summary,
+        notes,
         quotes,
         credits: this._dedupeCredits(credits, members),
         keywordFacets,
         keywords,
         parentUid,
+        _memoryIntel: { relationships: mem.relationships || [], hooks: mem.hooks || [] },
     };
 }
 
@@ -5811,11 +6462,22 @@ _ingestAgentCards(raw, { sourceEntries = null, mode = 'agent', maxCards = 0 } = 
         try {
             const card = this._normalizeAgentCard(item);
             if (!card) { failed.push(item); continue; }
+            const intel = card._memoryIntel || parseMemoryBookContent(String(item?.Content || item?.content || ''));
+            delete card._memoryIntel;
             card.kind = 'card';
             card.levelId = leafId;
             if (stamp) card.sourceStamp = stamp;
             if (books.length) card.sourceBook = books.join(', ');
             cards.push(this._addCard(card));
+            try {
+                const applied = applyMemoryBookIntel(this.storage, intel, { bus: this.bus });
+                if (applied.rumors.length || applied.hooks.length) {
+                    this.bus?.emit('motivation.updated', {});
+                    this.bus?.emit('showtime.stateChanged');
+                }
+            } catch (err) {
+                log('Memory intel apply failed', err);
+            }
         } catch (err) {
             log('Agent card ingest failed', err);
             failed.push(item);
@@ -6075,11 +6737,7 @@ _openAgentDialogNow(opts = {}) {
             : 'chat';
     const preBook = opts.bookName || this._boundChatBook() || '';
 
-    const profileOpts = [
-        `<option value="">— Current (default) —</option>`,
-        ...this._profiles.map(p =>
-            `<option value="${esc(p.id)}" ${db.settings.aiProfile === p.id ? 'selected' : ''}>${esc(p.name)}</option>`),
-    ].join('');
+    const profileOpts = this._scriptProfileOpts(db.settings.aiProfile);
 
     const libLeaves = listLibraryLeaves(this.storage, this._wiBooks);
     let stampIdx = this._agentStampIndex();
@@ -6172,6 +6830,7 @@ _openAgentDialogNow(opts = {}) {
 
                 <details class="stm-agent-ai">
                     <summary>AI profile &amp; budget</summary>
+                    <p class="stm-settings-hint">Empty uses the Script Agent house profile (Backstage → Settings). Otherwise this chat overrides it.</p>
                     <div class="stm-form-row">
                         <label>AI profile</label>
                         <select id="stm-agent-profile">${profileOpts}</select>
@@ -6659,7 +7318,7 @@ _bindFacetEditor(el) {
             return;
         }
         const x = e.target.closest('.stm-pill-x');
-        if (!x || x.closest('.stm-credit-wrap')) return;
+        if (!x || x.closest('.stm-credit-wrap') || x.closest('.stm-spine-pick-wrap')) return;
         e.preventDefault();
         e.stopPropagation();
         x.closest('.stm-pill-edit')?.remove();
@@ -6669,7 +7328,6 @@ _bindFacetEditor(el) {
 _openKeywordAddDialog(formEl) {
     const overlay = document.createElement('div');
     overlay.className = 'stm-dialog-overlay';
-    const cal = this._cal();
     const typeOpts = KEYWORD_EDIT_FACETS.map(f =>
         `<option value="${esc(f.id)}">${esc(f.tag)}</option>`
     ).join('');
@@ -6693,10 +7351,6 @@ _openKeywordAddDialog(formEl) {
                         emptyHint: 'Pick a known location or add a new one.',
                     })}
                 </div>
-                <div class="stm-form-row" id="stm-kw-cal-wrap" hidden style="display:none">
-                    <label>Calendar time</label>
-                    ${this._calendarPickerHTML({ inputName: 'stm-kw-values', idPrefix: 'stm-kw-tp', scaleFilter: true })}
-                </div>
             </div>
             <div class="stm-dialog-footer">
                 <button type="button" id="stm-kw-cancel" class="stm-btn">Cancel</button>
@@ -6707,24 +7361,27 @@ _openKeywordAddDialog(formEl) {
     const close = () => overlay.remove();
     const input = overlay.querySelector('#stm-kw-values');
     const typeSel = overlay.querySelector('#stm-kw-type');
-    const calWrap = overlay.querySelector('#stm-kw-cal-wrap');
     const textWrap = overlay.querySelector('#stm-kw-text-wrap');
     const locWrap = overlay.querySelector('#stm-kw-loc-wrap');
 
-    bindLocationCatalogPicker(overlay.querySelector('.st-loctag-wrap[data-role="stm-kw-loctags"]'), this.storage);
+    bindLocationCatalogPicker(overlay.querySelector('.st-loctag-wrap[data-role="stm-kw-loctags"]'), this.storage, {
+        getKnown: () => {
+            const listed = locationChoices(this.storage);
+            let extra = [];
+            try {
+                extra = unlistedLocationChoices(ensureCompass(this.storage.getChat('backstage', {})));
+            } catch { extra = []; }
+            return [...listed, ...extra];
+        },
+    });
 
     const syncMode = () => {
-        const isDate = typeSel.value === 'datetime';
         const isLoc = typeSel.value === 'location';
-        calWrap.hidden = !isDate;
-        calWrap.style.display = isDate ? '' : 'none';
         locWrap.hidden = !isLoc;
         locWrap.style.display = isLoc ? '' : 'none';
         textWrap.hidden = isLoc;
         textWrap.style.display = isLoc ? 'none' : '';
-        input.placeholder = isDate
-            ? 'Day 3, Mid Spring… or build below'
-            : 'harbor, lantern, night market';
+        input.placeholder = 'harbor, lantern, night market';
         if (isLoc) {
             overlay.querySelector('.st-loctag-search')?.focus();
         } else {
@@ -6732,14 +7389,6 @@ _openKeywordAddDialog(formEl) {
         }
     };
     typeSel.addEventListener('change', syncMode);
-    syncMode();
-    this._bindCalendarPicker(overlay, {
-        onPick: (key) => {
-            const cur = input.value.trim();
-            input.value = cur ? `${cur}, ${key}` : key;
-            input.focus();
-        },
-    });
     syncMode();
 
     const commit = () => {
@@ -6769,14 +7418,6 @@ _openKeywordAddDialog(formEl) {
             existing.add(key);
             wrap.insertAdjacentHTML('beforeend', this._keywordEditChipHTML(facet, v));
         }
-        if (facet === 'datetime') {
-            const spanInput = formEl.querySelector('[name="span"]');
-            if (spanInput && !spanInput.value.trim()) {
-                for (const v of values) {
-                    if (parseTimeKey(v, cal) || parseTimeRange(v, cal)) { spanInput.value = v; break; }
-                }
-            }
-        }
         close();
     };
     overlay.querySelector('#stm-kw-cancel').addEventListener('click', close);
@@ -6793,10 +7434,11 @@ _readFacets(el) {
     el.querySelectorAll('.stm-pill-edit').forEach(p => {
         const id = p.dataset.facet;
         const v = p.dataset.value;
-        if (id === 'characters') return; // obsolete — use Credits
+        if (id === 'characters' || id === 'datetime') return;
         if (id && v && facets[id]) facets[id].push(v);
     });
     facets.characters = [];
+    facets.datetime = [];
     return facets;
 }
 
@@ -6995,6 +7637,7 @@ _readFacets(el) {
     if (compact) {
       return `${top()}
         ${eventBanner}
+        ${this._spineAfterLine(card)}
         ${card.span ? `<div class="stm-card-span">${esc(card.span)}</div>` : ''}
         <div class="stm-card-peek">${esc((card.summary || card.content || '').slice(0, 110))}</div>
         ${this._keywordPillsHTML(card, { open: false })}`;
@@ -7002,6 +7645,7 @@ _readFacets(el) {
 
     return `${top()}
       ${eventBanner}
+      ${this._spineAfterLine(card)}
       ${card.span ? `<div class="stm-card-span">${esc(card.span)}</div>` : ''}
       <div class="stm-card-summary">${esc(card.summary || card.content || '')}</div>
       ${this._quotesViewHTML(card)}
@@ -7092,17 +7736,13 @@ _readFacets(el) {
         <label>Title <span class="stm-required">*</span></label>
         <input type="text" name="title" value="${esc(card.title || '')}" placeholder="Event title…">
       </div>
+      ${this._spinePickerHTML(card)}
       <div class="stm-form-row stm-form-row--toggles">
         <label><input type="checkbox" name="pinned" ${card.pinned ? 'checked' : ''}> Pinned (always inject)</label>
         <label><input type="checkbox" name="onTimeline" ${card.timelineOff ? '' : 'checked'}> Show on timeline</label>
         <label><input type="checkbox" name="active" ${card.active !== false ? 'checked' : ''}> Active</label>
       </div>
-      <div class="stm-form-row">
-        <label>Time / date <span class="stm-required">*</span></label>
-        <input type="text" name="span" value="${esc(card.span || this._cardTimeKey(card) || '')}" placeholder="${esc(this._calendarTimePlaceholder())}">
-        <div class="stm-cal-hints">${this._calendarTimeHintsHTML(card)}</div>
-        ${this._setTimeDetailsHTML(card)}
-      </div>
+      ${this._spanFieldHTML(card, { label: 'Time / date', required: true })}
       <div class="stm-form-row stm-form-row--tall">
         <label>Description <span class="stm-hint">(injected when this event is near the present)</span></label>
         <textarea name="summary" rows="5" placeholder="What happens…">${esc(card.summary || card.content || '')}</textarea>
@@ -7123,18 +7763,14 @@ _readFacets(el) {
         <label>Title <span class="stm-required">*</span></label>
         <input type="text" name="title" value="${esc(card.title || '')}" placeholder="Title…">
       </div>
+      ${this._spinePickerHTML(card)}
       <div class="stm-form-row stm-form-row--toggles">
         <label><input type="checkbox" name="pinned" ${card.pinned ? 'checked' : ''}> Pinned (always inject)</label>
         <label><input type="checkbox" name="timeLocked" ${card.timeLocked ? 'checked' : ''}> Lock on timeline</label>
         <label><input type="checkbox" name="onTimeline" ${card.timelineOff ? '' : 'checked'}> Show on timeline</label>
         <label><input type="checkbox" name="active" ${card.active !== false ? 'checked' : ''}> Active</label>
       </div>
-      <div class="stm-form-row">
-        <label>Span <span class="stm-hint">(timeline placement)</span></label>
-        <input type="text" name="span" value="${esc(card.span || this._cardTimeKey(card) || '')}" placeholder="${esc(this._calendarTimePlaceholder('span'))}">
-        <div class="stm-cal-hints">${this._calendarTimeHintsHTML(card)}</div>
-        ${this._setTimeDetailsHTML(card)}
-      </div>
+      ${this._spanFieldHTML(card, { label: 'Span', hint: '(timeline placement)' })}
       <div class="stm-form-row stm-form-row--tall">
         <label>Summary <span class="stm-hint">(injected when pinned or keyword-matched)</span></label>
         <textarea name="summary" rows="5" placeholder="One paragraph…">${esc(card.summary || card.content || '')}</textarea>
@@ -7180,9 +7816,9 @@ _readFacets(el) {
       this._refreshDrawer();
     });
 
-    el.querySelector('.stm-btn-delete').addEventListener('click', e => {
+    el.querySelector('.stm-btn-delete').addEventListener('click', async e => {
       e.stopPropagation();
-      if (!confirm(`Delete "${card.title || 'this card'}"?`)) return;
+      if (!await showtimeConfirm(`Delete "${card.title || 'this card'}"?`, { title: 'DELETE CARD', danger: true, confirmLabel: 'Delete' })) return;
       this._deleteCard(card.uid);
       if (this._editingCardUid === card.uid) this._editingCardUid = null;
       if (this._focusedUid === card.uid) this._focusedUid = null;
@@ -7611,6 +8247,77 @@ _readFacets(el) {
     search?.addEventListener('blur', () => setTimeout(hideSuggest, 180));
   }
 
+  _bindSpinePicker(el, card) {
+    el.querySelectorAll('.stm-spine-pick-wrap').forEach(wrap => {
+      const name = wrap.dataset.spine;
+      const chips = wrap.querySelector('.stm-spine-chips');
+      const search = wrap.querySelector('.stm-spine-search');
+      const suggest = wrap.querySelector('.stm-spine-suggest');
+      if (!chips || !name) return;
+
+      const taken = () => new Set([...chips.querySelectorAll('.stm-spine-chip')].map(c => c.dataset.uid));
+
+      const addChip = (uid) => {
+        const id = String(uid || '').trim();
+        const c = this._getCard(id);
+        if (!c || this._isFolder(c) || id === card.uid || taken().has(id)) return;
+        chips.insertAdjacentHTML('beforeend', this._spineChipHTML(c, name));
+      };
+
+      wrap.addEventListener('click', e => {
+        const x = e.target.closest('.stm-spine-x');
+        if (!x) return;
+        e.preventDefault();
+        e.stopPropagation();
+        x.closest('.stm-spine-chip')?.remove();
+      });
+
+      const hideSuggest = () => { if (suggest) suggest.hidden = true; };
+      const matches = (q) => {
+        const needle = String(q || '').trim().toLowerCase();
+        const have = taken();
+        return this._spineSceneOptions(card).filter(c => {
+          if (have.has(c.uid)) return false;
+          if (!needle) return true;
+          const label = this._spineCardLabel(c).toLowerCase();
+          const title = (c.title || '').toLowerCase();
+          return label.includes(needle) || title.includes(needle);
+        });
+      };
+      const showSuggest = (q) => {
+        if (!suggest) return;
+        const opts = matches(q);
+        const rows = opts.slice(0, 16).map(c =>
+          `<button type="button" class="stm-suggest-item" data-uid="${esc(c.uid)}">${esc(this._spineCardLabel(c))}</button>`
+        );
+        const needle = String(q || '').trim();
+        suggest.innerHTML = rows.join('') || `<span class="stm-settings-hint">${needle ? 'No matches.' : 'Type to search scenes.'}</span>`;
+        suggest.hidden = false;
+      };
+
+      search?.addEventListener('input', () => showSuggest(search.value));
+      search?.addEventListener('focus', () => showSuggest(search.value));
+      search?.addEventListener('keydown', e => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const hit = matches(search.value)[0];
+        if (!hit) return;
+        addChip(hit.uid);
+        search.value = '';
+        hideSuggest();
+      });
+      suggest?.addEventListener('click', e => {
+        const item = e.target.closest('.stm-suggest-item');
+        if (!item) return;
+        e.preventDefault();
+        addChip(item.dataset.uid);
+        if (search) search.value = '';
+        hideSuggest();
+      });
+      search?.addEventListener('blur', () => setTimeout(hideSuggest, 180));
+    });
+  }
+
   _openNewCastDialog({ onCreated } = {}) {
     const overlay = document.createElement('div');
     overlay.className = 'stm-dialog-overlay';
@@ -7668,7 +8375,13 @@ _readFacets(el) {
         el.querySelector('[name="title"]').focus();
         return;
       }
-      this._updateCard(card.uid, this._readForm(el, card));
+      const patch = this._readForm(el, card);
+      if (!this._isFolder(card) && spineWouldCycle(this._db().cards, card.uid, patch.followsUids, patch.dependsUids)) {
+        void showtimeAlert('Plot spine would loop — follows/depends were not saved.', { title: 'PLOT SPINE' });
+        delete patch.followsUids;
+        delete patch.dependsUids;
+      }
+      this._updateCard(card.uid, patch);
       this._editingCardUid = null;
       this._refreshDrawer();
     });
@@ -7676,6 +8389,7 @@ _readFacets(el) {
     this._bindFacetEditor(el);
     this._bindCreditEditor(el, card);
     this._bindSponsorEditor(el);
+    this._bindSpinePicker(el, card);
     this._bindCalendarTimeHints(el);
     if (isEventCard(card)) this._bindEventScaleFields(el);
     if (this._isFolder(card)) this._bindCoverPicker(el);
@@ -7726,16 +8440,14 @@ _readFacets(el) {
       if (sp) sponsors.push(sp);
     });
     const facets = isEventCard(card) ? normalizeFacets(card.keywordFacets) : this._readFacets(el);
+    facets.characters = [];
+    facets.datetime = [];
     const cal = this._cal();
     const span = (q('span')?.value || '').trim() || null;
-    // Derive placement key from span (primary) or Date/Time tags.
     let timeKey = '';
-    const hit = pickParseableTimeKey({ span, keywordFacets: facets, timeKey: '' }, cal);
+    const hit = pickParseableTimeKey({ span, timeKey: '' }, cal);
     if (hit) timeKey = hit.key;
     else if (span) timeKey = span;
-    if (timeKey) {
-        facets.datetime = [timeKey, ...(facets.datetime || []).filter(d => d.toLowerCase() !== timeKey.toLowerCase())];
-    }
     const timeLocked = !!q('timeLocked')?.checked;
     const onTl = q('onTimeline');
     const timelineOff = onTl ? !onTl.checked : !!card?.timelineOff;
@@ -7766,6 +8478,8 @@ _readFacets(el) {
       active   : !!q('active')?.checked,
       credits: this._dedupeCredits(credits, members),
       sponsors: isEventCard(card) ? (card.sponsors || []) : sponsors,
+      followsUids: this._readSpineUids(el, 'followsUid'),
+      dependsUids: this._readSpineUids(el, 'dependsUid'),
     };
     if (isEventCard(card)) {
       const ev = this._readEventScaleFields(el);
@@ -7850,7 +8564,7 @@ _readFacets(el) {
         const parentUid = overlay.querySelector('#stm-new-parent').value || null;
         const draft = { kind: 'card', levelId: leafId, parentUid: null };
         if (!this._applyLevelForParent(draft, parentUid)) {
-            alert('Cannot place a card under that parent.');
+            void showtimeAlert('Cannot place a card under that parent.', { title: 'NEW SCENE CARD' });
             return;
         }
         const card = this._addCard({
@@ -7885,12 +8599,7 @@ _readFacets(el) {
             <button class="stm-btn stm-btn-rm-level">✕</button>
         </div>`).join('');
 
-    const profileOpts = [
-        `<option value="">— Current (default) —</option>`,
-        ...this._profiles.map(p =>
-            `<option value="${esc(p.id)}" ${db.settings.aiProfile === p.id ? 'selected' : ''}>${esc(p.name)}</option>`
-        ),
-    ].join('');
+    const profileOpts = this._scriptProfileOpts(db.settings.aiProfile);
 
     const scheme = this._orgScheme();
     const preview = previewCustomOrgCode(db.settings.levels);
@@ -7935,7 +8644,7 @@ _readFacets(el) {
                 <details class="stm-settings-fold">
                     <summary class="stm-settings-section">AI agent</summary>
                     <div class="stm-settings-fold-body">
-                        <p class="stm-settings-hint">Profile and token budgets used by the Script Agent. Input budget truncates source text (~4 characters per token). Output budget is passed as max new tokens.</p>
+                        <p class="stm-settings-hint">House Script Agent profile is set in Backstage → Settings. Leave this empty to use it (otherwise the currently selected model). Input budget truncates source text (~4 characters per token). Output budget is passed as max new tokens.</p>
                         <div class="stm-form-row">
                             <label>Profile</label>
                             <select id="stm-ai-profile">${profileOpts}</select>
@@ -7980,6 +8689,13 @@ _readFacets(el) {
                 <div class="stm-form-row stm-form-row--toggles">
                     <label><input id="stm-replace-chat" type="checkbox" ${db.settings.replaceChatLorebook ? 'checked' : ''}> Replace chat lorebook (unbind native book so Script is the only chat-bound memory)</label>
                 </div>
+                <p class="stm-settings-hint">MemoryBooks: copy/install bakes current Cast billing (reinstall after Cast changes). Keep Default Previous Memories at Last 1 so Timeframe can step from the prior scene. Locations may include new scene places — copy spelling from the scene; do not invent shop names.</p>
+                <button id="stm-copy-memory-prompt" class="stm-btn" style="margin-top:8px" type="button">
+                    Copy Showtime MemoryBooks prompt
+                </button>
+                <button id="stm-install-memory-prompt" class="stm-btn" style="margin-top:8px" type="button">
+                    Install preset into MemoryBooks
+                </button>
                 <button id="stm-import-chatbook" class="stm-btn" style="margin-top:8px" type="button">
                     Open Agent on bound chat lorebook…
                 </button>
@@ -8045,12 +8761,39 @@ _readFacets(el) {
         }
     });
 
+    overlay.querySelector('#stm-copy-memory-prompt')?.addEventListener('click', async () => {
+        const prompt = buildShowtimeMemoryPrompt(this.storage);
+        try {
+            await navigator.clipboard.writeText(prompt);
+            void showtimeAlert('Copied Showtime Script MemoryBooks prompt (current Cast baked in).', { title: 'MEMORYBOOKS' });
+        } catch {
+            void showtimeAlert('Could not copy — select the prompt from the console.', { title: 'MEMORYBOOKS', danger: true });
+            console.log(prompt);
+        }
+    });
+    overlay.querySelector('#stm-install-memory-prompt')?.addEventListener('click', async () => {
+        try {
+            const mod = await import('../../../../SillyTavern-MemoryBooks/summaryPromptManager.js');
+            if (typeof mod.upsertPreset !== 'function') throw new Error('no upsert');
+            await mod.upsertPreset(SHOWTIME_MEMORY_PRESET_KEY, SHOWTIME_MEMORY_PROMPT, 'Showtime Script');
+            void showtimeAlert('Installed “Showtime Script” in MemoryBooks. Select it on a memory profile. Click again only if you want this text to replace a preset you edited.', { title: 'MEMORYBOOKS' });
+        } catch (err) {
+            console.warn('[Showtime/MemoryBook] install failed', err);
+            try {
+                await navigator.clipboard.writeText(SHOWTIME_MEMORY_PROMPT);
+                void showtimeAlert('MemoryBooks not available. Prompt copied instead — paste it as a custom preset.', { title: 'MEMORYBOOKS' });
+            } catch {
+                void showtimeAlert('MemoryBooks not available and copy failed. See console for the prompt.', { title: 'MEMORYBOOKS', danger: true });
+                console.log(SHOWTIME_MEMORY_PROMPT);
+            }
+        }
+    });
     overlay.querySelector('#stm-import-chatbook').addEventListener('click', async () => {
         const name = this._boundChatBook() || this._db().settings.previousChatBook;
-        if (!name) { alert('No chat lorebook is bound (or remembered).'); return; }
+        if (!name) { void showtimeAlert('No chat lorebook is bound (or remembered).', { title: 'IMPORT LOREBOOK' }); return; }
         await this._ensureBookLoaded(name);
         if (!this._wiBooks.some(b => b.name === name)) {
-            alert('Could not load lorebook: ' + name);
+            void showtimeAlert('Could not load lorebook: ' + name, { title: 'IMPORT LOREBOOK', danger: true });
             return;
         }
         close();
@@ -8059,14 +8802,14 @@ _readFacets(el) {
 
     overlay.querySelector('#stm-refresh-stamps').addEventListener('click', () => {
         const n = this._refreshLibraryStamps();
-        alert(n
+        void showtimeAlert(n
             ? `Refreshed Library stamps — updated ${n} tag list${n === 1 ? '' : 's'}.`
-            : 'Library stamps already match Script cards.');
+            : 'Library stamps already match Script cards.', { title: 'LIBRARY STAMPS' });
     });
 
     overlay.querySelector('#stm-restore-chatbook').addEventListener('click', () => {
         const db2 = this._db();
-        if (!db2.settings.previousChatBook) { alert('No remembered chat lorebook.'); return; }
+        if (!db2.settings.previousChatBook) { void showtimeAlert('No remembered chat lorebook.', { title: 'RESTORE LOREBOOK' }); return; }
         db2.settings.replaceChatLorebook = false;
         this._setChatLorebook(db2.settings.previousChatBook);
         this._save(db2);
@@ -8079,7 +8822,7 @@ _readFacets(el) {
     });
     overlay.querySelector('#stm-cfg-save').addEventListener('click', () => {
         const newLevels = normalizeLevels(readLevelRows());
-        if (!newLevels.length) { alert('At least one level is required.'); return; }
+        if (!newLevels.length) { void showtimeAlert('At least one level is required.', { title: 'SCRIPT CONFIGURE' }); return; }
 
         const db2 = this._db();
         const schemeVal = overlay.querySelector('input[name="stm-org-scheme"]:checked')?.value;
@@ -8946,6 +9689,93 @@ _readFacets(el) {
 }
 .stm-set-time[open] > summary::before { transform: rotate(90deg); }
 .stm-set-time-body { margin-top: 4px; }
+.stm-span-field { position: relative; }
+.stm-span-pop {
+  margin-top: 6px;
+  padding: 8px;
+  background: #f7f1e2;
+  border: 1px solid #9a7d3f;
+  border-radius: 6px;
+}
+.stm-span-pop[hidden] { display: none !important; }
+.stm-span-cal {
+  margin-top: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+}
+.stm-span-cal-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.stm-span-cal-step,
+.stm-span-cal-title,
+.stm-span-cal-chip,
+.stm-span-cal-day {
+  border: 1px solid #c4b48a;
+  background: #efe4c4;
+  color: #1a1208;
+  cursor: pointer;
+  font: inherit;
+}
+.stm-span-cal-step {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.stm-span-cal-title {
+  flex: 1;
+  height: 28px;
+  border-radius: 4px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+.stm-span-cal-seasons,
+.stm-span-cal-months {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.stm-span-cal-chip {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.stm-span-cal-chip.is-on,
+.stm-span-cal-title:hover,
+.stm-span-cal-day.is-on {
+  background: #6b4f1e;
+  border-color: #6b4f1e;
+  color: #f0d89a;
+}
+.stm-span-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 3px;
+}
+.stm-span-cal-day {
+  min-height: 28px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.stm-span-cal-day.is-in {
+  background: rgba(107, 79, 30, 0.22);
+}
+.stm-span-cal-day:hover,
+.stm-span-cal-chip:hover,
+.stm-span-cal-step:hover {
+  background: #e4d4a8;
+}
+.stm-span-cal-day.is-on:hover,
+.stm-span-cal-chip.is-on:hover {
+  background: #7a5c24;
+  color: #f0d89a;
+}
 .stm-cal-picker {
   display: flex;
   flex-direction: column;
@@ -9848,6 +10678,52 @@ _readFacets(el) {
 }
 .stm-suggest-item:hover { background: #2a1e0a; }
 .stm-suggest-item em { color: #9a7d3f; font-style: normal; font-size: 10px; }
+.stm-spine-block { margin: 8px 0; }
+.stm-spine-pick-wrap { width: 100%; }
+.stm-spine-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 0; }
+.stm-spine-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #efe4c4;
+  border: 1px solid #9a7d3f;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #1a1208;
+}
+.stm-folder .stm-spine-chip { background: #d4c49a; color: #2b1d0e; }
+.stm-spine-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  position: relative;
+}
+.stm-spine-search {
+  flex: 1;
+  min-width: 140px;
+  margin-top: 0;
+  width: 100%;
+  background: #1f1609;
+  border: 1px dashed #6b4f1e;
+  color: #d4c9a8;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.stm-spine-suggest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 5;
+  margin-top: 4px;
+  background: #1a1208;
+  border: 1px solid #6b4f1e;
+  max-height: 160px;
+  overflow-y: auto;
+}
 .stm-quotes { margin: 8px 0; }
 .stm-quote {
   margin: 6px 0;
@@ -9951,6 +10827,17 @@ _readFacets(el) {
   color: #c8aa6e;
   min-width: 64px;
   text-align: center;
+}
+.stm-tl-view-label {
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  color: #a89878;
+  min-width: 72px;
+  max-width: 160px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .stm-tl-show-pop {
   position: relative;

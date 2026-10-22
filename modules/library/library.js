@@ -6,6 +6,7 @@
 // SillyTavern's World Info already handles everything that lives in a book.
 
 import { getContext } from '../../../../../extensions.js';
+import { chat_metadata, converter, saveMetadata, saveSettingsDebounced } from '../../../../../../script.js';
 import {
   loadWorldInfo,
   openWorldInfoEditor,
@@ -15,10 +16,24 @@ import {
   METADATA_KEY,
 } from '../../../../../world-info.js';
 import { Module } from '../../lib/module.js';
-import { getCastMembers, getCastRecords, castNameMatches, normalizeAliases } from '../../lib/castCatalog.js';
+import { getCastMembers, getCastRecords, getStarMember, castNameMatches, normalizeAliases } from '../../lib/castCatalog.js';
 import { collectActiveLocationTags } from '../../lib/compass/state.js';
 import { bindLocationTagEditor, locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
 import { rafMove } from '../../lib/uiPerf.js';
+import { mintItem, worldFromStorage } from '../../lib/itemLocator.js';
+import {
+  knowerLabel, knowerShareHint, setKnowerStance, normalizeKnownBy, knowerKey,
+} from '../../lib/motivationCatalog.js';
+import { sanitizeFileHtml, smokeFileSanitizePure } from '../../lib/fileSanitize.js';
+import {
+  FILE_FORMS, ensureCabinet, getCabinet, listHouses, groupFilesByHouse,
+  upsertFile, filesKnownToCharacter, formatFileTidbits,
+  dressFileHtml, formLabel, extractFileEnvelopes, prepareLoreSource,
+  stripLorebookChrome, looksLikeCompleteHtml, dropRedundantHeading, guessFileForm,
+  splitMarkedDocuments, barRedactions, editableFileBody, setFamiliarity,
+  smokeFileCabinetPure,
+} from '../../lib/fileCabinet.js';
+import { showtimeAlert, showtimeConfirm, showtimePrompt } from '../../lib/dialogs.js';
 
 const SEED_SECTIONS = [
   { title: 'Places & Geography', icon: '⛰', blurb: 'Cities, rooms, roads, the shape of the map.' },
@@ -94,14 +109,23 @@ export class LibraryModule extends Module {
     this._searchTimer = 0;
     this._leafCache = null;
     this._cubbyScrolls = {};
+    this._openFileId = '';
+    this._cabinetHouseFilter = '';
   }
 
   async init() {
     this._registerInjection();
+    const smoke = smokeFileCabinetPure() || smokeFileSanitizePure();
+    if (smoke) console.warn('[Showtime/Library] smoke failed:', smoke);
+    this.bus?.on('library.openCabinet', (payload) => this._openCabinet(payload));
+    try {
+      await this._loadBooks();
+    } catch (err) {
+      console.warn('[Showtime/Library] lorebooks', err);
+    }
   }
 
   async onChatChanged() {
-    this._booksLoaded = false;
     this._openKeys.clear();
     this._uncap.clear();
     this._selected.clear();
@@ -109,6 +133,13 @@ export class LibraryModule extends Module {
     this._dupCache = null;
     this._leafCache = null;
     this._filter = { tag: '', text: '' };
+    this._openFileId = '';
+    this._cabinetHouseFilter = '';
+    try {
+      await this._loadBooks({ fresh: true });
+    } catch (err) {
+      console.warn('[Showtime/Library] lorebooks', err);
+    }
   }
 
   getDefaultState() {
@@ -119,8 +150,10 @@ export class LibraryModule extends Module {
       filing: {},
       bookFiling: {},
       adopted: [],
+      detached: [],
       native: [],
       dismissed: [],
+      cabinet: { files: [] },
       settings: {
         scanDepth: 4,
         injectPinned: true,
@@ -262,8 +295,10 @@ export class LibraryModule extends Module {
     st.filing ??= {};
     st.bookFiling ??= {};
     st.adopted ??= [];
+    st.detached ??= [];
     st.native ??= [];
     st.dismissed ??= [];
+    ensureCabinet(st);
     st.settings ??= { scanDepth: 4, injectPinned: true, injectKeyword: true };
     if (st.version !== 2) {
       st.version = 2;
@@ -321,49 +356,70 @@ export class LibraryModule extends Module {
     add(ctx.powerUserSettings?.persona_description_lorebook, 'persona');
 
     // Books the user filed or pulled in stay visible even out of play.
+    // A detached book stays off that list until it is pulled back in.
     const st = this._db();
-    for (const name of st.adopted) add(name, 'filed');
-    for (const name of Object.keys(st.bookFiling)) add(name, 'filed');
+    const quiet = new Set(st.detached || []);
+    for (const name of st.adopted) {
+      if (!quiet.has(name)) add(name, 'filed');
+    }
+    for (const name of Object.keys(st.bookFiling)) {
+      if (!quiet.has(name)) add(name, 'filed');
+    }
     // Only revive a book from a filing key if it is a real lorebook — a
     // mangled separator used to invent ghost copies of the same book.
     const known = new Set(world_names ?? []);
     for (const key of Object.keys(st.filing)) {
       const name = this._bookNameFromKey(key);
+      if (quiet.has(name)) continue;
       if (known.has(name) || found.has(name)) add(name, 'filed');
     }
 
     return found;
   }
 
-  async _loadBooks() {
-    if (this._loading) return;
-    this._loading = true;
-    try {
-      const detected = this._detectBooks();
-      const results = await Promise.allSettled(
-        [...detected.keys()].map(name => loadWorldInfo(name).then(wi => ({ name, wi }))),
-      );
-      const seen = new Set();
-      this._books = results
-        .filter(r => r.status === 'fulfilled' && r.value?.wi)
-        .map(({ value: { name, wi } }) => {
-          const raw = wi.entries ?? {};
-          const entries = (Array.isArray(raw) ? raw : Object.values(raw))
-            .filter(Boolean)
-            .map(e => ({ ...e, uid: String(e.uid) }));
-          return { name, sources: [...(detected.get(name) ?? [])], entries };
-        })
-        .filter(b => {
-          if (seen.has(b.name)) return false;
-          seen.add(b.name);
-          return true;
-        })
-        .sort((a, b) => a.name.localeCompare(b.name));
-      this._leafCache = null;
-      this._booksLoaded = true;
-    } finally {
-      this._loading = false;
+  _loadBooks({ fresh = false } = {}) {
+    if (fresh) {
+      this._booksEpoch = (this._booksEpoch || 0) + 1;
+      this._booksLoaded = false;
+      this._loadJob = null;
     }
+    if (this._booksLoaded) return Promise.resolve();
+    if (this._loadJob) return this._loadJob;
+    const epoch = this._booksEpoch || 0;
+    this._loading = true;
+    this._loadJob = (async () => {
+      try {
+        const detected = this._detectBooks();
+        const results = await Promise.allSettled(
+          [...detected.keys()].map(name => loadWorldInfo(name).then(wi => ({ name, wi }))),
+        );
+        if (epoch !== (this._booksEpoch || 0)) return;
+        const seen = new Set();
+        this._books = results
+          .filter(r => r.status === 'fulfilled' && r.value?.wi)
+          .map(({ value: { name, wi } }) => {
+            const raw = wi.entries ?? {};
+            const entries = (Array.isArray(raw) ? raw : Object.values(raw))
+              .filter(Boolean)
+              .map(e => ({ ...e, uid: String(e.uid) }));
+            return { name, sources: [...(detected.get(name) ?? [])], entries };
+          })
+          .filter(b => {
+            if (seen.has(b.name)) return false;
+            seen.add(b.name);
+            return true;
+          })
+          .sort((a, b) => a.name.localeCompare(b.name));
+        this._leafCache = null;
+        this._booksLoaded = true;
+      } finally {
+        if (epoch === (this._booksEpoch || 0)) {
+          this._loading = false;
+          this._loadJob = null;
+        }
+      }
+    })();
+    return this._loadJob;
   }
 
   /** Books on disk that this chat is not using — offer-to-file candidates. */
@@ -977,7 +1033,7 @@ export class LibraryModule extends Module {
 
   async render(container) {
     this.container = container;
-    if (!this._booksLoaded && !this._loading) {
+    if (!this._booksLoaded) {
       container.innerHTML = `<div class="lib-root"><div class="lib-boot">Reading the shelves…</div></div>`;
       await this._loadBooks();
     }
@@ -1003,7 +1059,8 @@ export class LibraryModule extends Module {
       <div class="lib-root">
         ${this._topHTML(leaves)}
         <main class="lib-body">
-          ${this._view === 'books' ? this._booksHTML(leaves)
+          ${this._view === 'cabinet' ? this._cabinetHTML()
+            : this._view === 'books' ? this._booksHTML(leaves)
             : this._view === 'bulk' ? this._bulkHTML(leaves)
             : this._shelfHTML(leaves)}
         </main>
@@ -1061,12 +1118,16 @@ export class LibraryModule extends Module {
         <nav class="lib-tabs">
           <button type="button" class="lib-tab${this._view === 'shelf' ? ' on' : ''}" data-view="shelf">Shelf</button>
           <button type="button" class="lib-tab${this._view === 'books' ? ' on' : ''}" data-view="books">Lorebooks</button>
+          <button type="button" class="lib-tab${this._view === 'cabinet' ? ' on' : ''}" data-view="cabinet">Cabinet</button>
           <button type="button" class="lib-tab${this._view === 'bulk' ? ' on' : ''}" data-view="bulk">Bulk</button>
         </nav>
         <input type="search" class="lib-search" data-role="search" placeholder="Search titles, keys, text…"
           value="${esc(this._filter.text)}">
-        ${this._view === 'books' ? '' : this._sortHTML(leaves)}
+        ${this._view === 'books' || this._view === 'cabinet' ? '' : this._sortHTML(leaves)}
         <div class="lib-top-actions">
+          ${this._view === 'cabinet' ? `
+            <button type="button" class="lib-btn small" data-action="file-new">＋ File</button>
+            <button type="button" class="lib-btn small" data-action="file-from-lore">From lorebook</button>` : ''}
           ${this._view === 'shelf' ? `
             <button type="button" class="lib-btn small${this._flat ? ' gold' : ''}" data-action="toggle-flat"
               title="${this._flat ? 'Back to cubbies' : 'Cards only — one flat list of whatever matches'}">${this._flat ? 'Cubbies' : 'Cards only'}</button>
@@ -1413,7 +1474,7 @@ export class LibraryModule extends Module {
 
   _bulkKeys({ quiet = false } = {}) {
     const keys = this._leaves().filter(l => this._selected.has(l.key)).map(l => l.key);
-    if (!keys.length && !quiet) alert('Pick at least one entry first.');
+    if (!keys.length && !quiet) void showtimeAlert('Pick at least one entry first.', { title: 'LIBRARY' });
     return keys;
   }
 
@@ -1474,9 +1535,7 @@ export class LibraryModule extends Module {
             </select>
           </label>
           <button type="button" class="lib-btn small" data-action="open-book">Open in ST</button>
-          ${this._db().adopted.includes(book.name)
-            ? `<button type="button" class="lib-btn small danger" data-action="release-book" title="Stop showing this book here">Release</button>`
-            : ''}
+          <button type="button" class="lib-btn small danger" data-action="detach-book" title="Take this lorebook out of the folder and turn it off. The file stays on disk.">Remove</button>
         </div>
         ${tags.length ? `<div class="lib-entry-tags">${tags.map(t => this._tagChipHTML(t)).join('')}</div>` : ''}
         ${open ? `
@@ -1498,6 +1557,475 @@ export class LibraryModule extends Module {
             }).join('') : `<div class="lib-cubby-empty">This book has no entries.</div>`}
           </div>` : ''}
       </article>`;
+  }
+
+  _openCabinet(payload = {}) {
+    this._view = 'cabinet';
+    this._openFileId = String(payload?.fileId || '').trim();
+    this._cabinetHouseFilter = String(payload?.houseId || '').trim();
+    this.bus?.emit('shell.activate', 'library');
+    if (this.container) this._paint();
+    const rec = this._fileById(this._openFileId);
+    if (rec) this._openFileView(rec);
+  }
+
+  _cabinet() {
+    return getCabinet(this.storage);
+  }
+
+  _fileById(id) {
+    return this._cabinet().files.find(f => f.id === id) || null;
+  }
+
+  _houseLabel(id) {
+    const h = listHouses(this.storage).find(x => x.id === id);
+    if (!h) return 'House';
+    return h.alias ? `${h.name} (${h.alias})` : (h.name || 'House');
+  }
+
+  _cabinetHTML() {
+    const cab = this._cabinet();
+    const houses = listHouses(this.storage);
+    const q = String(this._filter.text || '').trim().toLowerCase();
+    const match = f => {
+      if (!q) return true;
+      return [f.title, f.tidbit, f.form].some(s => String(s || '').toLowerCase().includes(q));
+    };
+    let { groups, unfiled } = groupFilesByHouse(cab.files, houses);
+    if (this._cabinetHouseFilter) {
+      groups = groups.filter(g => g.house.id === this._cabinetHouseFilter);
+      unfiled = [];
+    }
+    groups = groups.map(g => ({ ...g, files: g.files.filter(match) }));
+    unfiled = unfiled.filter(match);
+    const open = this._fileById(this._openFileId);
+    const sections = [
+      ...groups.map(g => ({
+        key: g.house.id,
+        title: this._houseLabel(g.house.id),
+        files: g.files,
+      })),
+      ...(!this._cabinetHouseFilter ? [{ key: 'library', title: 'No origin', files: unfiled }] : []),
+    ];
+    return `
+      <div class="lib-cabinet">
+        <div class="lib-cabinet-list">
+          ${sections.map(sec => `
+            <section class="lib-cab-group" data-house="${esc(sec.key)}">
+              <header class="lib-cab-head">${esc(sec.title)}
+                <span class="lib-cubby-count">${sec.files.length}</span></header>
+              ${sec.files.length ? sec.files.map(f => this._fileRowHTML(f)).join('')
+                : `<div class="lib-cubby-empty">Empty drawer.</div>`}
+            </section>`).join('')}
+        </div>
+        <div class="lib-cabinet-read">
+          ${open ? this._fileReadHTML(open) : `<div class="lib-cubby-empty">Select a file for filing details. The document opens in a pop-out.</div>`}
+        </div>
+      </div>`;
+  }
+
+  _fileRowHTML(f) {
+    const on = this._openFileId === f.id;
+    const house = f.cabinetOf?.type === 'house' ? this._houseLabel(f.cabinetOf.id) : 'No origin';
+    const stub = !String(f.html || '').trim();
+    return `
+      <button type="button" class="lib-file-row${on ? ' on' : ''}" data-action="open-file" data-id="${esc(f.id)}">
+        <span class="lib-file-title">${esc(f.title)}</span>
+        <span class="lib-file-meta">${esc(f.form)} · ${esc(house)}${f.physical ? ' · physical' : ''}${f.public ? ' · public' : ''}${stub ? ' · stub' : ''} · ${f.knownBy?.length || 0} know</span>
+      </button>`;
+  }
+
+  _fileReadHTML(f) {
+    const houseId = f.cabinetOf?.type === 'house' ? f.cabinetOf.id : '';
+    const houses = listHouses(this.storage);
+    const knowers = [
+      ...normalizeKnownBy(f.knownBy).map(k => ({ ...k, stance: 'knows' })),
+      ...normalizeKnownBy(f.unawareBy).map(k => ({ ...k, stance: 'unaware' })),
+    ];
+    const access = normalizeKnownBy(f.canAccess);
+    const stub = !String(f.html || '').trim();
+    return `
+      <article class="lib-file-read">
+        <header class="lib-file-read-head">
+          <div class="lib-file-title">${esc(f.title)}</div>
+          <div class="lib-file-meta">${esc(formLabel(f.form))}${f.physical ? ' · physical' : ''}${stub ? ' · stub' : ''}</div>
+        </header>
+        <div class="lib-field"><label>Tidbit (injected for knowers)</label>
+          <div class="lib-hint">${esc(f.tidbit || '—')}</div></div>
+        <label class="lib-check"><input type="checkbox" data-action="file-public" data-id="${esc(f.id)}" ${f.public ? 'checked' : ''}> Public access</label>
+        <div class="lib-field"><label>Origin</label>
+          <select data-action="file-house" data-id="${esc(f.id)}">
+            <option value="">— No origin —</option>
+            ${houses.map(h => `<option value="${esc(h.id)}" ${h.id === houseId ? 'selected' : ''}>${esc(this._houseLabel(h.id))}</option>`).join('')}
+          </select></div>
+        <div class="lib-field"><label>Clearance</label>
+          ${f.public
+            ? `<div class="lib-hint">Public. Clearance does not apply.</div>`
+            : (access.length
+              ? `<div class="lib-file-chips">${access.map(k =>
+                `<span class="lib-file-chip">${esc(knowerLabel(this.storage, k))}${k.type === 'house' ? ` · ${esc(knowerShareHint(k))}` : ''}</span>`).join('')}</div>`
+              : `<div class="lib-hint">Anyone who obtains it may read it.</div>`)}
+        </div>
+        ${f.public ? `<div class="lib-field"><label>Familiarity</label>
+          ${(f.familiarity || []).length
+            ? `<div class="lib-file-chips">${(f.familiarity || []).map(r =>
+              `<span class="lib-file-chip">${esc(knowerLabel(this.storage, { type: 'cast', id: r.id }))} · ${esc(r.level)}</span>`).join('')}</div>`
+            : `<div class="lib-hint">Checked the first time someone is considered.</div>`}
+        </div>` : `<div class="lib-field"><label>Exposed</label>
+          ${knowers.length
+            ? `<div class="lib-file-chips">${knowers.map(k =>
+              `<span class="lib-file-chip ${k.stance}">${esc(knowerLabel(this.storage, k))}${k.type === 'house' ? ` · ${esc(knowerShareHint(k))}` : ''} · ${k.stance === 'knows' ? 'Knows' : 'Dark'}</span>`).join('')}</div>`
+            : `<div class="lib-hint">Nobody tagged.</div>`}
+        </div>`}
+        <div class="lib-file-actions">
+          <button type="button" class="lib-btn small gold" data-action="file-view" data-id="${esc(f.id)}">View</button>
+          <button type="button" class="lib-btn small" data-action="file-edit" data-id="${esc(f.id)}">Edit</button>
+          <button type="button" class="lib-btn small" data-action="file-access" data-id="${esc(f.id)}">Who may read</button>
+          <button type="button" class="lib-btn small" data-action="file-knows" data-id="${esc(f.id)}">Who knows</button>
+          <button type="button" class="lib-btn small" data-action="file-physical" data-id="${esc(f.id)}">${f.physical ? 'Unlink item' : 'Physical copy'}</button>
+          <button type="button" class="lib-btn small danger" data-action="file-drop" data-id="${esc(f.id)}">Delete</button>
+        </div>
+      </article>`;
+  }
+
+  _closeFilePage() {
+    document.querySelectorAll('.lib-modal-backdrop:has(.lib-modal--page)').forEach(el => el.remove());
+  }
+
+  _openFileView(file) {
+    if (!file) return;
+    this._closeFilePage();
+    const house = file.cabinetOf?.type === 'house' ? this._houseLabel(file.cabinetOf.id) : 'No origin';
+    const form = String(file.form || 'file').toUpperCase();
+    const body = file.html || '<p class="st-file-stub">On file — body not yet transcribed.</p>';
+    const backdrop = this._modal(`
+      <div class="lib-modal-title">${esc(form)}</div>
+      <div class="lib-modal-sub">— ${esc(file.title || 'Untitled')} · Origin · ${esc(house)} —</div>
+      <div class="st-file-page st-file--${esc(file.form || 'file')}">${body}</div>
+      <label class="lib-check"><input type="checkbox" data-action="file-public-one" ${file.public ? 'checked' : ''}> Public access</label>
+      ${file.public ? '<div class="lib-hint" data-role="clearance-note">Clearance does not apply.</div>' : ''}
+      <div class="lib-modal-actions">
+        <button type="button" class="lib-btn" data-action="cancel">Close</button>
+        <button type="button" class="lib-btn gold" data-action="file-edit-open">Edit</button>
+        <button type="button" class="lib-btn" data-action="file-access-open">Who may read</button>
+        <button type="button" class="lib-btn" data-action="file-knows-open">Who knows</button>
+      </div>`, { page: true });
+    backdrop.querySelector('[data-action="file-public-one"]')?.addEventListener('change', (e) => {
+      const rec = this._fileById(file.id);
+      if (!rec) return;
+      rec.public = !!e.target.checked;
+      let note = backdrop.querySelector('[data-role="clearance-note"]');
+      if (rec.public && !note) {
+        note = document.createElement('div');
+        note.className = 'lib-hint';
+        note.dataset.role = 'clearance-note';
+        note.textContent = 'Clearance does not apply.';
+        e.target.closest('label')?.after(note);
+      } else if (!rec.public && note) {
+        note.remove();
+      }
+      this._saveCabinet();
+      this._openFileId = file.id;
+      this._paint();
+    });
+    backdrop.querySelector('[data-action="file-edit-open"]')?.addEventListener('click', () => {
+      backdrop.remove();
+      this._openFileEditor(file);
+    });
+    backdrop.querySelector('[data-action="file-access-open"]')?.addEventListener('click', () => {
+      this._openFileKnowDialog(file, { field: 'canAccess' });
+    });
+    backdrop.querySelector('[data-action="file-knows-open"]')?.addEventListener('click', () => {
+      this._openFileKnowDialog(file, { field: 'knownBy' });
+    });
+  }
+
+  _saveCabinet() {
+    this._save();
+    this.bus?.emit('showtime.stateChanged');
+    this.bus?.emit('library.cabinetUpdated');
+  }
+
+  _openFileEditor(rec) {
+    const editing = !!rec;
+    const houses = listHouses(this.storage);
+    const n = rec || { title: '', form: 'letter', html: '', tidbit: '', cabinetOf: { type: 'library' }, physical: false, public: false };
+    const houseId = n.cabinetOf?.type === 'house' ? n.cabinetOf.id : '';
+    const backdrop = this._modal(`
+      <div class="lib-modal-title">${editing ? 'REFIT FILE' : 'NEW FILE'}</div>
+      <div class="lib-modal-sub">— File Cabinet · the page is the document, the tidbit is what knowers hear —</div>
+      <div class="lib-field"><label>Title</label>
+        <input type="text" data-field="title" value="${esc(n.title)}"></div>
+      <div class="lib-field"><label>Form</label>
+        <select data-field="form">
+          ${FILE_FORMS.map(f => `<option value="${f}" ${n.form === f ? 'selected' : ''}>${f}</option>`).join('')}
+        </select></div>
+      <div class="lib-field"><label>Origin</label>
+        <select data-field="house">
+          <option value="">— No origin —</option>
+          ${houses.map(h => `<option value="${esc(h.id)}" ${h.id === houseId ? 'selected' : ''}>${esc(this._houseLabel(h.id))}</option>`).join('')}
+        </select></div>
+      <div class="lib-field"><label>Body</label>
+        <div class="lib-file-tools">
+          <button type="button" class="lib-btn small" data-fmt="bold">Bold</button>
+          <button type="button" class="lib-btn small" data-fmt="italic">Italic</button>
+          <button type="button" class="lib-btn small" data-fmt="h2">Heading</button>
+          <button type="button" class="lib-btn small" data-fmt="p">Paragraph</button>
+        </div>
+        <div class="st-file-page st-file--${esc(n.form || 'letter')}" data-role="file-skin">
+          <div class="st-file-body st-file-draft" contenteditable="true" data-field="body"></div>
+        </div></div>
+      <div class="lib-field"><label>Tidbit</label>
+        <input type="text" data-field="tidbit" value="${esc(n.tidbit)}" placeholder="One or two sentences for knowers"></div>
+      <label class="lib-check"><input type="checkbox" data-field="public" ${n.public ? 'checked' : ''}> Public access</label>
+      <label class="lib-check"><input type="checkbox" data-field="physical" ${n.physical ? 'checked' : ''}> Physical copy (inventory item)</label>
+      <div class="lib-modal-actions">
+        <button type="button" class="lib-btn" data-action="cancel">Cancel</button>
+        <button type="button" class="lib-btn gold" data-action="save">File</button>
+      </div>`);
+    const draft = backdrop.querySelector('[data-field="body"]');
+    const formSel = backdrop.querySelector('[data-field="form"]');
+    const skin = backdrop.querySelector('[data-role="file-skin"]');
+    draft.innerHTML = editableFileBody(n.html) || '';
+    const applyFmt = (fmt) => {
+      draft.focus();
+      if (fmt === 'bold') document.execCommand('bold');
+      else if (fmt === 'italic') document.execCommand('italic');
+      else if (fmt === 'h2') document.execCommand('formatBlock', false, 'h2');
+      else document.execCommand('formatBlock', false, 'p');
+    };
+    backdrop.querySelector('.lib-file-tools')?.addEventListener('mousedown', (e) => {
+      if (e.target.closest('[data-fmt]')) e.preventDefault();
+    });
+    backdrop.querySelector('.lib-file-tools')?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-fmt]');
+      if (btn) applyFmt(btn.dataset.fmt);
+    });
+    formSel?.addEventListener('change', () => {
+      if (skin) skin.className = `st-file-page st-file--${formSel.value || 'file'}`;
+    });
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+      const title = backdrop.querySelector('[data-field="title"]').value.trim();
+      if (!title) { void showtimeAlert('A title is required.', { title: 'ENTRY' }); return; }
+      const house = backdrop.querySelector('[data-field="house"]').value;
+      const form = formSel.value;
+      const bodyHtml = sanitizeFileHtml(draft.innerHTML);
+      const html = sanitizeFileHtml(dressFileHtml({ form, title, bodyHtml, house }));
+      const physical = backdrop.querySelector('[data-field="physical"]').checked;
+      const spec = {
+        id: rec?.id,
+        title,
+        form,
+        html,
+        tidbit: backdrop.querySelector('[data-field="tidbit"]').value.trim(),
+        public: backdrop.querySelector('[data-field="public"]').checked,
+        cabinetOf: house ? { type: 'house', id: house } : { type: 'library' },
+        physical,
+        itemId: rec?.itemId || '',
+        canAccess: rec ? rec.canAccess : undefined,
+        knownBy: rec?.knownBy,
+        unawareBy: rec?.unawareBy,
+        familiarity: rec?.familiarity,
+        source: rec?.source || { type: 'manual' },
+      };
+      const file = upsertFile(this._cabinet(), spec, { houses });
+      if (physical && !file.itemId) this._mintPhysical(file);
+      if (!physical) { file.physical = false; }
+      this._openFileId = file.id;
+      this._saveCabinet();
+      backdrop.remove();
+      this._paint();
+    });
+    setTimeout(() => backdrop.querySelector('[data-field="title"]').focus(), 0);
+  }
+
+  _mintPhysical(file) {
+    const world = worldFromStorage(this.storage);
+    const item = mintItem(world, { name: file.title, ownerId: 'star', category: 'misc' });
+    item.fileId = file.id;
+    file.itemId = item.id;
+    file.physical = true;
+    this.bus?.emit('inventory.updated');
+  }
+
+  _openFileKnowDialog(file, { field = 'knownBy' } = {}) {
+    const clearance = field === 'canAccess';
+    const liveFile = this._fileById(file.id) || file;
+    const familiar = !clearance && !!liveFile.public;
+    const title = clearance ? 'WHO MAY READ' : 'WHO KNOWS';
+    const backdrop = this._modal(`
+      <div class="lib-modal-title">SET · ${title}</div>
+      <div class="lib-modal-sub">— ${esc(file.title)} —</div>
+      <div class="lib-field"><label>Who</label>
+        ${familiar ? '' : `<div class="inv-kind-row" data-role="know-kind">
+          <button type="button" class="lib-btn small on" data-kind="cast">Cast</button>
+          <button type="button" class="lib-btn small" data-kind="house">Affiliation</button>
+        </div>`}
+        <select data-field="knower"></select></div>
+      ${clearance ? '' : `<div class="lib-field"><label>${familiar ? 'Familiarity' : 'Stance'}</label>
+        <div class="inv-kind-row" data-role="know-stance">
+          ${familiar
+            ? `<button type="button" class="lib-btn small" data-stance="dark">Dark</button>
+               <button type="button" class="lib-btn small" data-stance="vague">Vague</button>
+               <button type="button" class="lib-btn small" data-stance="aware">Aware</button>
+               <button type="button" class="lib-btn small on" data-stance="known">Known</button>`
+            : `<button type="button" class="lib-btn small on" data-stance="knows">Knows</button>
+               <button type="button" class="lib-btn small" data-stance="unaware">In the dark</button>`}
+        </div></div>`}
+      <div class="lib-modal-actions">
+        <button type="button" class="lib-btn" data-action="cancel">Done</button>
+        <button type="button" class="lib-btn gold" data-action="apply">Apply</button>
+      </div>`);
+    const kindRow = backdrop.querySelector('[data-role="know-kind"]');
+    const select = backdrop.querySelector('[data-field="knower"]');
+    const fill = (kind) => {
+      const choices = kind === 'house'
+        ? listHouses(this.storage).map(h => ({ type: 'house', id: h.id, label: this._houseLabel(h.id) }))
+        : getCastMembers(this.storage).map(m => ({ type: 'cast', id: m.id, label: m.name || 'Unnamed' }));
+      select.innerHTML = choices.map(c => `<option value="${esc(c.type)}:${esc(c.id)}">${esc(c.label)}</option>`).join('');
+    };
+    fill('cast');
+    kindRow?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-kind]');
+      if (!btn) return;
+      kindRow.querySelectorAll('[data-kind]').forEach(b => b.classList.toggle('on', b === btn));
+      fill(btn.dataset.kind);
+    });
+    backdrop.querySelector('[data-role="know-stance"]')?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-stance]');
+      if (!btn) return;
+      backdrop.querySelectorAll('[data-stance]').forEach(b => b.classList.toggle('on', b === btn));
+    });
+    backdrop.querySelector('[data-action="apply"]').addEventListener('click', () => {
+      const raw = String(select.value || '');
+      const [type, ...rest] = raw.split(':');
+      const id = rest.join(':');
+      if ((type !== 'cast' && type !== 'house') || !id) return;
+      if (familiar && type !== 'cast') return;
+      const knower = { type, id };
+      const rec = this._fileById(file.id) || file;
+      if (familiar) {
+        const level = backdrop.querySelector('[data-stance].on')?.dataset.stance || 'known';
+        setFamiliarity(rec, id, level);
+      } else if (clearance) {
+        const list = normalizeKnownBy(rec.canAccess);
+        const key = knowerKey(knower);
+        rec.canAccess = list.some(k => knowerKey(k) === key)
+          ? list.filter(k => knowerKey(k) !== key)
+          : [...list, knower];
+      } else {
+        const stance = backdrop.querySelector('[data-stance].on')?.dataset.stance || 'knows';
+        setKnowerStance(rec, knower, stance);
+      }
+      this._saveCabinet();
+      this._paint();
+    });
+  }
+
+  async _openLoreConvert() {
+    if (!this._booksLoaded) await this._loadBooks();
+    const books = this._books || [];
+    const houses = listHouses(this.storage);
+    const backdrop = this._modal(`
+      <div class="lib-modal-title">FROM LOREBOOK</div>
+      <div class="lib-modal-sub">— the full entry is restyled as a document; nothing is summarized —</div>
+      <div class="lib-field"><label>Book</label>
+        <select data-field="book">
+          ${books.map(b => `<option value="${esc(b.name)}">${esc(b.name)}</option>`).join('') || '<option value="">No books in play</option>'}
+        </select></div>
+      <div class="lib-field"><label>Entry</label>
+        <select data-field="entry"></select></div>
+      <div class="lib-field"><label>Origin</label>
+        <select data-field="house">
+          <option value="">— No origin —</option>
+          ${houses.map(h => `<option value="${esc(h.id)}">${esc(this._houseLabel(h.id))}</option>`).join('')}
+        </select></div>
+      <label class="lib-check"><input type="checkbox" data-field="physical"> Physical copy</label>
+      <div class="lib-hint" data-role="convert-preview"></div>
+      <div class="lib-modal-actions">
+        <button type="button" class="lib-btn" data-action="cancel">Cancel</button>
+        <button type="button" class="lib-btn gold" data-action="convert">Convert</button>
+      </div>`);
+    const bookSel = backdrop.querySelector('[data-field="book"]');
+    const entrySel = backdrop.querySelector('[data-field="entry"]');
+    const fillEntries = () => {
+      const book = books.find(b => b.name === bookSel.value);
+      const entries = book?.entries || [];
+      entrySel.innerHTML = entries.map((e, i) =>
+        `<option value="${esc(String(e.uid ?? i))}">${esc(this._entryTitle(e))}</option>`).join('')
+        || '<option value="">No entries</option>';
+    };
+    fillEntries();
+    const preview = backdrop.querySelector('[data-role="convert-preview"]');
+    const showPreview = () => {
+      const book = books.find(b => b.name === bookSel.value);
+      const entry = (book?.entries || []).find(e => String(e.uid) === entrySel.value);
+      const src = String(entry?.content || '').trim();
+      const n = src.length;
+      if (!n) {
+        preview.textContent = 'This entry has no Content in the lorebook.';
+        return;
+      }
+      const structured = /^(#|\*\*)|CLASSIFIED|Document ID:|<h[1-3]\b/m.test(src);
+      const head = src.replace(/\s+/g, ' ').slice(0, 160);
+      const lead = structured || n >= 1600
+        ? `${n} characters. Convert restyles this text as-is — it does not rewrite or shorten it.`
+        : `${n} characters. This looks like a short blurb, not the full document. Convert will not expand it. Paste the full note into World Info → Content, then convert again.`;
+      preview.textContent = `${lead} ${head}${n > 160 ? '…' : ''}`;
+    };
+    showPreview();
+    bookSel.addEventListener('change', () => { fillEntries(); showPreview(); });
+    entrySel.addEventListener('change', showPreview);
+    backdrop.querySelector('[data-action="convert"]').addEventListener('click', async () => {
+      const book = books.find(b => b.name === bookSel.value);
+      const uidWant = entrySel.value;
+      const entry = (book?.entries || []).find(e => String(e.uid) === uidWant);
+      if (!entry) { void showtimeAlert('Pick an entry.', { title: 'CONVERT LOREBOOK' }); return; }
+      const btn = backdrop.querySelector('[data-action="convert"]');
+      btn.disabled = true;
+      try {
+        const title = this._entryTitle(entry);
+        const source = String(entry.content || '');
+        if (!source.trim()) { void showtimeAlert('That entry has no text to convert.', { title: 'CONVERT LOREBOOK' }); return; }
+        const house = backdrop.querySelector('[data-field="house"]').value;
+        const physical = backdrop.querySelector('[data-field="physical"]').checked;
+        const marked = splitMarkedDocuments(source);
+        const chunks = marked.length
+          ? marked
+          : [{ title, form: guessFileForm(source) || 'file', body: source }];
+        let file = null;
+        for (let i = 0; i < chunks.length; i++) {
+          const piece = chunks[i];
+          const pieceTitle = piece.title || title;
+          const bodyHtml = this._loreBodyHtml(piece.body, { title: pieceTitle });
+          const form = piece.form || guessFileForm(piece.body) || 'file';
+          const tidbit = tidbitFromHtml(bodyHtml);
+          const source = { type: 'lorebook', book: book.name, uid: entry.uid };
+          if (i > 0) source.part = pieceTitle;
+          file = upsertFile(this._cabinet(), {
+            title: pieceTitle,
+            form,
+            html: sanitizeFileHtml(dressFileHtml({ form, title: pieceTitle, bodyHtml, house })),
+            tidbit,
+            cabinetOf: house ? { type: 'house', id: house } : { type: 'library' },
+            physical,
+            source,
+          }, { houses });
+          if (physical) this._mintPhysical(file);
+        }
+        this._openFileId = file?.id || '';
+        this._saveCabinet();
+        backdrop.remove();
+        this._paint();
+        if (file) this._openFileView(file);
+      } catch (err) {
+        console.warn('[Showtime/Library] lore convert', err);
+        void showtimeAlert('Convert failed.', { title: 'CONVERT LOREBOOK', danger: true });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Convert';
+      }
+    });
   }
 
   _statusHTML(leaves) {
@@ -1543,19 +2071,72 @@ export class LibraryModule extends Module {
     const action = act?.dataset.action;
     if (action === 'add-section') return this._openSectionEditor(null);
     if (action === 'add-entry') return this._openNativeEditor(null);
+    if (action === 'file-new') return this._openFileEditor(null);
+    if (action === 'file-from-lore') return void this._openLoreConvert();
+    if (action === 'open-file') {
+      this._openFileId = act.dataset.id || '';
+      this._paint();
+      return;
+    }
+    if (action === 'file-view') {
+      const rec = this._fileById(act.dataset.id);
+      if (rec) this._openFileView(rec);
+      return;
+    }
+    if (action === 'file-edit') {
+      const rec = this._fileById(act.dataset.id);
+      if (rec) this._openFileEditor(rec);
+      return;
+    }
+    if (action === 'file-knows') {
+      const rec = this._fileById(act.dataset.id);
+      if (rec) this._openFileKnowDialog(rec, { field: 'knownBy' });
+      return;
+    }
+    if (action === 'file-access') {
+      const rec = this._fileById(act.dataset.id);
+      if (rec) this._openFileKnowDialog(rec, { field: 'canAccess' });
+      return;
+    }
+    if (action === 'file-physical') {
+      const rec = this._fileById(act.dataset.id);
+      if (!rec) return;
+      if (rec.physical && rec.itemId) {
+        rec.physical = false;
+      } else {
+        this._mintPhysical(rec);
+      }
+      this._saveCabinet();
+      this._paint();
+      return;
+    }
+    if (action === 'file-drop') {
+      const id = act.dataset.id;
+      if (!id) return;
+      void showtimeConfirm('Delete this file from the cabinet?', { title: 'DELETE FILE', danger: true, confirmLabel: 'Delete' }).then(ok => {
+        if (!ok) return;
+        const cab = this._cabinet();
+        cab.files = cab.files.filter(f => f.id !== id);
+        if (this._openFileId === id) this._openFileId = '';
+        this._closeFilePage();
+        this._saveCabinet();
+        this._paint();
+      });
+      return;
+    }
     if (action === 'tag-types') return this._openTagTypes();
     if (action === 'settings') return this._openSettings();
     if (action === 'reload') {
-      this._booksLoaded = false;
-      return void this._loadBooks().then(() => this._paint());
+      return void this._loadBooks({ fresh: true }).then(() => this._paint());
     }
     if (action === 'add-shelf') {
-      const label = prompt('Folder name', 'Worldbuilding');
-      if (!label?.trim()) return;
-      const g = this._g();
-      g.shelves.push({ id: uid(), label: label.trim(), sortIndex: g.shelves.length });
-      this._saveG();
-      this._paint();
+      void showtimePrompt('Folder name', { title: 'NEW FOLDER', defaultValue: 'Worldbuilding', confirmLabel: 'Add' }).then(label => {
+        if (!label?.trim()) return;
+        const g = this._g();
+        g.shelves.push({ id: uid(), label: label.trim(), sortIndex: g.shelves.length });
+        this._saveG();
+        this._paint();
+      });
       return;
     }
     if (action === 'toggle-flat') {
@@ -1712,46 +2293,45 @@ export class LibraryModule extends Module {
       if (name) this._openBookTagEditor(name);
       return;
     }
-    if (action === 'release-book') {
+    if (action === 'detach-book' || action === 'release-book') {
       const name = act.closest('.lib-book')?.dataset.book;
-      const st = this._db();
-      st.adopted = st.adopted.filter(n => n !== name);
-      this._invalidate();
-      this._save();
-      this._booksLoaded = false;
-      return void this._loadBooks().then(() => this._paint());
+      if (name) void this._detachBook(name);
+      return;
     }
     if (action === 'adopt-book') {
       const name = act.dataset.book;
       const st = this._db();
+      st.detached = (st.detached || []).filter(n => n !== name);
       if (name && !st.adopted.includes(name)) st.adopted.push(name);
       this._invalidate();
       this._save();
-      this._booksLoaded = false;
       this._openBooks.add(name);
-      return void this._loadBooks().then(() => this._paint());
+      return void this._loadBooks({ fresh: true }).then(() => this._paint());
     }
     if (action === 'rename-shelf') {
       const g = this._g();
       const sh = g.shelves.find(s => s.id === act.dataset.shelf);
       if (!sh) return;
-      const next = prompt('Folder name', sh.label);
-      if (!next?.trim()) return;
-      sh.label = next.trim();
-      this._saveG();
-      this._paint();
+      void showtimePrompt('Folder name', { title: 'RENAME FOLDER', defaultValue: sh.label, confirmLabel: 'Rename' }).then(next => {
+        if (!next?.trim()) return;
+        sh.label = next.trim();
+        this._saveG();
+        this._paint();
+      });
       return;
     }
     if (action === 'drop-shelf') {
       const g = this._g();
       const id = act.dataset.shelf;
-      if (!confirm('Remove this folder? The books inside stay on the shelf.')) return;
-      g.shelves = g.shelves.filter(s => s.id !== id);
-      for (const [book, sid] of Object.entries(g.bookShelf)) {
-        if (sid === id) delete g.bookShelf[book];
-      }
-      this._saveG();
-      this._paint();
+      void showtimeConfirm('Remove this folder? The books inside stay on the shelf.', { title: 'REMOVE FOLDER', danger: true, confirmLabel: 'Remove' }).then(ok => {
+        if (!ok) return;
+        g.shelves = g.shelves.filter(s => s.id !== id);
+        for (const [book, sid] of Object.entries(g.bookShelf)) {
+          if (sid === id) delete g.bookShelf[book];
+        }
+        this._saveG();
+        this._paint();
+      });
       return;
     }
     if (action) return;
@@ -1760,6 +2340,72 @@ export class LibraryModule extends Module {
     if (this._openKeys.has(key)) this._openKeys.delete(key);
     else this._openKeys.add(key);
     this._refreshEntry(card, key);
+  }
+
+  /**
+   * Take a lorebook off the shelf. Global and chat attachments are turned
+   * off; the file on disk is left alone. A character card or persona link
+   * is left in place, so that book can stay in play.
+   */
+  async _detachBook(name) {
+    const book = this._books.find(b => b.name === name);
+    const sources = new Set(book?.sources || []);
+    const lines = ['It leaves this folder.'];
+    if (sources.has('global') || selected_world_info.includes(name)) {
+      lines.push('It is turned off as a lorebook for all chats.');
+    }
+    if (sources.has('chat') || chat_metadata?.[METADATA_KEY] === name) {
+      lines.push('It is unassigned from this chat.');
+    }
+    lines.push('The lorebook file stays on disk.');
+    if (sources.has('character') || sources.has('persona')) {
+      lines.push('A character card or persona still links it, so it may remain in play.');
+    }
+    if (!await showtimeConfirm(`Remove "${name}"?\n\n${lines.join(' ')}`, { title: 'REMOVE LOREBOOK', danger: true, confirmLabel: 'Remove' })) return;
+
+    const g = this._g();
+    if (g.bookShelf[name]) {
+      delete g.bookShelf[name];
+      this._saveG();
+    }
+
+    const st = this._db();
+    st.adopted = (st.adopted || []).filter(n => n !== name);
+    st.detached ??= [];
+    if (!st.detached.includes(name)) st.detached.push(name);
+    this._save();
+
+    this._turnOffGlobal(name);
+    if (chat_metadata?.[METADATA_KEY] === name) {
+      delete chat_metadata[METADATA_KEY];
+      document.querySelectorAll('.chat_lorebook_button').forEach(el => el.classList.remove('world_set'));
+      try { await saveMetadata(); } catch { /* chat metadata is optional */ }
+    }
+
+    this._invalidate();
+    await this._loadBooks({ fresh: true });
+    this._paint();
+  }
+
+  /** Drop a name from SillyTavern's global lorebook list and persist it. */
+  _turnOffGlobal(name) {
+    if (!selected_world_info.includes(name)) return;
+    const $sel = globalThis.$?.('#world_info');
+    if ($sel?.length) {
+      const current = $sel.val();
+      const values = Array.isArray(current) ? current : (current ? [current] : []);
+      const next = values.filter(v => $sel[0].options[Number(v)]?.text !== name);
+      if (next.length !== values.length) {
+        $sel.val(next).trigger('change');
+        return;
+      }
+    }
+    const idx = selected_world_info.indexOf(name);
+    if (idx !== -1) selected_world_info.splice(idx, 1);
+    if (world_info && typeof world_info === 'object') {
+      world_info.globalSelect = [...selected_world_info];
+    }
+    saveSettingsDebounced();
   }
 
   _onRootChange(e) {
@@ -1808,6 +2454,20 @@ export class LibraryModule extends Module {
       this._fileLeaf(el.closest('[data-key]')?.dataset.key, el.value);
       this._paint();
     }
+    if (el.dataset.action === 'file-house') {
+      const rec = this._fileById(el.dataset.id);
+      if (!rec) return;
+      rec.cabinetOf = el.value ? { type: 'house', id: el.value } : { type: 'library' };
+      this._saveCabinet();
+      this._paint();
+    }
+    if (el.dataset.action === 'file-public') {
+      const rec = this._fileById(el.dataset.id);
+      if (!rec) return;
+      rec.public = !!el.checked;
+      this._saveCabinet();
+      this._paint();
+    }
   }
 
   _refreshEntry(card, key) {
@@ -1818,9 +2478,9 @@ export class LibraryModule extends Module {
     card.outerHTML = this._leafHTML(leaf, { compact, peek });
   }
 
-  _dropSection(id) {
+  async _dropSection(id) {
     const section = this._section(id);
-    if (!section || !confirm(`Remove “${section.title}”? Its entries go back to Unsorted — nothing is deleted from any lorebook.`)) return;
+    if (!section || !await showtimeConfirm(`Remove “${section.title}”? Its entries go back to Unsorted — nothing is deleted from any lorebook.`, { title: 'REMOVE CUBBY', danger: true, confirmLabel: 'Remove' })) return;
     const st = this._db();
     if (this._focusSection === id) this._focusSection = '';
     st.sections = st.sections.filter(s => s.id !== id);
@@ -1838,10 +2498,10 @@ export class LibraryModule extends Module {
     this._paint();
   }
 
-  _editNote(key) {
+  async _editNote(key) {
     const leaf = this._leafByKey(key);
     if (!leaf) return;
-    const next = prompt('Shelf note — yours, never injected', leaf.note || '');
+    const next = await showtimePrompt('Shelf note — yours, never injected', { title: 'SHELF NOTE', defaultValue: leaf.note || '', confirmLabel: 'Save' });
     if (next == null) return;
     const st = this._db();
     if (leaf.kind === 'linked') {
@@ -1857,10 +2517,10 @@ export class LibraryModule extends Module {
     this._paint();
   }
 
-  _dropNative(key) {
+  async _dropNative(key) {
     const st = this._db();
     const rec = st.native.find(n => `native${SEP}${n.id}` === key);
-    if (!rec || !confirm(`Delete “${rec.title}”? This one is Library's own, so it is gone for good.`)) return;
+    if (!rec || !await showtimeConfirm(`Delete “${rec.title}”? This one is Library's own, so it is gone for good.`, { title: 'DELETE ENTRY', danger: true, confirmLabel: 'Delete' })) return;
     st.native = st.native.filter(n => n.id !== rec.id);
     this._openKeys.delete(key);
     this._invalidate();
@@ -1892,7 +2552,7 @@ export class LibraryModule extends Module {
 
   _parkDuplicateExtras() {
     const keys = this._selectedOrDupExtras();
-    if (!keys.length) { alert('No extras to park — flip on Duplicates and Pick extras first.'); return; }
+    if (!keys.length) { void showtimeAlert('No extras to park — flip on Duplicates and Pick extras first.', { title: 'DUPLICATES' }); return; }
     const cubby = this._duplicatesCubby();
     let moved = 0;
     let skippedNative = 0;
@@ -1907,14 +2567,14 @@ export class LibraryModule extends Module {
     this._invalidate();
     this._save();
     this._paint();
-    alert(`Parked ${moved} linked extra${moved === 1 ? '' : 's'} in “Duplicates”.${skippedNative ? ` ${skippedNative} Library-written copy/copies were left selected — use Delete Library copies for those.` : ''}`);
+    void showtimeAlert(`Parked ${moved} linked extra${moved === 1 ? '' : 's'} in “Duplicates”.${skippedNative ? ` ${skippedNative} Library-written copy/copies were left selected — use Delete Library copies for those.` : ''}`, { title: 'DUPLICATES' });
   }
 
   /** Hide linked extras from the shelf without touching World Info. */
   _dismissDuplicateExtras() {
     const keys = this._selectedOrDupExtras();
     if (!keys.length) {
-      alert('No extras to dismiss — open Duplicates, Pick extras, or select linked twins first.');
+      void showtimeAlert('No extras to dismiss — open Duplicates, Pick extras, or select linked twins first.', { title: 'DUPLICATES' });
       return;
     }
     const st = this._db();
@@ -1935,16 +2595,16 @@ export class LibraryModule extends Module {
     this._invalidate();
     this._save();
     this._paint();
-    alert(`Dismissed ${hid} linked extra${hid === 1 ? '' : 's'} from view.${skippedNative ? ` ${skippedNative} Library-written copy/copies were left — use Delete Library copies for those.` : ''} Use Dismissed (…) then select + click again to restore.` );
+    void showtimeAlert(`Dismissed ${hid} linked extra${hid === 1 ? '' : 's'} from view.${skippedNative ? ` ${skippedNative} Library-written copy/copies were left — use Delete Library copies for those.` : ''} Use Dismissed (…) then select + click again to restore.`, { title: 'DUPLICATES' });
   }
 
-  _bulkDeleteNatives() {
+  async _bulkDeleteNatives() {
     const keys = this._bulkKeys().filter(k => String(k).startsWith(`native${SEP}`));
     if (!keys.length) {
-      alert('Select Library-written (◆) copies only. Linked lorebook entries cannot be deleted from here.');
+      void showtimeAlert('Select Library-written (◆) copies only. Linked lorebook entries cannot be deleted from here.', { title: 'DELETE COPIES' });
       return;
     }
-    if (!confirm(`Permanently delete ${keys.length} Library-written entr${keys.length === 1 ? 'y' : 'ies'}? Lorebooks are not touched.`)) return;
+    if (!await showtimeConfirm(`Permanently delete ${keys.length} Library-written entr${keys.length === 1 ? 'y' : 'ies'}? Lorebooks are not touched.`, { title: 'DELETE COPIES', danger: true, confirmLabel: 'Delete' })) return;
     const st = this._db();
     const drop = new Set(keys.map(k => k.slice(`native${SEP}`.length)));
     st.native = (st.native || []).filter(n => !drop.has(n.id));
@@ -2032,7 +2692,7 @@ export class LibraryModule extends Module {
       openWorldInfoEditor(name);
     } catch (err) {
       console.error('[Library] open lorebook', err);
-      alert(`Could not open “${name}” in SillyTavern.`);
+      void showtimeAlert(`Could not open “${name}” in SillyTavern.`, { title: 'LIBRARY', danger: true });
     }
   }
 
@@ -2114,7 +2774,7 @@ export class LibraryModule extends Module {
     this._wireTagWrap(backdrop, tagWrap);
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const add = this._readTagWrap(tagWrap);
-      if (!add.length) { alert('Add at least one tag.'); return; }
+      if (!add.length) { void showtimeAlert('Add at least one tag.', { title: 'TAG' }); return; }
       for (const key of keys) {
         const leaf = this._leafByKey(key);
         if (leaf) this._setLeafTags(key, [...(leaf.tags ?? []), ...add]);
@@ -2187,7 +2847,7 @@ export class LibraryModule extends Module {
       </div>`);
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const title = backdrop.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('A name is required.'); return; }
+      if (!title) { void showtimeAlert('A name is required.', { title: 'CUBBY' }); return; }
       const patch = {
         title,
         icon: backdrop.querySelector('[data-field="icon"]').value.trim() || '◈',
@@ -2249,7 +2909,7 @@ export class LibraryModule extends Module {
     });
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const title = backdrop.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('A title is required.'); return; }
+      if (!title) { void showtimeAlert('A title is required.', { title: 'ENTRY' }); return; }
       const patch = {
         title,
         content: backdrop.querySelector('[data-field="content"]').value.trim(),
@@ -2447,7 +3107,7 @@ export class LibraryModule extends Module {
     inner.querySelector('[data-action="ok"]').addEventListener('click', () => {
       const type = typeSel.value;
       const values = readLocationTags(valueBox);
-      if (!values.length) { alert('Give it at least one value.'); return; }
+      if (!values.length) { void showtimeAlert('Give it at least one value.', { title: 'TAG' }); return; }
       const tagged = values.map(value => ({
         type,
         value: this._canonicalValueForType(type, value),
@@ -2461,7 +3121,7 @@ export class LibraryModule extends Module {
   _openConvertKeys(tagWrap, keys) {
     const list = this._uniqueNames(keys);
     if (!list.length) {
-      alert('This entry has no keys to convert.');
+      void showtimeAlert('This entry has no keys to convert.', { title: 'KEYS → TAGS' });
       return;
     }
     const types = this._tagTypes();
@@ -2500,7 +3160,7 @@ export class LibraryModule extends Module {
         value = this._canonicalValueForType(type, value);
         add.push({ type, value });
       }
-      if (!add.length) { alert('Pick at least one key.'); return; }
+      if (!add.length) { void showtimeAlert('Pick at least one key.', { title: 'KEYS → TAGS' }); return; }
       this._appendTagChips(tagWrap, add);
       inner.remove();
     });
@@ -2509,7 +3169,7 @@ export class LibraryModule extends Module {
   _openExtractFromScript(tagWrap, { mention = '', matchOnly = false } = {}) {
     const all = this._scriptTagCandidates();
     if (!all.length) {
-      alert('No Place, Person, Faction, Object, or Era tags found on Script cards.');
+      void showtimeAlert('No Place, Person, Faction, Object, or Era tags found on Script cards.', { title: 'FROM SCRIPT' });
       return;
     }
     const matched = mention ? this._scriptTagCandidates({ mention }) : all;
@@ -2558,7 +3218,7 @@ export class LibraryModule extends Module {
         type: el.dataset.type,
         value: el.dataset.value,
       }));
-      if (!add.length) { alert('Pick at least one tag.'); return; }
+      if (!add.length) { void showtimeAlert('Pick at least one tag.', { title: 'FROM SCRIPT' }); return; }
       this._appendTagChips(tagWrap, add);
       inner.remove();
     });
@@ -2569,7 +3229,7 @@ export class LibraryModule extends Module {
     if (!keys.length) return;
     const leaves = keys.map(k => this._leafByKey(k)).filter(l => l?.keys?.length);
     if (!leaves.length) {
-      alert('None of the picked entries have World Info keys.');
+      void showtimeAlert('None of the picked entries have World Info keys.', { title: 'KEYS → TAGS' });
       return;
     }
     const inner = this._modal(`
@@ -2593,7 +3253,7 @@ export class LibraryModule extends Module {
       }
       inner.remove();
       this._paint();
-      alert(n ? `Tagged ${n} ${n === 1 ? 'entry' : 'entries'} from their keys.` : 'Those tags were already present.');
+      void showtimeAlert(n ? `Tagged ${n} ${n === 1 ? 'entry' : 'entries'} from their keys.` : 'Those tags were already present.', { title: 'KEYS → TAGS' });
     });
   }
 
@@ -2602,7 +3262,7 @@ export class LibraryModule extends Module {
     if (!keys.length) return;
     const all = this._scriptTagCandidates();
     if (!all.length) {
-      alert('No Place, Person, Faction, Object, or Era tags found on Script cards.');
+      void showtimeAlert('No Place, Person, Faction, Object, or Era tags found on Script cards.', { title: 'FROM SCRIPT' });
       return;
     }
     const inner = this._modal(`
@@ -2657,7 +3317,7 @@ export class LibraryModule extends Module {
       }
       inner.remove();
       this._paint();
-      alert(n ? `Updated ${n} ${n === 1 ? 'entry' : 'entries'}.` : 'No new tags to add.');
+      void showtimeAlert(n ? `Updated ${n} ${n === 1 ? 'entry' : 'entries'}.` : 'No new tags to add.', { title: 'FROM SCRIPT' });
     });
   }
 
@@ -2669,7 +3329,7 @@ export class LibraryModule extends Module {
       <div class="lib-types" data-role="types">
         ${g.tagTypes.map(t => `
           <div class="lib-type-row" data-id="${esc(t.id)}">
-            <input type="color" data-field="color" value="${esc(/^#[0-9a-f]{6}$/i.test(t.color || '') ? t.color : '#8a6a3d')}">
+            <input type="color" data-field="color" value="${esc(/^#[00-9a-f]{6}$/i.test(t.color || '') ? t.color : '#8a6a3d')}">
             <input type="text" data-field="label" value="${esc(t.label)}">
             <button type="button" class="lib-icon danger" data-action="drop-type" title="Remove type">✕</button>
           </div>`).join('')}
@@ -2707,7 +3367,7 @@ export class LibraryModule extends Module {
         seen.add(id);
         next.push({ id, label, color: row.querySelector('[data-field="color"]').value });
       }
-      if (!next.length) { alert('Keep at least one tag type.'); return; }
+      if (!next.length) { void showtimeAlert('Keep at least one tag type.', { title: 'TAG TYPES' }); return; }
       g.tagTypes = next;
       this._saveG();
       backdrop.remove();
@@ -2740,12 +3400,48 @@ export class LibraryModule extends Module {
     });
   }
 
-  _modal(inner) {
+  _loreBodyHtml(content, { title = '' } = {}) {
+    const prepared = prepareLoreSource(content);
+    if (!prepared) return '';
+    let html = '';
+    if (looksLikeCompleteHtml(prepared)) {
+      html = prepared;
+    } else {
+      try { html = String(converter?.makeHtml?.(prepared) || ''); } catch { html = ''; }
+      if (!html.trim()) {
+        html = `<p>${esc(prepared).replace(/\n\n+/g, '</p><p>').replace(/\n/g, '<br>')}</p>`;
+      }
+    }
+    html = dropRedundantHeading(html, title);
+    html = stripLorebookChrome(html);
+    html = barRedactions(html);
+    const clean = sanitizeFileHtml(html);
+    const envs = extractFileEnvelopes(clean);
+    if (envs.length === 1 && /^<aside\b/i.test(clean.trim())) {
+      return String(envs[0].inner || '').trim();
+    }
+    return clean;
+  }
+
+  _modal(inner, { page = false } = {}) {
     const backdrop = document.createElement('div');
     backdrop.className = 'lib-modal-backdrop';
     const stacked = document.querySelectorAll('.lib-modal-backdrop').length;
     if (stacked) backdrop.style.zIndex = String(100000 + stacked * 10);
-    backdrop.innerHTML = `<div class="lib-modal">${inner}</div>`;
+    backdrop.innerHTML = `<div class="lib-modal${page ? ' lib-modal--page' : ''}">${inner}</div>`;
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      const all = [...document.querySelectorAll('.lib-modal-backdrop')];
+      if (all[all.length - 1] !== backdrop) return;
+      e.preventDefault();
+      backdrop.remove();
+    };
+    document.addEventListener('keydown', onKey);
+    const origRemove = backdrop.remove.bind(backdrop);
+    backdrop.remove = () => {
+      document.removeEventListener('keydown', onKey);
+      origRemove();
+    };
     document.body.appendChild(backdrop);
     backdrop.querySelector('[data-action="cancel"]')?.addEventListener('click', () => backdrop.remove());
     backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
@@ -2760,6 +3456,11 @@ export class LibraryModule extends Module {
       id: 'library.glossary',
       always: true,
       buildText: () => this._buildInjection(),
+    });
+    this.injector.register({
+      id: 'library.files',
+      always: true,
+      buildText: () => this._buildFileInjection(),
     });
   }
 
@@ -2804,6 +3505,13 @@ export class LibraryModule extends Module {
       return lines.join('\n');
     }).join('\n\n---\n\n');
   }
+
+  _buildFileInjection() {
+    const star = getStarMember(this.storage);
+    if (!star?.id) return '';
+    const bits = formatFileTidbits(filesKnownToCharacter(this.storage, star.id));
+    return bits ? `[Files known:\n${bits}]` : '';
+  }
 }
 
 function uid() {
@@ -2817,6 +3525,10 @@ function slug(text) {
 function clip(text, max) {
   const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
   return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+}
+
+function tidbitFromHtml(html) {
+  return clip(String(html || '').replace(/<[^>]+>/g, ' '), 180);
 }
 
 function esc(s) {

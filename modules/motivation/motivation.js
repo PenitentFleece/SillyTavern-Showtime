@@ -7,7 +7,7 @@ import { Module } from '../../lib/module.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
 import { leanQuietGenerate, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
 import { parseJsonObject } from '../../lib/jsonExtract.js';
-import { getCastMembers, getStarMember, PRIORITY_MAP, priorityMeta, resolveCastPromptIdentity, listPersonas, isFoilOrHigher, getDirectorRecord, normalizePlotHook, formatPlotHookLine } from '../../lib/castCatalog.js';
+import { getCastMembers, getStarMember, PRIORITY_MAP, priorityMeta, resolveInterviewCard, listPersonas, isFoilOrHigher, getDirectorRecord, normalizePlotHook, formatPlotHookLine } from '../../lib/castCatalog.js';
 import { getSceneCards, sceneLabel, creditedScenes } from '../../lib/scriptCatalog.js';
 import {
   knowerLabel,
@@ -15,6 +15,9 @@ import {
   setKnowerStance,
   knowerKey,
   smokeSecretRelationPure,
+  smokeCinemaLexiconPure,
+  CINEMA_PATTERNS,
+  extractCinemaLexicon,
   standingSubjects,
   standingToward,
   standingInfo,
@@ -29,10 +32,16 @@ import {
   houseAffiliateRoster,
   houseAffiliateIds,
 } from '../../lib/motivationCatalog.js';
-import { buildModal } from '../../lib/compass/dialogs.js';
+import { buildModal, showtimeAlert, showtimeConfirm } from '../../lib/compass/dialogs.js';
+import {
+  applySlateAchievement,
+  applySlateSecret,
+  resolveIntelSubject,
+} from '../../lib/intelBridge.js';
 import {
   pullBeatAsHook,
   syncHookFromBeat,
+  createHookFromEvent,
   markHookResolved,
   unlinkBeat,
 } from '../../lib/plotHookBridge.js';
@@ -48,7 +57,7 @@ const TIER_MAP = Object.fromEntries(TIERS.map(t => [t.id, t]));
 const REWARD_KINDS = [
   { id: 'achievement', label: 'Achievement', hint: 'Files an achievement. Can also grant an item or secret.' },
   { id: 'secret',      label: 'Reveal secret', hint: 'Flips a matching secret to Known (or files it).' },
-  { id: 'item',        label: 'Item',        hint: 'Adds the item to Inventory — On Person.' },
+  { id: 'item',        label: 'Item',        hint: 'On resolve: onto the assignee’s person, or the Star’s trunk.' },
   { id: 'bonus',       label: 'Bonus',       hint: 'A note on the beat — dynamic shift, new dynamic, leverage.' },
 ];
 const ITEM_CATS = ['consumable', 'wearable', 'usable', 'misc'];
@@ -73,9 +82,104 @@ const STATUS_MAP = Object.fromEntries(STATUSES.map(s => [s.id, s]));
 
 // Cheap pre-filter so the secrets sonar only pays for a quiet-prompt
 // classification call on messages that plausibly involve a secret changing
-// hands — mirrors Inventory's OFFER_CUE_RE gate.
-const SECRET_CUE_RE = /\b(reveals?|admits?|confess(?:es|ing)?|overhears?|eavesdrops?|finds?\s+out|discovers?|learns?|realizes?|blurts?|lets?\s+slip|spills?|catches?\s+(?:sight|a\s+glimpse)\s+of|stumbles?\s+(?:upon|across)|secretly|in\s+secret|it\s+turns?\s+out)\b/i;
+// hands — mirrors Inventory's OFFER_CUE_RE gate and includes Cinema Lexicon cues.
+const SECRET_CUE_RE = /\b(reveals?|admits?|confess(?:es|ing)?|overhears?|eavesdrops?|blurts?|lets?\s+slip|secretly|in\s+secret|it\s+turns?\s+out|off\s*the\s*record|not\s*in\s*the\s*script|unscripted|secret\s+unlocked?|classified\s+revealed|deleted\s*scene\s*found|easter\s*egg\s*discovered)\b|(?:classified|restricted|confidential|redacted|top\s*secret)\s+(?:script|footage|scene|ending|cut)|(?:deleted|alternate|extended|director['’]s\s*cut|behind\s*the\s*scenes|bloopers?)\s+(?:scene|take|footage|ending)|(?:easter\s*egg|hidden|secret|unlockable|bonus|post[-\s]credit)\s+(?:scene|track|footage|reveal)|(?:major|huge|plot)\s+(?:spoiler|twist|reveal)/i;
 const MAX_SONAR_PINGS = 5;
+
+/**
+ * Filing prompt for a Motivation audit. JSON beats only.
+ * Fresh trees are Opening, then Defy and Yield, then a crucible and a
+ * transformation on each fork. One parent per beat, so the forks do not join.
+ */
+export function buildMotivationAuditPrompt(c) {
+  const sourceBits = [
+    c.connectionBlock ? `Connections:\n${c.connectionBlock}` : '',
+    c.sceneBlock ? `Script cards:\n${c.sceneBlock}` : '',
+    c.hookBlock ? `Plot hooks:\n${c.hookBlock}` : '',
+  ].filter(Boolean).join('\n\n');
+  const extendNote = c.extendExisting
+    ? 'Build onto the existing arc. Do not restart a full three-act tree. Continue listed beats in the same Defy/Yield logic. A new beat may use a listed title as parent only when it clearly follows that beat; otherwise parent null. Do not repeat titles.'
+    : 'Start fresh. parent null only on the Opening. Do not parent new beats under existing ones.';
+  const directionBlock = c.direction ? `DIRECTION:\n${c.direction}\n` : '';
+  const cardNote = c.sceneBlock
+    ? 'When a script card was picked, name that card by its existing code and title inside the description. Do not invent a card id.'
+    : 'No script cards were picked. The description says what scene should later be filed. Do not invent a card id.';
+  return `SYSTEM: Return JSON only. Do not roleplay. Do not write a BEAT: prose block.
+
+Task: a large-scale character arc for the card below. One parent per beat. Defy and Yield cannot merge into one node.
+${extendNote}
+
+Fresh shape, about seven beats, when not extending:
+- Opening: parent null, branch "". Current want and what disrupts it. theme "Opening". One reward: a minor secret, or a secret that re-reads a picked connection.
+- Arc 1: two children of Opening. branch "Defy" or "Yield". theme matches the branch. Defy costs support or safety. Yield costs autonomy. Both are valid. Each gets a notable achievement named for that path, plus a secret. An item may ride as an achievement offer.
+- Crucible: one child on each fork, not a shared join. theme "Crucible". The consequence of that choice. A major achievement and a secret. An item offer when a physical token fits.
+- Transformation: one child on each crucible. theme "Transformation". The description calls back to the Opening. Capstone reward is a pivotal achievement.
+
+${cardNote}
+description is two or three sentences: what happens, what is sacrificed, and what is lost if the beat is ignored. Title is the beat name.
+
+Rewards kind: achievement|secret|item|bonus. tier: trivial|minor|notable|major|pivotal. item category: consumable|wearable|usable|misc. 1–3 rewards per beat. Later beats carry the heavier payload. Achievement offers: 0–2 item or secret objects.
+
+${directionBlock}CHARACTER:
+${c.cardBlock}
+Billing: ${PRIORITY_MAP[c.priority]?.label ?? c.priority}
+
+Secrets:
+${c.secrets}
+
+Achievements:
+${c.achievements}
+
+${sourceBits}
+
+Existing beats (do not repeat titles):
+${c.existing}
+
+Schema example (Yield still needs its own Crucible and Transformation, same shape as Defy):
+{"beats":[{"id":"1","parent":null,"branch":"","title":"The want","description":"What they want, what disrupts it, and what is lost if this is ignored.","theme":"Opening","rewards":[{"kind":"secret","title":"The unpaid debt","tier":"minor","description":"A fact that re-reads a connection."}]},{"id":"2","parent":"1","branch":"Defy","title":"The refusal","description":"They reject the demand and lose a supporter. If ignored, the demand hardens.","theme":"Defy","rewards":[{"kind":"achievement","title":"The Defiant","tier":"notable","description":"They chose isolation over compliance.","offers":[{"kind":"item","title":"Torn seal","description":"The broken token of the pact.","category":"misc"}]},{"kind":"secret","title":"Who ordered it","tier":"notable","description":"The name behind the demand."}]},{"id":"3","parent":"1","branch":"Yield","title":"The pact","description":"They accept the terms and give up a freedom. If ignored, the ally walks.","theme":"Yield","rewards":[{"kind":"achievement","title":"The Kept Pact","tier":"notable","description":"They chose harmony over self.","offers":[]},{"kind":"secret","title":"The clause","tier":"notable","description":"What the agreement actually costs."}]},{"id":"4","parent":"2","branch":"Defy","title":"The cost","description":"The refusal comes due. If ignored, the isolation becomes permanent.","theme":"Crucible","rewards":[{"kind":"achievement","title":"Standing Alone","tier":"major","description":"The price of the refusal."},{"kind":"secret","title":"What was protected","tier":"major","description":"Who the refusal actually saved."}]},{"id":"5","parent":"4","branch":"Defy","title":"The other name","description":"They are no longer who the Opening described. If ignored, the old name sticks.","theme":"Transformation","rewards":[{"kind":"achievement","title":"Named Anew","tier":"pivotal","description":"How others see them has changed."}]}]}`;
+}
+
+/** Compiled cast (played on the Director card) informs the audit without that card's text. */
+export function smokeMotivationAuditPromptPure() {
+  const directorDesc = 'DIRECTOR-CARD-VOICE-TELLER-ONLY';
+  const summary = 'COMPILED-CAST-SUMMARY';
+  const characters = [
+    { avatar: 'teller.png', name: 'Teller', description: directorDesc, personality: 'narrates', scenario: 'the desk' },
+  ];
+  const cast = [
+    { id: 'dir', name: 'Teller', priority: 'director', characterCardId: 'teller.png', description: directorDesc },
+    { id: 'played', name: 'Yokumiru', priority: 'foil', characterCardId: 'teller.png', summary },
+  ];
+  const storage = {
+    getChat(id, fallback = {}) {
+      if (id === 'cast') return { characters: cast };
+      return fallback;
+    },
+  };
+  const voice = resolveInterviewCard(storage, cast[1], { characters });
+  if (voice.kind !== 'compiled') return 'audit voice should compile a director-card cast member';
+  if (!voice.text.includes(summary)) return 'compiled voice missing summary';
+  if (voice.text.includes(directorDesc)) return 'compiled voice included the director card';
+  const prompt = buildMotivationAuditPrompt({
+    cardBlock: voice.text,
+    secrets: 'None recorded.',
+    achievements: 'None recorded.',
+    sceneBlock: '',
+    connectionBlock: '',
+    hookBlock: '',
+    existing: 'None yet.',
+    direction: '',
+    extendExisting: false,
+    priority: 'foil',
+  });
+  if (!prompt.includes(summary)) return 'audit prompt missing compiled summary';
+  if (prompt.includes(directorDesc)) return 'audit prompt included the director card';
+  if (!prompt.includes('Defy') || !prompt.includes('Yield')) return 'audit prompt missing Defy/Yield';
+  if (!prompt.includes('Opening') || !prompt.includes('Crucible') || !prompt.includes('Transformation')) {
+    return 'audit prompt missing arc positions';
+  }
+  return '';
+}
 
 export class MotivationModule extends Module {
   static id = 'motivation';
@@ -98,35 +202,48 @@ export class MotivationModule extends Module {
     this._knowModal = null;
     const relationSmoke = smokeSecretRelationPure();
     if (relationSmoke) console.warn('[Motivation] secret relation invariant:', relationSmoke);
+    const lexiconSmoke = smokeCinemaLexiconPure();
+    if (lexiconSmoke) console.warn('[Motivation] cinema lexicon invariant:', lexiconSmoke);
+    const auditSmoke = smokeMotivationAuditPromptPure();
+    if (auditSmoke) console.warn('[Motivation] audit prompt:', auditSmoke);
     this.bus?.on('cast.updated', () => {
       if (this.container) this.render(this.container);
+    });
+    this.bus?.on('motivation.sceneResolved', (payload) => {
+      this._onSceneLinked(payload?.characterId, payload?.stepId);
+    });
+    this.bus?.on('motivation.sceneCleared', (payload) => {
+      this._onSceneCleared(payload?.characterId, payload?.stepId);
+    });
+    this.bus?.on('motivation.slateResolved', (payload) => {
+      this._onSlateResolved(payload?.characterId, payload?.stepId);
+    });
+    this.bus?.on('motivation.slateFailed', (payload) => {
+      this._onSlateFailed(payload?.characterId, payload?.stepId);
     });
     if (!this._sonarBound) {
       this._sonarBound = true;
       this._lastSonarScanLen = -1;
+      // SillyTavern awaits every listener here before it hides the typing
+      // indicator and unlocks Send. The sonar calls a model. Cue send is
+      // also holding the connection-profile gate until that same generation
+      // returns — so awaiting the sonar from this listener deadlocks the
+      // unlock (the reply is already on screen, "…is typing" never clears).
       eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => {
         const chatLen = (getContext().chat ?? []).length;
         if (chatLen === this._lastSonarScanLen) return;
         this._lastSonarScanLen = chatLen;
-        this._ensureSonar();
-        void this._scanSecretsSonar();
-        const pol = this._motivationPolicy();
-        if (pol.enabled !== false && pol.achievementsSonar !== false) {
-          this.state.sonar.msgSinceCheck = (this.state.sonar.msgSinceCheck || 0) + 1;
-          if (this.state.sonar.msgSinceCheck >= (pol.scanEveryN || 6)) {
-            this.state.sonar.msgSinceCheck = 0;
-            this.saveState();
-            void this._scanAchievementsSonar();
-          } else {
-            this.saveState();
-          }
-        }
+        clearTimeout(this._sonarAfterTimer);
+        this._sonarAfterTimer = setTimeout(() => {
+          this._sonarAfterTimer = null;
+          void this._runDeferredSonar();
+        }, 0);
       });
     }
   }
 
   getDefaultState() {
-    return { selectedId: '', perChar: {}, sonar: { secretPings: [], beatPings: [], msgSinceCheck: 0 } };
+    return { selectedId: '', perChar: {}, sonar: { secretPings: [], beatPings: [], msgSinceCheck: 0, lastCinemaFp: '' } };
   }
 
   _ensureSonar() {
@@ -135,6 +252,7 @@ export class MotivationModule extends Module {
     if (!Array.isArray(s.sonar.secretPings)) s.sonar.secretPings = [];
     if (!Array.isArray(s.sonar.beatPings)) s.sonar.beatPings = [];
     if (!Number.isFinite(s.sonar.msgSinceCheck)) s.sonar.msgSinceCheck = 0;
+    if (typeof s.sonar.lastCinemaFp !== 'string') s.sonar.lastCinemaFp = '';
     return s.sonar;
   }
 
@@ -158,11 +276,36 @@ export class MotivationModule extends Module {
     // Reset scan cursor / in-flight flags so a new chat isn't skipped when
     // its length happens to match the previous chat's, and so a quiet prompt
     // that finishes after a switch can't write into the wrong metadata.
+    clearTimeout(this._sonarAfterTimer);
+    this._sonarAfterTimer = null;
     this._lastSonarScanLen = -1;
     this._sonarSecretsBusy = false;
     this._sonarBeatsBusy = false;
     this._auditCancelled = true;
-    if (this.container) await this.render(this.container);
+  }
+
+  /** Post-render sonar, off the generation event so Send can unlock first. */
+  async _runDeferredSonar() {
+    this._ensureSonar();
+    const lex = this._scanCinemaExtractions();
+    if (!lex?.secrets?.length) {
+      await this._scanSecretsSonar();
+    }
+    const pol = this._motivationPolicy();
+    if (pol.enabled !== false && pol.achievementsSonar !== false) {
+      const fuzzyBeatCue = !!(
+        !lex?.achievements?.length
+        && (lex?.flags?.isAchievement || lex?.flags?.beatAchievementUnlock || lex?.flags?.beatSecretUnlock)
+      );
+      this.state.sonar.msgSinceCheck = (this.state.sonar.msgSinceCheck || 0) + 1;
+      if (fuzzyBeatCue || this.state.sonar.msgSinceCheck >= (pol.scanEveryN || 6)) {
+        this.state.sonar.msgSinceCheck = 0;
+        this.saveState();
+        await this._scanAchievementsSonar();
+      } else {
+        this.saveState();
+      }
+    }
   }
 
   /** Switch to the Backstage "Motivation" connection profile for quiet LLM work. */
@@ -243,7 +386,15 @@ export class MotivationModule extends Module {
     if (!STATUS_MAP[x.status]) {
       x.status = x.known ? 'earned' : 'unknown';
     }
-    if (!secret) x.known = x.status !== 'unknown';
+    if (!secret) {
+      x.known = x.status !== 'unknown';
+      x.hidden = !!x.hidden;
+      x.unlocked = typeof x.unlocked === 'string' ? x.unlocked : '';
+    } else {
+      x.channel = x.channel === 'rumor' ? 'rumor' : 'fact';
+      x.repFrom = typeof x.repFrom === 'string' ? x.repFrom : '';
+      x.repTo = typeof x.repTo === 'string' ? x.repTo : '';
+    }
   }
 
   _sceneOptionsHTML(sceneUid) {
@@ -572,6 +723,8 @@ export class MotivationModule extends Module {
         <div class="mot-card-body">
           <div class="mot-card-row">
             <span class="mot-card-title">${esc(x.title || 'Untitled')}</span>
+            ${isSecret && x.channel === 'rumor' ? '<span class="mot-badge mot-badge-rumor">Rumor</span>' : ''}
+            ${!isSecret && x.hidden ? '<span class="mot-badge mot-badge-skull" title="Hidden feat">💀</span>' : ''}
             <span class="mot-card-tier" style="background:${tier.color}">${esc(tier.label)}</span>
             ${heard ? '' : this._statusSelectHTML(x)}
             ${isSecret
@@ -684,8 +837,8 @@ export class MotivationModule extends Module {
     const parent = step.parentId ? (cs.steps ?? []).find(s => s.id === step.parentId) : null;
     const blocked = parent && !parent.unlocked;
     const gate = this._gateEval(cs, step);
-    const canUnlock = !!step.sceneUid && !blocked && gate.open;
-    const sealed = gate.sealed && !step.unlocked;
+    const canUnlock = !!step.sceneUid && !blocked && gate.open && !step.failed;
+    const sealed = gate.sealed && !step.unlocked && !step.failed;
     const rewards = (step.rewards ?? []).map(r => {
       const tier = TIER_MAP[r.tier];
       return `<span class="mot-reward mot-reward--${esc(r.kind)}">${esc(labelForReward(r))}${tier ? ` · ${esc(tier.label)}` : ''}</span>`;
@@ -697,10 +850,10 @@ export class MotivationModule extends Module {
           `<span class="mot-gate${c.met ? ' met' : ''}">${c.met ? '✓' : '✗'} ${esc(c.label)}</span>`).join('')}
       </div>` : '';
     return `
-      <article class="mot-step${focused ? ' on' : ''}${step.unlocked ? ' unlocked' : ''}${blocked ? ' blocked' : ''}${sealed ? ' sealed' : ''}${!gate.open && !step.unlocked ? ' gated' : ''}"
+      <article class="mot-step${focused ? ' on' : ''}${step.unlocked ? ' unlocked' : ''}${step.failed ? ' failed' : ''}${blocked ? ' blocked' : ''}${sealed ? ' sealed' : ''}${!gate.open && !step.unlocked && !step.failed ? ' gated' : ''}"
         data-id="${esc(step.id)}" title="${focused ? '' : (sealed ? 'Sealed until its conditions are met' : esc(step.title || 'Untitled beat'))}">
         <div class="mot-step-row">
-          <span class="mot-step-dot">${step.unlocked ? '◆' : (sealed ? '▮' : '◇')}</span>
+          <span class="mot-step-dot">${step.failed ? '✕' : (step.unlocked ? '◆' : (sealed ? '▮' : '◇'))}</span>
           <div class="mot-step-title">
             ${sealed && !focused
               ? `<span class="mot-redact">▬▬▬ ▬▬▬▬ ▬▬</span>`
@@ -717,14 +870,17 @@ export class MotivationModule extends Module {
             ${scene ? esc(scene) : '⚭ Link a scene'}
           </button>
           <div class="mot-step-actions">
-            <button type="button" class="mot-btn small${step.unlocked ? ' gold' : ''}" data-action="toggle-step"
-              ${canUnlock || step.unlocked ? '' : 'disabled'}
-              title="${step.unlocked
+            <button type="button" class="mot-btn small${step.unlocked ? ' gold' : ''}${step.failed ? ' danger' : ''}" data-action="toggle-step"
+              ${step.failed || canUnlock || step.unlocked ? '' : 'disabled'}
+              ${step.failed ? 'disabled' : ''}
+              title="${step.failed
+                ? 'This beat failed — it stays on the board without rewards'
+                : (step.unlocked
                 ? 'Re-lock and withdraw its rewards'
                 : (blocked ? 'Unlock the beat before this one first'
                   : (!gate.open ? 'Conditions are not met yet'
-                    : (step.sceneUid ? 'Unlock and apply rewards' : 'Link a scene card first')))}">
-              ${step.unlocked ? 'Unlocked' : (gate.open ? 'Locked' : 'Blocked')}
+                    : (step.sceneUid ? 'Resolve this beat and collect rewards' : 'Link a scene card first'))))}">
+              ${step.failed ? 'Failed' : (step.unlocked ? 'Resolved' : (gate.open ? 'Locked' : 'Blocked'))}
             </button>
             <button type="button" class="mot-btn small${step.hookId ? ' gold' : ''}" data-action="to-hook"
               title="${step.hookId ? 'Already a Director plot hook — click to refresh it' : 'Add this beat as a Director plot hook'}">
@@ -736,7 +892,8 @@ export class MotivationModule extends Module {
         : `<div class="mot-step-tags">
             ${sealed
               ? `<span class="mot-step-tag seal">Sealed · ${gate.unmet.length} condition${gate.unmet.length === 1 ? '' : 's'}</span>`
-              : `${scene ? `<span class="mot-step-tag on">${esc(scene)}</span>` : `<span class="mot-step-tag">No scene</span>`}
+              : `${step.failed ? `<span class="mot-step-tag block">Failed</span>` : ''}
+                 ${scene ? `<span class="mot-step-tag on">${esc(scene)}</span>` : `<span class="mot-step-tag">No scene</span>`}
                  ${rewardCount ? `<span class="mot-step-tag">${rewardCount} reward${rewardCount === 1 ? '' : 's'}</span>` : ''}
                  ${gate.rules.length ? `<span class="mot-step-tag${gate.open ? ' on' : ' block'}">${gate.open ? 'Conditions met' : `${gate.unmet.length} blocked`}</span>` : ''}`}
           </div>`}
@@ -847,19 +1004,19 @@ export class MotivationModule extends Module {
         const x = (cs[kind] ?? []).find(y => y.id === id);
         if (x) this._openCardEditor(cs, kind, x);
       });
-      card.querySelector('[data-action="drop-card"]')?.addEventListener('click', () => {
+      card.querySelector('[data-action="drop-card"]')?.addEventListener('click', async () => {
         if (kind === 'interviews' || card.dataset.heard) return;
         const x = (cs[kind] ?? []).find(y => y.id === id);
-        if (!x || !confirm(`Remove “${x.title}”?`)) return;
+        if (!x || !await showtimeConfirm(`Remove “${x.title}”?`, { title: 'REMOVE CARD', danger: true, confirmLabel: 'Remove' })) return;
         cs[kind] = cs[kind].filter(y => y.id !== id);
         if (this._focusedCard?.[kind] === id) this._focusedCard[kind] = '';
         this.saveState();
         this.bus.emit('motivation.updated', { characterId: this.state.selectedId });
         this.render(this.container);
       });
-      card.querySelector('[data-action="drop-interview"]')?.addEventListener('click', e => {
+      card.querySelector('[data-action="drop-interview"]')?.addEventListener('click', async e => {
         e.stopPropagation();
-        if (!confirm('Remove this filed interview?')) return;
+        if (!await showtimeConfirm('Remove this filed interview?', { title: 'REMOVE INTERVIEW', danger: true, confirmLabel: 'Remove' })) return;
         let found = false;
         for (const row of Object.values(this.state.perChar || {})) {
           if (!Array.isArray(row.interviews)) continue;
@@ -875,8 +1032,8 @@ export class MotivationModule extends Module {
       });
     });
     root.querySelector('[data-action="add-step"]')?.addEventListener('click', () => this._openStepEditor(cs, null));
-    root.querySelector('[data-action="clear-path"]')?.addEventListener('click', () => {
-      if (!confirm('Remove every beat on this arc? Secrets and achievements stay.')) return;
+    root.querySelector('[data-action="clear-path"]')?.addEventListener('click', async () => {
+      if (!await showtimeConfirm('Remove every beat on this arc? Secrets and achievements stay.', { title: 'CLEAR ARC', danger: true, confirmLabel: 'Clear' })) return;
       let hooked = false;
       for (const step of cs.steps ?? []) {
         if (unlinkBeat(this.storage, step)) hooked = true;
@@ -903,9 +1060,9 @@ export class MotivationModule extends Module {
         const step = (cs.steps ?? []).find(s => s.id === id);
         if (step) this._openStepEditor(cs, step);
       });
-      el.querySelector('[data-action="drop-step"]')?.addEventListener('click', () => {
+      el.querySelector('[data-action="drop-step"]')?.addEventListener('click', async () => {
         const step = (cs.steps ?? []).find(s => s.id === id);
-        if (!step || !confirm(`Remove “${step.title}”? Beats branching from it move up a level.`)) return;
+        if (!step || !await showtimeConfirm(`Remove “${step.title}”? Beats branching from it move up a level.`, { title: 'REMOVE BEAT', danger: true, confirmLabel: 'Remove' })) return;
         for (const child of cs.steps.filter(s => s.parentId === id)) child.parentId = step.parentId ?? null;
         if (step.unlocked) this._withdrawRewards(cs, step);
         const hooked = unlinkBeat(this.storage, step);
@@ -985,6 +1142,7 @@ export class MotivationModule extends Module {
   _toggleStep(cs, id) {
     const step = (cs.steps ?? []).find(s => s.id === id);
     if (!step) return;
+    if (step.failed) return;
     if (step.unlocked) {
       step.unlocked = false;
       step.unlockedAt = 0;
@@ -1001,30 +1159,193 @@ export class MotivationModule extends Module {
       return;
     }
     if (!step.sceneUid) {
-      alert('Connect a scene card first — beats unlock against a place on the Script.');
+      void showtimeAlert('Connect a scene card first — beats unlock against a place on the Script.', { title: 'MOTIVATION BEAT' });
       return;
     }
     const parent = step.parentId ? cs.steps.find(s => s.id === step.parentId) : null;
     if (parent && !parent.unlocked) {
-      alert(`Unlock “${parent.title}” first.`);
+      void showtimeAlert(`Unlock “${parent.title}” first.`, { title: 'MOTIVATION BEAT' });
       return;
     }
     const gate = this._gateEval(cs, step);
     if (!gate.open) {
-      alert(`This path is blocked:\n\n${gate.unmet.map(u => `• ${u.label}`).join('\n')}`);
+      void showtimeAlert(`This path is blocked:\n\n${gate.unmet.map(u => `• ${u.label}`).join('\n')}`, { title: 'MOTIVATION GATE' });
       return;
     }
-    this._unlockStep(cs, step, this.state.selectedId);
-    this.render(this.container);
+    this._offerBeatResolve(this.state.selectedId, step);
   }
 
   /** Mechanical unlock (no UI guards/alerts) — shared by the toggle button and the narrative sonar. */
-  _unlockStep(cs, step, characterId = null) {
+  _unlockStep(cs, step, characterId = null, { skipItems = false } = {}) {
+    if (!step || step.failed) return;
     step.unlocked = true;
     step.unlockedAt = Date.now();
-    this._applyRewards(cs, step, characterId || this.state.selectedId);
+    this._applyRewards(cs, step, characterId || this.state.selectedId, { skipItems });
     this._markHookResolved(step, true);
     this.saveState();
+  }
+
+  _itemRewardsOf(step) {
+    const out = [];
+    for (const r of step?.rewards ?? []) {
+      if (r?.kind === 'item') out.push(r);
+      if (r?.kind === 'achievement') {
+        for (const o of r.offers ?? []) {
+          if (o?.kind === 'item') out.push(o);
+        }
+      }
+    }
+    return out;
+  }
+
+  _onSceneLinked(characterId, stepId) {
+    if (!characterId || !stepId) return;
+    const cs = this._charState(characterId);
+    const step = (cs.steps ?? []).find(s => s.id === stepId);
+    if (!step?.sceneUid) return;
+    this._offerBeatResolve(characterId, step);
+  }
+
+  _onSceneCleared(characterId, stepId) {
+    if (!characterId || !stepId) return;
+    const cs = this._charState(characterId);
+    const step = (cs.steps ?? []).find(s => s.id === stepId);
+    if (!step) return;
+    step.sceneUid = '';
+    if (step.unlocked) {
+      step.unlocked = false;
+      step.unlockedAt = 0;
+      this._withdrawRewards(cs, step);
+      this._markHookResolved(step, false);
+    }
+    this.saveState();
+    if (this.container) this.render(this.container);
+  }
+
+  /**
+   * Linking a scene resolves the beat: lock it in (unlock + hook inactive)
+   * and collect rewards. Item dest is chosen in a popup; achievements file
+   * on this character automatically.
+   */
+  _offerBeatResolve(characterId, step) {
+    if (!step || step.unlocked || step.failed) return;
+    const cs = this._charState(characterId);
+    if (!cs) return;
+    const items = this._itemRewardsOf(step);
+    if (!items.length) {
+      this._unlockStep(cs, step, characterId);
+      if (this.container) this.render(this.container);
+      return;
+    }
+    if (this.container) this.render(this.container);
+    this._openRewardCollect(cs, step, characterId, items);
+  }
+
+  _onSlateResolved(characterId, stepId) {
+    if (!characterId || !stepId) return;
+    const cs = this._charState(characterId);
+    const step = (cs.steps ?? []).find(s => s.id === stepId);
+    if (!step || step.unlocked || step.failed) return;
+    const member = this._castRecord(characterId);
+    this.bus?.emit('showtime.notice', {
+      kind: 'motivation',
+      items: [{
+        text: `Beat · ${member?.name || 'Cast'} · ${step.title || 'Resolved'}`,
+        mark: '★',
+        characterId,
+      }],
+    });
+    const prior = this.state.selectedId;
+    this.state.selectedId = characterId;
+    this._offerBeatResolve(characterId, step);
+    this.state.selectedId = prior;
+  }
+
+  _onSlateFailed(characterId, stepId) {
+    if (!characterId || !stepId) return;
+    const cs = this._charState(characterId);
+    const step = (cs.steps ?? []).find(s => s.id === stepId);
+    if (!step || step.failed) return;
+    if (step.unlocked) {
+      this._withdrawRewards(cs, step);
+      step.unlocked = false;
+      step.unlockedAt = 0;
+    }
+    step.failed = true;
+    step.failedAt = Date.now();
+    this._markHookResolved(step, true);
+    this.saveState();
+    const member = this._castRecord(characterId);
+    this.bus?.emit('showtime.notice', {
+      kind: 'motivation',
+      items: [{
+        text: `Beat failed · ${member?.name || 'Cast'} · ${step.title || 'Beat'}`,
+        mark: 'X',
+        characterId,
+      }],
+    });
+    if (this.container) this.render(this.container);
+  }
+
+  _openRewardCollect(cs, step, characterId, items) {
+    const member = this._castRecord(characterId) || getCastMembers(this.storage).find(m => m.id === characterId);
+    const star = getStarMember(this.storage);
+    const isStar = !!(star && characterId === star.id) || member?.priority === 'star';
+    const who = member?.name || 'this character';
+    const scene = step.sceneUid ? sceneLabel(this.storage, step.sceneUid) : '';
+    const autoRows = (step.rewards ?? []).flatMap((r) => {
+      const rows = [];
+      if (r.kind === 'achievement') {
+        rows.push(`<div class="mot-collect-row"><span class="mot-reward mot-reward--achievement">Achievement: ${esc(r.title)}</span><span class="mot-hint">Filed on ${esc(who)}</span></div>`);
+      }
+      if (r.kind === 'secret') {
+        rows.push(`<div class="mot-collect-row"><span class="mot-reward mot-reward--secret">Secret: ${esc(r.title)}</span><span class="mot-hint">Revealed</span></div>`);
+      }
+      if (r.kind === 'bonus') {
+        rows.push(`<div class="mot-collect-row"><span class="mot-reward mot-reward--bonus">Bonus: ${esc(r.title)}</span><span class="mot-hint">Noted</span></div>`);
+      }
+      for (const o of r.offers ?? []) {
+        if (o.kind === 'secret') {
+          rows.push(`<div class="mot-collect-row"><span class="mot-reward mot-reward--secret">Secret: ${esc(o.title)}</span><span class="mot-hint">Revealed</span></div>`);
+        }
+      }
+      return rows;
+    }).join('');
+    const itemRows = items.map((r, i) => {
+      const dest = isStar
+        ? `<label class="mot-dest"><input type="radio" name="dest-${i}" value="person" checked> On person</label>
+           <label class="mot-dest"><input type="radio" name="dest-${i}" value="trunk"> Trunk</label>`
+        : `<span class="mot-hint">On ${esc(who)}’s person</span>`;
+      return `<div class="mot-collect-row" data-item-idx="${i}">
+        <span class="mot-reward mot-reward--item">Item: ${esc(r.title)}</span>
+        <div class="mot-dest-row">${dest}</div>
+      </div>`;
+    }).join('');
+    const backdrop = this._modal(`
+      <div class="mot-modal-title">REWARDS</div>
+      <div class="mot-modal-sub">— ${esc(step.title || 'Untitled beat')} —</div>
+      ${scene ? `<div class="mot-hint">Resolved against ${esc(scene)}.</div>` : ''}
+      ${autoRows || itemRows ? `<div class="mot-collect-list">${autoRows}${itemRows}</div>` : '<div class="mot-hint">No rewards on this beat.</div>'}
+      <div class="mot-modal-actions">
+        <button type="button" class="mot-btn" data-action="cancel">Later</button>
+        <button type="button" class="mot-btn gold" data-action="ok">Collect</button>
+      </div>
+    `);
+    backdrop.querySelector('[data-action="ok"]').addEventListener('click', () => {
+      const dests = items.map((_, i) => {
+        if (!isStar) return 'person';
+        const picked = backdrop.querySelector(`input[name="dest-${i}"]:checked`);
+        return picked?.value === 'trunk' ? 'trunk' : 'person';
+      });
+      this._unlockStep(cs, step, characterId, { skipItems: true });
+      items.forEach((r, i) => {
+        const title = String(r.title || r.name || '').trim();
+        if (title) this._grantItem(step, r, title, { dest: dests[i], characterId });
+      });
+      this.saveState();
+      backdrop.remove();
+      if (this.container) this.render(this.container);
+    });
   }
 
   _markHookResolved(step, resolved) {
@@ -1040,7 +1361,7 @@ export class MotivationModule extends Module {
   _sendBeatToHook(characterId, step) {
     const out = pullBeatAsHook(this.storage, characterId, step);
     if (out.reason === 'no-director') {
-      alert('Cast a Director first — plot hooks live on their sheet.');
+      void showtimeAlert('Cast a Director first — plot hooks live on their sheet.', { title: 'PLOT HOOK' });
       return;
     }
     this.saveState();
@@ -1098,6 +1419,215 @@ export class MotivationModule extends Module {
     return normalizeKnownBy(out);
   }
 
+  /** Resolve a foil-or-higher cast member from a turn message or extracted line. */
+  _resolveCinemaOwner(mes, lineText = '') {
+    const members = this._members();
+    if (!members.length) return null;
+    const text = String(lineText || '').trim();
+    if (text) {
+      for (const m of members) {
+        const nm = String(m.name || '').trim();
+        if (nm && new RegExp(`\\b${nm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)) {
+          return m;
+        }
+      }
+    }
+    const speaker = String(mes?.name || '').trim();
+    if (speaker) {
+      const sub = resolveIntelSubject(this.storage, speaker);
+      if (sub?.type === 'cast') {
+        const hit = members.find(m => m.id === sub.id);
+        if (hit) return hit;
+      }
+    }
+    return this._selected() || getStarMember(this.storage) || members[0];
+  }
+
+  /**
+   * Deterministic auto-filing of explicit Cinema Lexicon extractions
+   * (`Classified scene: ...`, `Awarded: ...`, `Plot hook: ...`) on the latest turn.
+   * Returns the `extractCinemaLexicon` result for downstream sonar gating.
+   */
+  _scanCinemaExtractions() {
+    const pol = this._motivationPolicy();
+    if (pol.enabled === false) return null;
+    const chat = getContext().chat ?? [];
+    let mes = null;
+    let mesIdx = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+      const m = chat[i];
+      if (!m || m.is_system) continue;
+      mes = m;
+      mesIdx = i;
+      break;
+    }
+    const raw = String(mes?.mes || '');
+    if (!raw.trim()) return null;
+    const lex = extractCinemaLexicon(raw);
+    const hasExtractions = lex.secrets.length > 0 || lex.achievements.length > 0 || lex.hooks.length > 0;
+    if (!hasExtractions) return lex;
+
+    const fp = `${mesIdx}:${JSON.stringify([lex.secrets, lex.achievements, lex.hooks])}`;
+    const sonar = this._ensureSonar();
+    if (sonar.lastCinemaFp === fp) return lex;
+    sonar.lastCinemaFp = fp;
+
+    const star = getStarMember(this.storage);
+    const noticeItems = [];
+    let motChanged = false;
+    let castChanged = false;
+
+    for (const secText of lex.secrets) {
+      const owner = this._resolveCinemaOwner(mes, secText);
+      if (!owner?.id) continue;
+      this._charState(owner.id);
+      const out = applySlateSecret(this.storage, {
+        ownerId: owner.id,
+        tier: 'notable',
+        context: secText,
+        knowers: star?.name ? [star.name] : [],
+      });
+      if (out?.ok && out.secret) {
+        motChanged = true;
+        noticeItems.push({
+          text: `Secret · ${owner.name || 'Cast'} · ${out.secret.title}`,
+          mark: '?',
+          characterId: owner.id,
+        });
+      }
+    }
+
+    for (const achText of lex.achievements) {
+      const owner = this._resolveCinemaOwner(mes, achText);
+      if (!owner?.id) continue;
+      this._charState(owner.id);
+      const title = achText.split(/[—–-]\s+/)[0].trim().slice(0, 80) || achText.slice(0, 80);
+      const out = applySlateAchievement(this.storage, {
+        ownerId: owner.id,
+        tier: 'notable',
+        title,
+        description: achText,
+        unlocked: 'Earned in scene',
+      });
+      if (out?.ok && out.achievement) {
+        motChanged = true;
+        noticeItems.push({
+          text: `Achievement · ${owner.name || 'Cast'} · ${out.achievement.title}`,
+          mark: '★',
+          characterId: owner.id,
+        });
+      }
+    }
+
+    for (const hookText of lex.hooks) {
+      const owner = this._resolveCinemaOwner(mes, hookText);
+      const out = createHookFromEvent(this.storage, {
+        name: hookText.slice(0, 80),
+        description: hookText,
+        assignedTo: owner?.id || '',
+      });
+      if (out?.hooked && out.hook) {
+        castChanged = true;
+        noticeItems.push({
+          text: `Plot hook · ${out.hook.name}`,
+          mark: '!',
+          characterId: owner?.id || '',
+        });
+      }
+    }
+
+    this.saveState();
+    if (motChanged) this.bus?.emit('motivation.updated', { characterId: this.state.selectedId });
+    if (castChanged) this.bus?.emit('cast.updated', {});
+    if (noticeItems.length) {
+      this.bus?.emit('showtime.notice', {
+        kind: 'motivation',
+        items: noticeItems,
+      });
+      this.bus?.emit('showtime.stateChanged');
+      if (this.container) this.render(this.container);
+    }
+    return lex;
+  }
+
+  /**
+   * Auto-attach secret/achievement rewards and plot hooks to a Motivation beat
+   * when its title/description contains Cinema Lexicon extractions or beat unlock cues.
+   */
+  _enrichStepWithCinemaLexicon(characterId, step) {
+    if (!step || typeof step !== 'object') return false;
+    const lex = extractCinemaLexicon(`${step.title || ''}\n${step.description || ''}`);
+    step.rewards = Array.isArray(step.rewards) ? step.rewards : [];
+    let changed = false;
+
+    const hasReward = (kind, title = '') => step.rewards.some(r => {
+      if (r?.kind !== kind) return false;
+      if (!title) return true;
+      return String(r.title || '').trim().toLowerCase() === String(title).trim().toLowerCase();
+    });
+
+    for (const secText of lex.secrets) {
+      const rTitle = secText.slice(0, 80);
+      if (!hasReward('secret', rTitle)) {
+        step.rewards.push({
+          kind: 'secret',
+          title: rTitle,
+          tier: 'notable',
+          description: secText.slice(0, 400),
+          category: 'misc',
+          offers: [],
+        });
+        changed = true;
+      }
+    }
+    if (lex.flags.beatSecretUnlock && !hasReward('secret')) {
+      step.rewards.push({
+        kind: 'secret',
+        title: String(step.title || 'Classified Reveal').slice(0, 80),
+        tier: 'notable',
+        description: String(step.description || '').slice(0, 400),
+        category: 'misc',
+        offers: [],
+      });
+      changed = true;
+    }
+
+    for (const achText of lex.achievements) {
+      const rTitle = achText.split(/[—–-]\s+/)[0].trim().slice(0, 80) || achText.slice(0, 80);
+      if (!hasReward('achievement', rTitle)) {
+        step.rewards.push({
+          kind: 'achievement',
+          title: rTitle,
+          tier: 'notable',
+          description: achText.slice(0, 400),
+          category: 'misc',
+          offers: [],
+        });
+        changed = true;
+      }
+    }
+    if (lex.flags.beatAchievementUnlock && !hasReward('achievement')) {
+      step.rewards.push({
+        kind: 'achievement',
+        title: String(step.title || 'Critical Acclaim').slice(0, 80),
+        tier: 'notable',
+        description: String(step.description || '').slice(0, 400),
+        category: 'misc',
+        offers: [],
+      });
+      changed = true;
+    }
+
+    if ((lex.hooks.length > 0 || lex.flags.isEvent) && characterId && !step.hookId) {
+      const out = pullBeatAsHook(this.storage, characterId, step);
+      if (out?.hooked) {
+        this.bus?.emit('cast.updated', {});
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   /**
    * Narrative sonar (secrets): cheap regex gate + quiet-LLM classification on
    * CHARACTER_MESSAGE_RENDERED, matched only against EXISTING filed secrets —
@@ -1118,6 +1648,7 @@ export class MotivationModule extends Module {
     for (let i = chat.length - 1; i >= 0 && i >= chat.length - 6; i--) {
       const m = chat[i];
       if (!m || m.is_system) continue;
+      if (m.extra?.showtimeSlate?.secrets?.length) return;
       if (SECRET_CUE_RE.test(String(m.mes || ''))) { mes = m; break; }
     }
     const text = String(mes?.mes || '');
@@ -1193,6 +1724,14 @@ JSON:`;
       });
       if (this.state.sonar.secretPings.length > MAX_SONAR_PINGS) this.state.sonar.secretPings.shift();
       this.saveState();
+      this.bus.emit('showtime.notice', {
+        kind: 'motivation',
+        items: [{
+          text: `Secret · ${owner.name || 'Unnamed'} · ${secret.title}`,
+          mark: '?',
+          characterId: owner.id,
+        }],
+      });
       this.bus.emit('showtime.stateChanged');
       if (this.container) this.render(this.container);
     } catch (err) {
@@ -1260,19 +1799,26 @@ JSON:`;
 
       this._ensureSonar();
       let changed = false;
+      const noticeItems = [];
       for (const u of unlocks.slice(0, 3)) {
         const beatId = String(u?.beatId || '').trim();
         const hit = eligible.find(e => e.step.id === beatId);
         if (!hit) continue;
         if (this.state.sonar.beatPings.some(p => p.beatId === beatId)) continue;
+        const beatTitle = hit.step.title || 'Untitled beat';
         this.state.sonar.beatPings.push({
           id: uid(),
           characterId: hit.characterId,
           characterName: hit.characterName,
           beatId,
-          beatTitle: hit.step.title || 'Untitled beat',
+          beatTitle,
           note: String(u?.note || '').trim().slice(0, 160),
           at: Date.now(),
+        });
+        noticeItems.push({
+          text: `Beat · ${hit.characterName} · ${beatTitle}`,
+          mark: '!',
+          characterId: hit.characterId,
         });
         changed = true;
       }
@@ -1281,6 +1827,12 @@ JSON:`;
         this.state.sonar.beatPings.splice(0, this.state.sonar.beatPings.length - MAX_SONAR_PINGS);
       }
       this.saveState();
+      if (noticeItems.length) {
+        this.bus.emit('showtime.notice', {
+          kind: 'motivation',
+          items: noticeItems,
+        });
+      }
       this.bus.emit('showtime.stateChanged');
       if (this.container) this.render(this.container);
     } catch (err) {
@@ -1338,17 +1890,21 @@ JSON:`;
     this.render(this.container);
   }
 
-  _applyRewards(cs, step, characterId = null) {
+  _applyRewards(cs, step, characterId = null, { skipItems = false } = {}) {
     for (const r of step.rewards ?? []) {
-      this._grantReward(cs, step, r);
+      if (skipItems && r.kind === 'item') continue;
+      this._grantReward(cs, step, r, characterId);
       if (r.kind === 'achievement') {
-        for (const offer of r.offers ?? []) this._grantReward(cs, step, offer);
+        for (const offer of r.offers ?? []) {
+          if (skipItems && offer.kind === 'item') continue;
+          this._grantReward(cs, step, offer, characterId);
+        }
       }
     }
     this.bus.emit('motivation.updated', { characterId: characterId || this.state.selectedId });
   }
 
-  _grantReward(cs, step, r) {
+  _grantReward(cs, step, r, characterId = null) {
     const title = String(r.title || r.name || '').trim();
     if (!title) return;
     const kind = r.kind === 'secret' ? 'secret' : r.kind === 'item' ? 'item' : r.kind === 'achievement' ? 'achievement' : '';
@@ -1394,24 +1950,51 @@ JSON:`;
       this._openDrawers.add('achievements');
       return;
     }
-    if (kind === 'item') this._grantItem(step, r, title);
+    if (kind === 'item') this._grantItem(step, r, title, { dest: 'person', characterId: characterId || this.state.selectedId });
   }
 
-  _grantItem(step, r, title) {
+  _grantItem(step, r, title, { dest = 'person', characterId = null } = {}) {
+    const whoId = characterId || this.state.selectedId;
+    const star = getStarMember(this.storage);
+    const isStar = !!(star && whoId === star.id);
+    const desc = String(r.description || '').slice(0, 400);
+    const category = ITEM_CATS.includes(r.category) ? r.category : 'misc';
+    if (!isStar) {
+      const char = this._castRecord(whoId);
+      if (!char) return;
+      const bag = char.props ??= [];
+      const key = title.toLowerCase();
+      if (bag.some(x => String(x.name || '').toLowerCase() === key)) return;
+      bag.push({
+        id: uid(),
+        name: title,
+        description: desc,
+        condition: 'fine',
+        kind: 'item',
+        parentId: null,
+        category,
+        fromStepId: step.id,
+      });
+      char.updatedAt = Date.now();
+      this.storage.saveChat();
+      this.bus.emit('cast.updated', { character: char });
+      return;
+    }
     const inv = this.storage.getChat('inventory', { static: [], mobile: [], currency: {}, openBoxes: [] });
     inv.mobile ??= [];
     inv.static ??= [];
+    const loc = dest === 'trunk' ? 'static' : 'mobile';
     const key = title.toLowerCase();
     if ([...inv.mobile, ...inv.static].some(x => String(x.name || '').toLowerCase() === key)) return;
-    inv.mobile.push({
+    inv[loc].push({
       id: uid(),
       kind: 'item',
       name: title,
-      description: String(r.description || '').slice(0, 400),
+      description: desc,
       parentId: null,
-      location: 'mobile',
+      location: loc,
       condition: 'fine',
-      category: ITEM_CATS.includes(r.category) ? r.category : 'misc',
+      category,
       fromStepId: step.id,
     });
     this.storage.saveChat();
@@ -1453,6 +2036,26 @@ JSON:`;
       this.storage.saveChat();
       this.bus.emit('inventory.updated');
     }
+    try {
+      const cast = this.storage.getChat('cast', { characters: [] });
+      let kitChanged = false;
+      for (const char of cast.characters ?? []) {
+        for (const key of ['props', 'wardrobe']) {
+          const list = char[key];
+          if (!Array.isArray(list)) continue;
+          const next = list.filter(x => x.fromStepId !== step.id);
+          if (next.length !== list.length) {
+            char[key] = next;
+            char.updatedAt = Date.now();
+            kitChanged = true;
+          }
+        }
+      }
+      if (kitChanged) {
+        this.storage.saveChat();
+        this.bus.emit('cast.updated', {});
+      }
+    } catch { /* ignore */ }
     this.bus.emit('motivation.updated', { characterId: this.state.selectedId });
   }
 
@@ -1502,6 +2105,8 @@ JSON:`;
           `<option value="${t.id}" ${t.id === x.tier ? 'selected' : ''}>${esc(t.label)}</option>`).join('')}</select></div>
       <div class="mot-field"><label>Description</label>
         <textarea data-field="description">${esc(x.description ?? '')}</textarea></div>
+      ${isSecret && x.channel === 'rumor' ? `<div class="mot-hint">Rumor — also lives as a standing on the Reputation web. Channel is locked.</div>` : ''}
+      ${!isSecret && x.hidden ? `<div class="mot-hint">Hidden feat (💀 SECRET rarity).</div>` : ''}
       <div class="mot-field"><label>Record</label>
         <select data-field="status">${STATUSES.map(s =>
           `<option value="${s.id}" ${s.id === (x.status || 'unknown') ? 'selected' : ''}>${esc(s.label)}</option>`).join('')}</select>
@@ -1540,7 +2145,7 @@ JSON:`;
     syncScene();
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const title = backdrop.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('A title is required.'); return; }
+      if (!title) { void showtimeAlert('A title is required.', { title: 'MOTIVATION' }); return; }
       const status = STATUS_MAP[statusEl.value] ? statusEl.value : 'unknown';
       const patch = {
         title,
@@ -1553,8 +2158,13 @@ JSON:`;
         patch.knownBy = normalizeKnownBy(knowDraft.knownBy);
         patch.unawareBy = normalizeKnownBy(knowDraft.unawareBy);
         patch.known = patch.knownBy.length > 0;
+        patch.channel = x.channel === 'rumor' ? 'rumor' : 'fact';
+        patch.repFrom = x.repFrom || '';
+        patch.repTo = x.repTo || '';
       } else {
         patch.known = status !== 'unknown';
+        patch.hidden = !!x.hidden;
+        if (x.unlocked) patch.unlocked = x.unlocked;
       }
       if (existing) Object.assign(existing, patch);
       else {
@@ -1822,7 +2432,7 @@ JSON:`;
 
     const applyStance = stance => {
       const knower = this._selectedKnower(backdrop);
-      if (!knower) { alert('Pick a cast member or affiliation first.'); return; }
+      if (!knower) { void showtimeAlert('Pick a cast member or affiliation first.', { title: 'SECRET STANCE' }); return; }
       if (knower.type === 'house') Object.assign(knower, readHouseShare(knower.id));
       setKnowerStance(secret, knower, stance);
       persistIf();
@@ -1915,7 +2525,7 @@ JSON:`;
     });
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const title = backdrop.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('A title is required.'); return; }
+      if (!title) { void showtimeAlert('A title is required.', { title: 'MOTIVATION' }); return; }
       const rewards = [...rewardWrap.querySelectorAll('.mot-reward')].map(el => {
         let offers = [];
         try { offers = JSON.parse(el.dataset.offers || '[]'); } catch { offers = []; }
@@ -1952,6 +2562,7 @@ JSON:`;
       else cs.steps.push({ id: uid(), sceneUid: '', unlocked: false, unlockedAt: 0, ...patch });
       const saved = existing ?? cs.steps[cs.steps.length - 1];
       this._normalizeGate(saved);
+      this._enrichStepWithCinemaLexicon(this.state.selectedId, saved);
       this._touchHookFromBeat(this.state.selectedId, saved);
       this.saveState();
       backdrop.remove();
@@ -2060,18 +2671,18 @@ JSON:`;
         rule.subject = inner.querySelector('[data-field="subject"]').value;
         rule.op = inner.querySelector('[data-field="op"]').value;
         rule.value = Math.max(-100, Math.min(100, Number(inner.querySelector('[data-field="value"]').value) || 0));
-        if (!rule.subject) { alert('Pick who has to feel that way.'); return; }
+        if (!rule.subject) { void showtimeAlert('Pick who has to feel that way.', { title: 'MOTIVATION GATE' }); return; }
       } else if (type === 'secret') {
         rule.refId = inner.querySelector('[data-field="secret"]').value;
         rule.mode = inner.querySelector('[data-field="secretMode"]').value;
-        if (!rule.refId) { alert('File a secret on this sheet first.'); return; }
+        if (!rule.refId) { void showtimeAlert('File a secret on this sheet first.', { title: 'MOTIVATION GATE' }); return; }
       } else if (type === 'scene') {
         rule.refId = inner.querySelector('[data-field="scene"]').value;
         rule.mode = inner.querySelector('[data-field="sceneMode"]').value;
-        if (!rule.refId) { alert('Add a scene on the Script first.'); return; }
+        if (!rule.refId) { void showtimeAlert('Add a scene on the Script first.', { title: 'MOTIVATION GATE' }); return; }
       } else {
         rule.refId = inner.querySelector('[data-field="beat"]').value;
-        if (!rule.refId) { alert('There is no other beat to wait on.'); return; }
+        if (!rule.refId) { void showtimeAlert('There is no other beat to wait on.', { title: 'MOTIVATION GATE' }); return; }
       }
       wrap.querySelector('.mot-hint')?.remove();
       wrap.insertAdjacentHTML('beforeend', this._gateChipHTML(rule));
@@ -2082,7 +2693,7 @@ JSON:`;
   _openRewardAdd(wrap) {
     const inner = this._modal(`
       <div class="mot-modal-title">REWARD</div>
-      <div class="mot-modal-sub">— applied the moment the beat unlocks —</div>
+      <div class="mot-modal-sub">— applied when the beat is resolved —</div>
       <div class="mot-field"><label>Kind</label>
         <select data-field="kind">${REWARD_KINDS.map(k =>
           `<option value="${k.id}">${esc(k.label)}</option>`).join('')}</select>
@@ -2106,7 +2717,7 @@ JSON:`;
     });
     inner.querySelector('[data-action="ok"]').addEventListener('click', () => {
       const title = inner.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('A title is required.'); return; }
+      if (!title) { void showtimeAlert('A title is required.', { title: 'REWARD' }); return; }
       const r = {
         kind: kindSel.value,
         title,
@@ -2125,7 +2736,7 @@ JSON:`;
     if (!step) return;
     const scenes = getSceneCards(this.storage);
     if (!scenes.length) {
-      alert('No scene cards in Script yet. Add a scene there, then link it here.');
+      void showtimeAlert('No scene cards in Script yet. Add a scene there, then link it here.', { title: 'CONNECT SCENE' });
       return;
     }
     const backdrop = this._modal(`
@@ -2136,7 +2747,7 @@ JSON:`;
           <option value="">— Not connected —</option>
           ${scenes.map(s => `<option value="${esc(s.uid)}" ${s.uid === step.sceneUid ? 'selected' : ''}>${esc(s.code)} — ${esc(s.title)}</option>`).join('')}
         </select>
-        <div class="mot-hint">A beat cannot unlock until it sits somewhere on the Script.</div></div>
+        <div class="mot-hint">Linking a scene resolves this beat — locks it in and collects its rewards.</div></div>
       <div class="mot-modal-actions">
         <button type="button" class="mot-btn" data-action="cancel">Cancel</button>
         <button type="button" class="mot-btn gold" data-action="save">Save</button>
@@ -2154,6 +2765,10 @@ JSON:`;
       this._touchHookFromBeat(this.state.selectedId, step);
       this.saveState();
       backdrop.remove();
+      if (uidVal && !step.unlocked) {
+        this._offerBeatResolve(this.state.selectedId, step);
+        return;
+      }
       this.render(this.container);
     });
   }
@@ -2480,11 +3095,10 @@ JSON:`;
     };
     const ctx = getContext();
     const record = this._castRecord(sel.id);
-    const identity = resolveCastPromptIdentity(record || sel, this.storage, {
+    const cardBlock = resolveInterviewCard(this.storage, record || sel, {
       characters: ctx.characters ?? [],
       personas: listPersonas(power_user),
-    });
-    const cardBlock = identity.block;
+    }).text;
 
     const cs = this._charState(sel.id);
     const secrets = cs.secrets.length
@@ -2627,46 +3241,7 @@ JSON:`;
     setBeat('Reading the dossier…', 12);
     try {
       const c = this._auditContext(sel, picks);
-      const sourceBits = [
-        c.connectionBlock ? `Connections:\n${c.connectionBlock}` : '',
-        c.sceneBlock ? `Script cards:\n${c.sceneBlock}` : '',
-        c.hookBlock ? `Plot hooks:\n${c.hookBlock}` : '',
-      ].filter(Boolean).join('\n\n');
-      const extendNote = c.extendExisting
-        ? 'Build onto the existing arc when it fits. New beats may continue a listed title as parent only if they clearly follow it; otherwise open a new root (parent null).'
-        : 'Start a new root branch. Do not parent new beats under existing ones.';
-      const directionBlock = c.direction ? `DIRECTION:\n${c.direction}\n` : '';
-      const prompt = `SYSTEM: Return JSON only. Do not roleplay. Do not write prose.
-
-Task: 4–8 character-arc beats for the dossier below. Wants, turns, costs. At least one fork (two beats, same parent, each with a branch label).
-${extendNote}
-
-Every beat should carry 1–2 rewards that fit the dossier. Mix kinds:
-- achievement (can also offer an item or a secret via "offers")
-- secret
-- item (a physical thing that goes into Inventory)
-- bonus (a dynamic / leverage note)
-
-Prefer concrete loot and secrets on payoff beats, not empty reward arrays.
-
-${directionBlock}${c.cardBlock}
-Billing: ${PRIORITY_MAP[c.priority]?.label ?? c.priority}
-
-Secrets:
-${c.secrets}
-
-Achievements:
-${c.achievements}
-
-${sourceBits}
-
-Existing beats (do not repeat titles):
-${c.existing}
-
-Schema:
-{"beats":[{"id":"1","parent":null,"branch":"","title":"Opening want","description":"One concrete sentence.","theme":"trope","rewards":[{"kind":"achievement","title":"Named feat","tier":"minor","description":"What they prove.","offers":[]}]},{"id":"2","parent":"1","branch":"Defy","title":"Fork A","description":"If they refuse.","theme":"trope","rewards":[{"kind":"secret","title":"Named secret","tier":"notable","description":"What is revealed."}]},{"id":"3","parent":"1","branch":"Yield","title":"Fork B","description":"If they comply.","theme":"trope","rewards":[{"kind":"achievement","title":"Pact kept","tier":"notable","description":"The cost of yielding.","offers":[{"kind":"item","title":"Sealed letter","description":"A physical token of the deal.","category":"misc"}]}]}]}
-
-parent is null or another id. rewards kind: achievement|secret|item|bonus. tier: trivial|minor|notable|major|pivotal. item category: consumable|wearable|usable|misc. 1–2 rewards per beat. Achievement offers: 0–2 item or secret objects.`;
+      const prompt = buildMotivationAuditPrompt(c);
 
       setBeat('Drafting the arc…', 40);
       const response = await this._quietAudit(prompt);
@@ -2688,7 +3263,7 @@ parent is null or another id. rewards kind: achievement|secret|item|bonus. tier:
         const step = {
           id: uid(),
           title: String(r.title).slice(0, 120),
-          description: String(r.description ?? '').slice(0, 400),
+          description: String(r.description ?? '').slice(0, 700),
           theme: String(r.theme ?? '').slice(0, 120),
           branch: String(r.branch ?? '').slice(0, 40),
           parentId: null,
@@ -2710,6 +3285,7 @@ parent is null or another id. rewards kind: achievement|secret|item|bonus. tier:
           parentId = existingTitles.get(a.parentKey.trim().toLowerCase()) || null;
         }
         a.step.parentId = parentId;
+        this._enrichStepWithCinemaLexicon(sel.id, a.step);
       }
       cs.steps = [...(cs.steps ?? []), ...added.map(a => a.step)];
       cs.auditAt = Date.now();
@@ -2844,7 +3420,7 @@ function salvageProseBeats(text) {
       parent: items.length ? String(items.length) : null,
       branch: /fork|defy|yield|refuse|comply/i.test(rest) ? title.slice(0, 40) : '',
       title,
-      description: parts.slice(1).join(': ').slice(0, 400),
+      description: parts.slice(1).join(': ').slice(0, 700),
       theme: '',
       rewards: [],
     });

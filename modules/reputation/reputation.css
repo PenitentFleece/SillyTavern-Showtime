@@ -43,6 +43,8 @@
   align-items: center;
   flex-shrink: 0;
   margin-bottom: 8px;
+  position: relative;
+  z-index: 9;
 }
 .rep-kicker {
   flex: 1;
@@ -105,6 +107,7 @@ button.rep-audit:disabled {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  position: relative;
 }
 .rep-personal.cards-hid .rep-web {
   flex: 1;
@@ -115,13 +118,13 @@ button.rep-audit:disabled {
 }
 .rep-web {
   position: relative;
-  flex: 1.15;
-  min-height: 180px;
+  flex: 1 1 38%;
+  min-height: 168px;
   overflow: hidden;
   background:
-    radial-gradient(ellipse at 50% 42%, rgba(201,162,74,0.16) 0 18%, transparent 52%),
-    radial-gradient(circle at 50% 48%, #3a2a18 0 2px, transparent 3px),
-    repeating-radial-gradient(circle at 50% 48%, transparent 0 38px, rgba(201,162,74,0.07) 38px 39px),
+    radial-gradient(ellipse at 50% 50%, rgba(201,162,74,0.16) 0 18%, transparent 52%),
+    radial-gradient(circle at 50% 50%, #3a2a18 0 2px, transparent 3px),
+    repeating-radial-gradient(circle at 50% 50%, transparent 0 38px, rgba(201,162,74,0.07) 38px 39px),
     linear-gradient(180deg, #1c140c 0%, #2b1d0e 55%, #1a120a 100%);
   border: 1px solid var(--st-gold-dim);
   box-shadow: inset 0 0 40px rgba(0,0,0,0.45);
@@ -135,7 +138,7 @@ button.rep-audit:disabled {
   inset: 0;
   z-index: 5;
   pointer-events: none;
-  background: radial-gradient(ellipse at 50% 48%, transparent 44%, rgba(18, 12, 6, 0.28) 74%, rgba(18, 12, 6, 0.78) 100%);
+  background: radial-gradient(ellipse at 50% 50%, transparent 44%, rgba(18, 12, 6, 0.28) 74%, rgba(18, 12, 6, 0.78) 100%);
 }
 .rep-web-world {
   position: absolute;
@@ -147,7 +150,7 @@ button.rep-audit:disabled {
 .rep-zoom {
   position: absolute;
   right: 8px;
-  bottom: 8px;
+  top: 8px;
   z-index: 6;
   display: flex;
   align-items: center;
@@ -384,68 +387,65 @@ button.rep-audit:disabled {
 }
 
 .rep-dossier {
-  flex: 0.85;
-  min-height: 140px;
+  position: relative;
+  z-index: 8;
+  flex: 1 1 52%;
+  min-height: 176px;
   overflow: auto;
   border: 1px solid var(--st-gold-dim);
-  border-top: none;
-  background: #1a1208;
-  padding: 10px 10px 14px;
+  border-bottom: none;
+  background: var(--st-paper);
+  color: var(--st-ink);
+  padding: 8px 14px 16px;
+  box-shadow: none;
+}
+.rep-personal:has(.rep-card.editing) .rep-web,
+.rep-personal:has(.rep-card.linking) .rep-web {
+  flex: 0 1 28%;
+  min-height: 120px;
+}
+.rep-personal:has(.rep-card.editing) .rep-dossier,
+.rep-personal:has(.rep-card.linking) .rep-dossier {
+  flex: 1 1 64%;
+}
+.rep-dossier::before {
+  content: '';
+  display: block;
+  width: 36px;
+  height: 4px;
+  margin: 2px auto 8px;
+  border-radius: 2px;
+  background: var(--st-gold-dim);
+  opacity: 0.65;
 }
 .rep-dossier-empty {
   font-style: italic;
-  color: #c8aa6e;
+  color: var(--st-ink-soft);
   font-size: 13px;
   padding: 12px 4px;
 }
 .rep-card {
   display: flex;
-  background: #f5f0e0;
-  color: #1a1208;
-  border-radius: 2px 4px 4px 2px;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(160,130,80,0.3);
-  min-height: 88px;
-  overflow: hidden;
+  background: transparent;
+  color: var(--st-ink);
+  border-radius: 0;
+  box-shadow: none;
+  min-height: 0;
+  overflow: visible;
 }
-.rep-card.editing { background: #fdf8ea; }
-.rep-card-punches {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: space-around;
-  width: 22px;
-  flex-shrink: 0;
-  background: #e8e0c8;
-  border-right: 1px dashed #c0aa80;
-  padding: 8px 0;
-}
-.rep-card-punches span {
-  display: block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #1a1208;
-  opacity: 0.14;
-}
+.rep-card.editing { background: transparent; }
+.rep-card-punches { display: none; }
 .rep-card-body {
   flex: 1;
   min-width: 0;
-  padding: 10px 12px 12px;
-  font-family: 'Courier New', Courier, monospace;
-  font-size: 12px;
-  line-height: 20px;
-  background-image: repeating-linear-gradient(
-    transparent,
-    transparent 19px,
-    rgba(160,130,80,0.22) 19px,
-    rgba(160,130,80,0.22) 20px
-  );
-  background-size: 100% 20px;
-  background-position: 0 8px;
+  padding: 4px 4px 12px;
+  font-family: var(--st-font-body);
+  font-size: 13px;
+  line-height: 1.45;
 }
+.rep-rel-read .rep-field { margin-bottom: 12px; }
 .rep-card.editing .rep-card-body,
 .rep-card.linking .rep-card-body {
-  background-image: none;
   line-height: 1.45;
 }
 .rep-card-top {
@@ -586,6 +586,24 @@ button.rep-audit:disabled {
   border-radius: 0;
 }
 .rep-field textarea { min-height: 52px; resize: vertical; }
+.rep-rel-sheet .rep-field textarea { min-height: 38px; }
+.rep-rel-stamp-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rep-stamp-chip {
+  display: inline-block;
+  align-self: flex-start;
+  font-family: var(--st-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--st-ink);
+  background: var(--st-paper-2);
+  border: 1px solid var(--st-gold);
+  padding: 1px 8px;
+  line-height: 1.4;
+}
 .rep-stand-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1209,3 +1227,24 @@ button.rep-audit:disabled {
   padding-top: 12px;
   border-top: 1px solid var(--st-gold-dim);
 }
+.rep-file-list { display: flex; flex-direction: column; gap: 2px; }
+.rep-file-row {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 4px 0;
+  border: none;
+  border-bottom: 1px dotted rgba(60, 70, 75, 0.28);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 0;
+  box-shadow: none;
+  font-family: var(--st-font-mono);
+  font-size: 12px;
+}
+.rep-file-row:hover { color: var(--st-gold-dim); }

@@ -5,14 +5,17 @@ import { getContext, extension_settings } from '../../../../../extensions.js';
 import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types, extension_prompt_types } from '../../../../../../script.js';
 import { power_user } from '../../../../../power-user.js';
 import { Module } from '../../lib/module.js';
-import { getCastMembers, getStarMember, formatDirectorPromptBlock, resolveCastPromptIdentity, listPersonas, PRIORITIES, PRIORITY_DEFAULT_COLORS, getRoleColors, setRoleColor, resetRoleColors, applyRoleColorVars, normalizePlotHook, formatPlotHookLine, normalizeCastPresence } from '../../lib/castCatalog.js';
-import { getSceneCards, creditedScenes, sceneCode } from '../../lib/scriptCatalog.js';
+import { openPlaybill } from '../../lib/playbill.js';
+import { getCastMembers, getCastRecords, inPlayCastRecords, getStarMember, formatDirectorPromptBlock, resolveCastPromptIdentity, resolveInterviewCard, fitInterviewDesk, buildCharacterDossier, listPersonas, PRIORITIES, PRIORITY_DEFAULT_COLORS, getRoleColors, setRoleColor, resetRoleColors, applyRoleColorVars, normalizePlotHook, formatPlotHookLine, normalizeCastPresence } from '../../lib/castCatalog.js';
+import { getSceneCards, creditedScenes, sceneCode, sceneLabel } from '../../lib/scriptCatalog.js';
+import { expandScriptSeeds, shelfOrderedUids } from '../../lib/scriptDag.js';
 import { flattenFacets } from '../../lib/keywordFacets.js';
 import {
   listPlaySecrets,
   knowerLabel,
   standingSubjects,
   standingToward,
+  connectionReading,
   standingInfo,
   secretsKnownToCharacter,
   secretsAboutCharacter,
@@ -20,16 +23,30 @@ import {
 } from '../../lib/motivationCatalog.js';
 import {
   applySceneCuesFromChat,
+  advanceSceneByMinutes,
   compactConnectionsInject,
-  compactSceneInject,
+  formatNowSceneLine,
   clipText,
   haystackLower,
   textMatchesHay,
   playMessagesSince,
+  parseMsgTimestamp,
   smokeChatTrackCuePure,
 } from '../../lib/chatTrack.js';
-import { withShowtimeProfile } from '../../lib/connectionProfile.js';
-import { rafMove } from '../../lib/uiPerf.js';
+import {
+  compactChatSlateInstruct,
+  compactTurnTimeInstruct,
+  applySlateSceneStamp,
+  smokeChatSlatePure,
+} from '../../lib/chatSlate.js';
+import {
+  withShowtimeProfile,
+  PROFILE_SLOTS,
+  PROFILE_SLOT_IDS,
+  emptyProfileMap,
+  hydrateProfileMap,
+} from '../../lib/connectionProfile.js';
+import { chatPaintPending, rafMove, runIdle } from '../../lib/uiPerf.js';
 import { formatChatLine, clipExcerptToLines } from '../../lib/castAudit.js';
 import { parseJsonObject, parseJsonArray, smokeJsonExtractPure } from '../../lib/jsonExtract.js';
 import { leanQuietGenerate, pinnedGenerateRaw, SYSTEM_VOICE } from '../../lib/isolatedGen.js';
@@ -38,11 +55,13 @@ import {
   knownPlaceRoster,
   buildLocationDeltaPrompt,
   parseLocationDelta,
-  applyLocationDelta,
-  dismissUnlisted,
-  forgetUnlisted,
-  dropMatchedUnlisted,
-  syncScriptLibraryUnlisted,
+    applyLocationDelta,
+    dismissUnlisted,
+    forgetUnlisted,
+    dropMatchedUnlisted,
+    syncScriptLibraryUnlisted,
+    resolveLocationFiling,
+    smokeLocationDeltaPure,
 } from '../../lib/compass/unlisted.js';
 import {
   hydrateFromDirectorJson,
@@ -58,12 +77,13 @@ import {
   formatDirectorPicksBlock,
 } from '../../lib/directorEvent.js';
 import { createHookFromEvent } from '../../lib/plotHookBridge.js';
-import { getCachedLibraryBooks, listLibraryLeaves, listVisibleLibraryLeaves, clearOrphanTags } from '../../lib/libraryCatalog.js';
+import { getCachedLibraryBooks, ensureLibraryBooks, listLibraryLeaves, listVisibleLibraryLeaves, matchStampLeaf, clearOrphanTags } from '../../lib/libraryCatalog.js';
 import {
   ensureCompass,
   createAndStoreRoom,
   loadRoom,
   unloadRoom,
+  findPlaceIdByKey,
   getActiveRoom,
   getPlace,
   renamePlace,
@@ -84,6 +104,7 @@ import {
   updateItem,
   removeItem,
   moveItem,
+  reorderCellItem,
   pickupItem,
   addPickupToInventory,
   listLostAndFound,
@@ -97,8 +118,10 @@ import {
   faceOccupant,
   addLink,
   removeLink,
+  clearForeignWallLink,
   setLinkExternal,
   linkWallToRoom,
+  linkWallToExterior,
   setSharedWallStyle,
   alignSuiteWalls,
   clearSuiteVisualAlign,
@@ -119,39 +142,81 @@ import {
   joinCollinearSuiteVertex,
   simplifySuiteRoomFootprint,
   smokeSuiteWallRestorePure,
+  smokeSyncOccupancyRoomPure,
   collectActiveLocationTags,
   moveSuiteChild,
+  setRoomStory,
   ensureSuiteLayout,
   divideRoom,
   listSuiteChildren,
+  listSuiteUnits,
+  suiteUnitOuterSilhouette,
+  setPlaceListingCode,
+  setPlaceCategory,
+  setWallConnection,
+  smokeOpeningAccessPure,
+  smokeAutoBindFixtureWallPure,
+  smokePlaceKeyCollisionPure,
 } from '../../lib/compass/state.js';
-import { buildCompassInjection, pickInjectionNames, invalidateRenderCache } from '../../lib/compass/render.js';
+import { buildCompassInjection, pickInjectionNames, resolveCompassFocusRoom, invalidateRenderCache } from '../../lib/compass/render.js';
+import { getActiveCastCue } from '../../lib/castCue.js';
 import { registerCompassCommands } from '../../lib/compass/commands.js';
-import { buildSetHtml, buildPlacementHtml, buildPlacementPovPreview, findPlaceForTag, findPlaceByExactName } from '../../lib/compass/stageUi.js';
+import { buildSetHtml, buildPlacementHtml, buildPlacementPovPreview, findPlaceForTag, findPlaceByExactName, renderCompassPlaceOptions, smokeCompassPlaceOptionsPure } from '../../lib/compass/stageUi.js';
 import { openCellDialog, openOpeningDialog, openFurnitureDialog, openPieceDialog } from '../../lib/compass/dialogs.js';
-import { applySonarPings, listSonarPingsInPlace, summarizeSonarCheck, sonarFingerprint, setSonarExcluded, pinSonarPing, smokeSonarLocationPure } from '../../lib/compass/sonar.js';
-import { auditCompass, applySafeAuditFixes, smokeCompassAuditPure } from '../../lib/compass/audit.js';
-import { COMPASS_VERSION, isVerticalOpeningType, normalizeSuitePose, isSuiteHostKind, isCompassPlaceKind, normalizeCell, PLACE_NEST_PARENTS, PLACE_KIND_SET } from '../../lib/compass/schema.js';
+import { showtimeAlert, showtimeConfirm, showtimePrompt, emitShowtimeNotice } from '../../lib/dialogs.js';
+import { smokeRotateCellForPose } from '../../lib/compass/pov.js';
+import { applySonarPings, listSonarPingsInPlace, summarizeSonarCheck, sonarFingerprint, setSonarExcluded, setSonarListening, pinSonarPing, pinNarratedSplitScene, reconcileRoomOccupants, smokeSonarLocationPure, smokeSonarPresencePure, confirmSettingHere, syncSonarPresence } from '../../lib/compass/sonar.js';
+import { applySafeAuditFixes, smokeCompassAuditPure } from '../../lib/compass/audit.js';
+import { COMPASS_VERSION, isVerticalOpeningType, normalizeSuitePose, isSuiteHostKind, isExteriorHostKind, isCompassPlaceKind, isScenePlaceKind, normalizeCell, PLACE_NEST_PARENTS, PLACE_KIND_SET, GEO_PLACE_KIND_SET, placeKindMeta } from '../../lib/compass/schema.js';
+import {
+  canonicalizeListingCode,
+  collectListingPalette,
+  listingCodesFromPlaces,
+  smokeListingPure,
+} from '../../lib/compass/listing.js';
+import {
+  runSuiteProgram,
+  commitSuiteDraft,
+  dismissSuiteDraft,
+  populatePlaceFromCategory,
+  smokeRoomBuilderPure,
+} from '../../lib/compass/roomBuilder.js';
+import {
+  populateRoomsFromNarrative,
+  collectRecentChatNarrative,
+  smokeRoomDresserPure,
+} from '../../lib/compass/roomDresser.js';
+import { smokeRoomProgramPure } from '../../lib/compass/roomProgram.js';
+import { smokeSuitePackPure } from '../../lib/compass/suitePack.js';
 import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPicker.js';
-import { bindLocationCatalogPicker, formatSceneLocation, mostPreciseGeoName, lowestLocationNames, locationKeyFromStored, smokeSceneLocationPure, syncLocationCatalogFromCompass, upsertLocationNode, GROUP_TO_COMPASS, COMPASS_TO_GROUP, findLocationNodeByName, findLocationNodeById, findLocationNodeByPlaceId, collectLocationIdentity, rewriteLocationTagNames, removeLocationNode, mergeLocationNodes, pruneGhostLocationNodes } from '../../lib/locationCatalog.js';
+import { bindLocationCatalogPicker, bindNarrativeLocationPicker, formatSceneLocation, mostPreciseGeoName, lowestLocationNames, locationKeyFromStored, smokeSceneLocationPure, syncLocationCatalogFromCompass, upsertLocationNode, GROUP_TO_COMPASS, COMPASS_TO_GROUP, findLocationNodeByName, findLocationNodeById, findLocationNodeByPlaceId, collectLocationIdentity, rewriteLocationTagNames, removeLocationNode, mergeLocationNodes, pruneGhostLocationNodes } from '../../lib/locationCatalog.js';
 import {
   defaultTrackers,
   normalizeTrackers,
+  clapperIsShowing,
   buildTrackersHtml,
   formatTrackerTimeFromHour,
   formatSceneDate,
   weatherPoolForSeason,
   parseWeatherToken,
   normalizeCustomBar,
+  buildSceneSetFormHtml,
+  normalizePendingCue,
 } from '../../lib/trackersConfig.js';
 import {
-  getTimelinePresent,
+  currentTimelinePresent,
+  pickParseableTimeKey,
+  phraseRecallGap,
   normalizeCalendar,
   seasonForMonth,
   formatTimeKey,
   shiftPartsByDays,
   smokeCalendarShiftPure,
+  parseTimeKey,
+  calendarSort,
+  earthDateSort,
 } from '../../lib/calendarTime.js';
+import { parseMemoryBookContent } from '../../lib/memoryBookPrompt.js';
 import { buildFloatingClapperHtml, CLAPPER_CSS } from '../../lib/clapperUi.js';
 import { clampFixedElement } from '../../lib/shell.js';
 import {
@@ -181,8 +246,58 @@ import {
   registerWorldIndexInjection,
   buildWorldIndexPreviewHtml,
   smokeWorldIndexPure,
+  normalizeWorldIndex,
+  runWorldIndexAudit,
 } from '../../lib/worldIndex.js';
-import { collectReelExtras, decorateReel, importReelExtras, isReelPayload } from '../../lib/reel.js';
+import {
+  collectReelExtras,
+  decorateReel,
+  packReelAffiliations,
+  stampCastAffiliations,
+  applyReelAffiliations,
+  importReelExtras,
+  isReelPayload,
+  reelFilename,
+  reelHash,
+  clipReelTitle,
+  stripStarFromReel,
+  smokeReelNamePure,
+  saveReelToUserFiles,
+  deleteReelUserFile,
+  listReelCatalog,
+  rememberReel,
+  forgetReel,
+} from '../../lib/reel.js';
+import { sanitizeReelPayload, smokeReelSanitizePure } from '../../lib/reelSanitize.js';
+import { runReceiptFiling, compactReceiptInject, loadLastReceipt, lastUserHasReceiptWrap, paintExistingReceipt, restoreLatestReceipt, applyOffscreenNeeds, smokeReceiptPure } from '../../lib/receipt.js';
+import { formatOccupancyLabel, normalizeTravel, smokeTravelStatePure } from '../../lib/travelState.js';
+import {
+  acceptNow,
+  commitNow,
+  defaultStandingChild,
+  ensureNow,
+  ignoreNow,
+  proposeNow,
+  renderNowLedgerLines,
+  renderNowSceneLine,
+  smokeNowSidecarPure,
+  syncNowFromScene,
+} from '../../lib/nowSidecar.js';
+import { smokeVisitMemoryPure, visitLinesForPeople } from '../../lib/visitMemory.js';
+import { smokeCastPresencePure, syncCastPresence } from '../../lib/castPresence.js';
+import {
+  formatHouseHealthLines,
+  readHouseHealth,
+  smokeHouseHealthPure,
+} from '../../lib/houseHealth.js';
+import { smokeItemLocatorPure, compactKitInject, compactNowInject, worldFromStorage, starKitFromInventory } from '../../lib/itemLocator.js';
+import {
+  formatOutfitLook,
+  kitOwnedItems,
+  normalizeOutfits,
+  outfitTypeMeta,
+  pickPrimaryOutfit,
+} from '../../lib/wardrobeOutfits.js';
 import {
   moveVertex,
   moveEdge,
@@ -212,7 +327,7 @@ const LOBBY_DOORS = [
     id: 'production',
     mark: '🎞',
     title: 'Production',
-    blurb: 'Director events, holidays, databank imports & exports.',
+    blurb: 'Director events, trackers, holidays, databank imports & exports.',
   },
   {
     id: 'interview',
@@ -230,7 +345,7 @@ const LOBBY_DOORS = [
     id: 'stage',
     mark: '🗺',
     title: 'Stage',
-    blurb: 'Set, placement, and studio shelves — map, dressing, effects, trackers, visuals.',
+    blurb: 'Set, placement, and studio shelves — map, dressing, effects, visuals.',
   },
   {
     id: 'settings',
@@ -261,12 +376,6 @@ const STAGE_DOORS = [
     blurb: 'Ambiance, weather, and immersive overlays.',
   },
   {
-    id: 'studio-trackers',
-    mark: '📊',
-    title: 'Trackers',
-    blurb: 'Tracker visuals, what is tracked, and call frequency.',
-  },
-  {
     id: 'studio-visuals',
     mark: '🖼',
     title: 'Visuals',
@@ -294,7 +403,7 @@ const NOTECARDS = [
   {
     id: 'fashion',
     label: 'Fashion',
-    sources: 'Wearable + Cast',
+    sources: 'Cast · Closet / Current',
     questions: [
       { id: 'look', text: 'What does this look say about them?' },
       { id: 'wear', text: 'Would you wear this — or put it on someone?' },
@@ -304,7 +413,7 @@ const NOTECARDS = [
   {
     id: 'role',
     label: 'Role',
-    sources: 'Cast · Motivation / Achievements · Script · Library cubbies',
+    sources: 'Motivation / Achievements · Script · Library cubbies',
     questions: [
       { id: 'sit', text: 'How does this sit with your role?' },
       { id: 'remember', text: 'What do you remember about this beat or entry?' },
@@ -376,7 +485,7 @@ export class BackstageModule extends Module {
     this._profiles = [];
     this._profilesLoaded = false;
     this._busy = false;
-    this._prodFolds = new Set(['director', 'events', 'set-places']);
+    this._prodFolds = new Set(['director', 'events']);
     this._sonarFilter = '';
     this._sonarView = 'all';
     this._placesFold = new Set();
@@ -385,27 +494,53 @@ export class BackstageModule extends Module {
     this._locTrackPrimed = false;
     this._locLastCount = 0;
     this._locBusy = false;
+    this._locNoticeKey = '';
+    this._setCreateDraft = null;
+    this._suiteBuildBusy = false;
+    this._noteTargetCache = null;
   }
 
   async init() {
     this.bus?.on('backstage.open', ({ door } = {}) => {
-      this._door = door || 'settings';
+      this._openDoor(door || 'settings');
       const shell = window.Showtime?.shell;
       shell?.activate?.('backstage');
       if (this.container) this.render(this.container);
+    });
+    this.bus?.on('showtime.locationDraft', (draft = {}) => {
+      this._applyLocationDraft(draft);
+    });
+    this.bus?.on('showtime.suiteDraft', (draft = {}) => {
+      this._openSuiteDraft(draft);
+    });
+    this.bus?.on('scene.slateApply', (tag) => {
+      try { this._applySlateScene(tag); } catch (err) {
+        console.warn('[Showtime/Backstage] slate scene', err);
+      }
+    });
+    this.bus?.on('scene.turnElapsed', (spec) => {
+      try { this._applyTurnElapsed(spec); } catch (err) {
+        console.warn('[Showtime/Backstage] turn elapsed', err);
+      }
     });
     this.bus?.on('showtime.chatPresence', () => {
       try { this._syncFloatingClapper(); } catch { /* ignore */ }
     });
     this.bus?.on('showtime.stateChanged', () => {
+      try { this._refreshHouseHealth(); } catch { /* ignore */ }
       try {
-        const scene = normalizeTrackers(this._db().trackers).scene;
-        if (!scene.enabled || scene.followTimeline === false) return;
+        const scene = this.storage.getChat('backstage', {})?.trackers?.scene;
+        if (!scene?.enabled || scene.followTimeline === false) return;
         // Soft-refresh clapper date/time from the Script present (narrative now).
         clearTimeout(this._tlFollowTimer);
         this._tlFollowTimer = setTimeout(() => {
           try {
             const st = this._db();
+            const scene = normalizeTrackers(st.trackers).scene;
+            if (scene.boardHeld) {
+              this._syncFloatingClapper(false, { scan: false });
+              return;
+            }
             const snap = this._sceneClapSnapshot(st);
             let dirty = false;
             if (st.trackers.scene.date && snap.date && snap.date !== '—') {
@@ -421,9 +556,9 @@ export class BackstageModule extends Module {
               }
             }
             if (dirty) this.saveState();
-            this._syncFloatingClapper();
+            this._syncFloatingClapper(false, { scan: false });
           } catch { /* ignore */ }
-        }, 200);
+        }, 450);
       } catch { /* ignore */ }
     });
     this.bus?.on('backstage.openEventPaper', () => this._renderEventPaper());
@@ -434,6 +569,13 @@ export class BackstageModule extends Module {
         settings: payload?.settings || null,
         picks: payload?.picks || null,
       });
+    });
+    this.bus?.on('showtime.receiptFiled', ({ receipt } = {}) => {
+      try {
+        this._handleReceiptLocationNotice(receipt);
+      } catch (err) {
+        console.warn('[Showtime/location receipt notice]', err);
+      }
     });
     this._applyTheme(this._g().theme);
     applyRoleColorVars();
@@ -447,45 +589,146 @@ export class BackstageModule extends Module {
       },
     });
     // Stage chrome lives outside the marquee — sync even if Backstage tab was never opened.
-    queueMicrotask(() => {
+    // Do not scan trackers here, and do not walk the set until messages are in the DOM.
+    const paintStageChrome = () => {
       try {
-        this._syncFloatingClapper();
-        this._syncStageBackground();
-        this._syncWeatherOverlay();
+        if (chatPaintPending()) {
+          setTimeout(paintStageChrome, 1000);
+          return;
+        }
+        this._syncFloatingClapper(false, { scan: false, lite: true });
+        runIdle(() => {
+          try {
+            this._syncStageBackground({ lite: true });
+            this._syncWeatherOverlay();
+          } catch (err) {
+            console.warn('[Showtime/Backstage] stage chrome sync failed', err);
+          }
+        }, 1600);
       } catch (err) {
         console.warn('[Showtime/Backstage] stage chrome sync failed', err);
       }
-    });
+    };
+    setTimeout(paintStageChrome, 4500);
     if (!this._genBound) {
       this._genBound = true;
-      eventSource.on(event_types.GENERATION_STARTED, () => {
-        this._scanChatTrackers({ persist: true });
+      this._receiptPrimed = true;
+      this._receiptLastCount = this._receiptCount();
+      eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
+        this._scanChatTrackers({ persist: false });
+        if (dryRun || type === 'quiet') return;
+        this._userGen = true;
+        this._genChatLen = (getContext()?.chat || []).length;
       });
       eventSource.on(event_types.GENERATION_ENDED, () => {
-        this._maybeAutoDirector();
+        if (!this._userGen) return;
+        this._userGen = false;
+        const len = (getContext()?.chat || []).length;
+        const grew = len > (Number(this._genChatLen) || 0);
+        this._genChatLen = len;
+        try { this._refreshHouseHealth(); } catch { /* ignore */ }
+        if (!grew) return;
+        try { this._maybeAutoDirector(); } catch { /* ignore */ }
+        try {
+          if (this._receiptCadenceId() === 'per_turn') this._scheduleReceiptCadence({ stampTarget: 'user' });
+        } catch { /* ignore */ }
       });
       // Re-pick stage background / refresh clapper after chat moves.
-      const resyncStage = () => {
-        try {
-          this._scanChatTrackers({ persist: true });
-          this._syncFloatingClapper();
-          this._syncStageBackground();
-          this._syncWeatherOverlay();
-        } catch { /* ignore */ }
+      const resyncStage = ({ scan = true, lite = false } = {}) => {
+        clearTimeout(this._resyncStageT);
+        this._resyncStageT = setTimeout(() => {
+          try {
+            if (chatPaintPending()) {
+              resyncStage({ scan: false, lite: true });
+              return;
+            }
+            if (scan) this._scanChatTrackers({ persist: true });
+            try {
+              const compass = ensureCompass(this._db());
+              const pinned = pinNarratedSplitScene(compass, {
+                chatId: String(getContext()?.chatId || ''),
+                castMembers: this._sonarCast({ includeWrittenOut: true }),
+                storage: this.storage,
+                chat: getContext()?.chat || [],
+              });
+              if (pinned) {
+                this.saveState();
+                this._syncFloatingClapper(false, { scan: false, lite: true });
+              }
+            } catch { /* scene pin is optional */ }
+            this._syncFloatingClapper(false, { scan: false, lite });
+            this._syncStageBackground({ lite });
+            this._syncWeatherOverlay();
+          } catch { /* ignore */ }
+        }, scan ? 800 : 400);
       };
-      eventSource.on(event_types.MESSAGE_SENT, () => {
+      eventSource.on(event_types.MESSAGE_SENT, (messageId) => {
         resyncStage();
-        this._scheduleLocCadence();
+        try { paintExistingReceipt(messageId); } catch (err) {
+          console.warn('[Showtime/receipt] paint on send', err);
+        }
       });
-      eventSource.on(event_types.MESSAGE_RECEIVED, resyncStage);
-      eventSource.on(event_types.CHAT_CHANGED, () => {
+      if (event_types.USER_MESSAGE_RENDERED) {
+        eventSource.on(event_types.USER_MESSAGE_RENDERED, (messageId) => {
+          try { paintExistingReceipt(messageId); } catch (err) {
+            console.warn('[Showtime/receipt] paint on user render', err);
+          }
+        });
+      }
+      eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (id, type) => {
+        if (type === 'quiet' || type === 'first_message') return;
+        const chat = getContext()?.chat || [];
+        const turnKey = `${Number.isFinite(Number(id)) ? Number(id) : chat.length - 1}:${chat.length}`;
+        if (this._lastPostTurnKey === turnKey) return;
+        this._lastPostTurnKey = turnKey;
+        const cad = this._receiptCadenceId();
+        if (cad === 'per_post' || cad === 'per_n') {
+          this._scheduleReceiptCadence({ stampTarget: 'ai' });
+        } else if (!cad) {
+          this._scheduleLocFallbackCadence();
+        }
+        this._scheduleWorldIndexAudit();
+      });
+      eventSource.on(event_types.MESSAGE_RECEIVED, () => {
+        resyncStage();
+      });
+      eventSource.on(event_types.CHAT_CHANGED, (chatId) => {
         this._locTrackPrimed = false;
         this._locLastCount = 0;
-        clearTimeout(this._locTrackTimer);
-        resyncStage();
-        queueMicrotask(() => this._renderEventPaper());
+        this._lastPostTurnKey = '';
+        const id = String(chatId || getContext()?.chatId || '');
+        const sameChat = id && id === this._receiptChatId;
+        this._receiptChatId = id;
+        if (!sameChat) {
+          this._receiptPrimed = true;
+          this._receiptLastCount = this._receiptCount();
+          clearTimeout(this._locTrackTimer);
+        }
+        this._locNoticeKey = '';
+        this._setCreateDraft = null;
+        const firstOpen = !this._stageChatSeen;
+        this._stageChatSeen = true;
+        clearTimeout(this._resyncStageT);
+        this._resyncStageT = setTimeout(() => resyncStage({ scan: false, lite: firstOpen }), firstOpen ? 4000 : 1200);
+        clearTimeout(this._presenceLoadT);
+        this._presenceLoadT = setTimeout(() => {
+          if (chatPaintPending()) return;
+          try { this._syncAutoPresence({ persist: false }); } catch { /* ignore */ }
+        }, firstOpen ? 5500 : 1500);
+        runIdle(() => { try { this._renderEventPaper(); } catch { /* ignore */ } }, firstOpen ? 5500 : 1500);
+        runIdle(() => { try { restoreLatestReceipt(); } catch { /* ignore */ } }, firstOpen ? 800 : 200);
       });
+      runIdle(() => { try { restoreLatestReceipt(); } catch { /* ignore */ } }, 800);
       eventSource.on(event_types.MESSAGE_SWIPED, () => clearTimeout(this._locTrackTimer));
+    }
+    this._profiles = this._listProfilesLocal();
+    this._profilesLoaded = true;
+    if (!this._profiles.length) {
+      runIdle(() => {
+        this._findProfiles().then((list) => {
+          this._profiles = list || [];
+        }).catch(() => {});
+      }, 2500);
     }
   }
 
@@ -505,6 +748,8 @@ export class BackstageModule extends Module {
         eventLog: [],
         pendingEvent: null,
         eventGuidance: '',
+        title: '',
+        lastReel: null,
       },
       interview: {
         active: false,
@@ -514,7 +759,9 @@ export class BackstageModule extends Module {
         flippedNote: '',
         notePick: {},
         noteIdx: 0,
+        notesOpen: true,
         turns: [],
+        pendingConn: [],
         startedAt: 0,
         retry: null,
       },
@@ -525,6 +772,7 @@ export class BackstageModule extends Module {
         recentN: 12,
         scriptUid: '',
         focusChat: false,
+        poke: '',
         sessions: [],
         activeIdx: -1, // which topic tab is being viewed/continued — see _pgActiveIdx()
       },
@@ -536,6 +784,7 @@ export class BackstageModule extends Module {
       trackers: defaultTrackers(),
       visuals: defaultVisuals(),
       effects: defaultEffects(),
+      worldIndex: normalizeWorldIndex(),
     };
   }
 
@@ -545,12 +794,7 @@ export class BackstageModule extends Module {
       ink: '',
       paper: '',
       gold: '',
-      profiles: {
-        audit: '',
-        motivation: '',
-        event: '',
-        interview: '',
-      },
+      profiles: emptyProfileMap(),
       handbookSeen: false,
     };
   }
@@ -558,8 +802,7 @@ export class BackstageModule extends Module {
   _g() {
     const g = this.storage.getGlobal('backstage', this._defaultGlobal());
     g.theme ??= 'paper';
-    g.profiles ??= { audit: '', motivation: '', event: '', interview: '' };
-    g.profiles.interview ??= '';
+    g.profiles = hydrateProfileMap(g.profiles);
     return g;
   }
 
@@ -584,6 +827,10 @@ export class BackstageModule extends Module {
       st.production.sources.scriptStampedLore = false;
     }
     st.production.eventGuidance ??= '';
+    st.production.title ??= '';
+    if (st.production.lastReel == null || typeof st.production.lastReel !== 'object') {
+      st.production.lastReel = null;
+    }
     st.trackers = normalizeTrackers(st.trackers);
     st.visuals = normalizeVisuals(st.visuals);
     st.effects = normalizeEffects(st.effects);
@@ -594,34 +841,28 @@ export class BackstageModule extends Module {
     st.interview.startedAt ??= 0;
     st.interview.noteIdx = this._ivNoteIdx(st.interview);
     st.interview.retry ??= null;
+    if (!Array.isArray(st.interview.pendingConn)) st.interview.pendingConn = [];
+    if (typeof st.interview.notesOpen !== 'boolean') st.interview.notesOpen = true;
     // Recover mid-session from older saves that had no `active` flag.
     if (st.interview.active == null) {
       st.interview.active = Array.isArray(st.interview.turns) && st.interview.turns.length > 0;
     }
     st.peanut ??= def.peanut;
     if (typeof st.peanut.focusChat !== 'boolean') st.peanut.focusChat = false;
-    ensureCompass(st);
+    if (typeof st.peanut.poke !== 'string') st.peanut.poke = '';
+    st.worldIndex = normalizeWorldIndex(st.worldIndex);
+    if (!Array.isArray(st.customListingCodes)) st.customListingCodes = [];
     return st;
   }
 
   async onChatChanged() {
     this._door = '';
-    if (this.container) await this.render(this.container);
-    else {
-      try {
-        this._syncFloatingClapper();
-        this._syncStageBackground();
-        this._syncWeatherOverlay();
-      } catch { /* ignore */ }
-    }
   }
 
-  async render(container) {
+  async render(container, { chrome = true } = {}) {
     this.container = container;
-    if (!this._profilesLoaded || ((this._door === 'settings' || this._door === 'interview' || this._door === 'gallery') && !this._profiles.length)) {
-      this._profiles = await this._findProfiles();
-      this._profilesLoaded = true;
-    }
+    if (!this._profiles.length) this._profiles = this._listProfilesLocal();
+    this._profilesLoaded = true;
     const snap = this._captureScroll(container);
     const st = this._db();
     container.innerHTML = `
@@ -634,18 +875,23 @@ export class BackstageModule extends Module {
       </div>`;
     this._bind(container.querySelector('.bst-root'));
     this._restoreScroll(container, snap);
-    this._syncFloatingClapper();
-    this._syncStageBackground();
-    this._syncWeatherOverlay();
+    if (chrome) {
+      this._syncFloatingClapper();
+      this._syncStageBackground();
+      this._syncWeatherOverlay();
+    }
   }
 
   _captureScroll(container) {
     const parents = [];
     let el = container;
+    const marquee = container?.closest?.('#showtime-marquee') || container;
     for (let i = 0; i < 6 && el; i++) {
+      if (el === document.body || el === document.documentElement) break;
       if (el.scrollHeight > el.clientHeight + 1) {
         parents.push({ el, top: el.scrollTop });
       }
+      if (el === marquee) break;
       el = el.parentElement;
     }
     return {
@@ -654,7 +900,8 @@ export class BackstageModule extends Module {
       pg: container.querySelector('[data-role="pg-log"]')?.scrollTop ?? 0,
       sonar: container.querySelector('.bst-sonar-body')?.scrollTop
         ?? container.querySelector('.bst-sonar-list')?.scrollTop ?? 0,
-      places: container.querySelector('.bst-set-index-list')?.scrollTop ?? 0,
+      places: container.querySelector('.bst-places-body')?.scrollTop
+        ?? container.querySelector('.bst-set-index-list')?.scrollTop ?? 0,
       parents,
     };
   }
@@ -677,7 +924,8 @@ export class BackstageModule extends Module {
       const sonar = container.querySelector('.bst-sonar-body')
         || container.querySelector('.bst-sonar-list');
       if (sonar) sonar.scrollTop = snap.sonar || 0;
-      const places = container.querySelector('.bst-set-index-list');
+      const places = container.querySelector('.bst-places-body')
+        || container.querySelector('.bst-set-index-list');
       if (places) places.scrollTop = snap.places || 0;
       for (const p of snap.parents || []) {
         if (p.el?.isConnected) p.el.scrollTop = p.top;
@@ -702,51 +950,77 @@ export class BackstageModule extends Module {
     const kicker = this._door === 'stage'
       ? 'Stage — pick a shelf'
       : (door ? (underStage ? `Stage · ${door.title}` : door.title) : 'House listings — pick a door');
+    const house = this._houseClosed()
+      ? `<button type="button" class="bst-back" data-action="close-desk">Close</button>`
+      : '';
     return `
       <header class="bst-top">
         <span class="bst-brand">Backstage</span>
         <span class="bst-kicker">${esc(kicker)}</span>
         ${back}
+        ${house}
       </header>`;
+  }
+
+  _houseClosed() {
+    try { return !!window.Showtime?.shell?._curtainMode; } catch { return false; }
+  }
+
+  _doorShut(id) {
+    return this._houseClosed() && (
+      id === 'interview' || id === 'gallery' || id === 'set' || id === 'placement'
+    );
   }
 
   _boardHTML(doors = LOBBY_DOORS, { heading = '' } = {}) {
     return `
       <div class="bst-board">
         ${heading ? `<div class="bst-board-group-label">${esc(heading)}</div>` : ''}
-        ${doors.map(d => `
-          <button type="button" class="bst-door" data-action="open" data-door="${d.id}">
+        ${doors.map(d => {
+          const shut = this._doorShut(d.id);
+          return `
+          <button type="button" class="bst-door${shut ? ' is-shut' : ''}" data-action="${shut ? '' : 'open'}" data-door="${d.id}" ${shut ? 'disabled aria-disabled="true"' : ''}>
             <span class="bst-door-mark">${d.mark}</span>
             <span class="bst-door-copy">
               <span class="bst-door-title">${d.title}</span>
-              <span class="bst-door-blurb">${esc(d.blurb)}</span>
+              <span class="bst-door-blurb">${esc(shut ? 'Needs an open chat.' : d.blurb)}</span>
             </span>
             <span class="bst-door-chev">›</span>
-          </button>`).join('')}
+          </button>`;
+        }).join('')}
       </div>`;
   }
 
   _stageHubHTML() {
-    const preview = buildWorldIndexPreviewHtml(this.storage, {
-      esc,
-      cellId: this._compassSelCell || '',
-    });
+    const closed = this._houseClosed();
+    const preview = closed
+      ? ''
+      : buildWorldIndexPreviewHtml(this.storage, {
+        esc,
+        cellId: this._compassSelCell || '',
+      });
+    const sub = closed
+      ? 'Effects and Visuals stay open. Set, Placement, and the world index wait for a chat.'
+      : 'Map the house, dress areas, then open studio shelves for effects and visuals.';
     return `
       <h2 class="bst-pane-title">Stage</h2>
-      <p class="bst-pane-sub">Map the house, dress areas, then open studio shelves for effects, trackers, and visuals.</p>
+      <p class="bst-pane-sub">${esc(sub)}</p>
       ${this._boardHTML(STAGE_DOORS)}
       ${preview}`;
   }
 
   _paneHTML(door, st) {
-    if (door === 'production') return this._productionHTML(st);
+    if (this._doorShut(door)) return this._boardHTML();
+    if (door === 'production' || door === 'studio-trackers') {
+      if (door === 'studio-trackers') this._openDoor('studio-trackers');
+      return this._productionHTML(st);
+    }
     if (door === 'interview') return this._interviewHTML(st);
     if (door === 'gallery') return this._peanutHTML(st);
     if (door === 'stage') return this._stageHubHTML();
     if (door === 'set') return this._setHTML(st);
     if (door === 'placement') return this._placementHTML(st);
     if (door === 'studio-effects') return this._studioEffectsHTML(st);
-    if (door === 'studio-trackers') return this._studioTrackersHTML(st);
     if (door === 'studio-visuals') return this._studioVisualsHTML(st);
     if (door === 'settings') return this._settingsHTML(st);
     return this._boardHTML();
@@ -878,8 +1152,15 @@ export class BackstageModule extends Module {
           </div>`;
         })()}`;
 
+    const last = p.lastReel;
+    const lastLine = last?.file
+      ? `<p class="bst-hint">Last export: ${esc(last.title || last.file)} · ${esc(new Date(last.at).toLocaleString())}</p>`
+      : '';
     const databankBody = `
         <p class="bst-hint">A <strong>Reel</strong> is a portable copy of this production — pick which tabs travel with it, then import the same file into another chat. Live data sits in this chat’s metadata (not a separate folder).</p>
+        <label class="bst-field"><span>Production name</span>
+          <input type="text" data-field="productionTitle" maxlength="80" value="${esc(p.title || '')}" placeholder="Lost &amp; Found">
+        </label>
         <div class="bst-field"><span>Include tabs</span>
           <div class="bst-checkgrid">${exportMods}
             <label class="bst-check"><input type="checkbox" data-export-global checked> Global settings too</label>
@@ -892,6 +1173,7 @@ export class BackstageModule extends Module {
             <label class="bst-check" title="Remember which ST card/persona each cast member uses, so import can re-link to cards you already have"><input type="checkbox" data-reel-relink checked> Re-link to cards already in SillyTavern</label>
             <label class="bst-check" title="World Info books currently in play for this chat"><input type="checkbox" data-reel-lore> Lorebooks in play</label>
             <label class="bst-check" title="Every World Info book on this install — large"><input type="checkbox" data-reel-lore-all> All lorebooks</label>
+            <label class="bst-check" title="Drops the Star card, their kit, and rows aimed at them. Their name can still appear in script and interview text."><input type="checkbox" data-reel-leave-star> Leave the Star behind</label>
           </div>
         </div>
         <div class="bst-row">
@@ -899,10 +1181,19 @@ export class BackstageModule extends Module {
           <button type="button" class="bst-btn" data-action="export-all">Export full Reel</button>
           <button type="button" class="bst-btn" data-action="export-tab">Export Backstage only</button>
         </div>
+        ${lastLine}
+        ${this._reelShelfHtml()}
         <div class="bst-field"><span>Import a Reel</span>
-          <p class="bst-hint" style="margin:0">Pick a previously exported <code>.json</code> Reel — full production, slice, or Backstage chat file. Optional: merge only checked modules instead of replacing everything.</p>
+          <p class="bst-hint" style="margin:0">Merge uses a reel from this list. Unchecked tabs stay as they are. Import from file is for a json that is not on the shelf.</p>
+          <label class="bst-field"><span>Shelf reel</span>
+            <select class="bst-select" data-role="merge-reel">
+              <option value="">— Pick a reel —</option>
+              ${listReelCatalog(extension_settings).map(r =>
+                `<option value="${esc(r.file)}">${esc(r.title || r.file)}</option>`).join('')}
+            </select>
+          </label>
           <div class="bst-checkgrid">
-            <label class="bst-check"><input type="checkbox" data-import-merge> Merge (keep unchecked modules)</label>
+            <label class="bst-check"><input type="checkbox" data-import-merge checked> Merge (keep unchecked modules)</label>
             ${Object.entries(MODULE_LABELS).map(([id, label]) =>
               `<label class="bst-check"><input type="checkbox" data-import-mod="${esc(id)}" checked> ${esc(label)}</label>`).join('')}
             <label class="bst-check"><input type="checkbox" data-import-global checked> Global settings</label>
@@ -911,7 +1202,8 @@ export class BackstageModule extends Module {
           </div>
         </div>
         <div class="bst-row">
-          <button type="button" class="bst-btn" data-action="import-all">Import Reel…</button>
+          <button type="button" class="bst-btn gold" data-action="merge-reel">Merge reel</button>
+          <button type="button" class="bst-btn" data-action="import-all">Import from file…</button>
         </div>
         <div class="bst-row">
           <select class="bst-select" data-role="wipe-target">
@@ -926,8 +1218,9 @@ export class BackstageModule extends Module {
 
     return `
       <h2 class="bst-pane-title">Production</h2>
-      <p class="bst-pane-sub">Director watches the floor. Reels pack the paperwork. Fold a section to keep the desk clear.</p>
+      <p class="bst-pane-sub">Director watches the floor. Trackers sit in a fold. Reels pack the paperwork.</p>
       ${fold('director', 'Director events', directorBody)}
+      ${fold('trackers', 'Trackers', this._studioTrackersInner(st))}
       ${fold('events', 'Events & Holidays', this._eventsHolidaysInner())}
       ${fold('databank', 'Reels', databankBody)}`;
   }
@@ -1032,8 +1325,8 @@ export class BackstageModule extends Module {
     return parts.join('\n\n');
   }
 
-  _clearOrphanTags() {
-    if (!confirm('Clear tags that no longer link to a Script card, lorebook entry, or book? This cannot be undone.')) {
+  async _clearOrphanTags() {
+    if (!await showtimeConfirm('Clear tags that no longer link to a Script card, lorebook entry, or book? This cannot be undone.', { title: 'CLEAR ORPHAN TAGS', danger: true, confirmLabel: 'Clear' })) {
       return;
     }
     const scriptDb = this.storage.getChat('script', { cards: [] });
@@ -1092,16 +1385,17 @@ export class BackstageModule extends Module {
     if (locN) bits.push(`${locN} blank location field${locN === 1 ? '' : 's'}`);
     this.bus?.emit('showtime.stateChanged');
     if (this._door === 'production' && this.container) this.render(this.container);
-    alert(bits.length
+    const msg = bits.length
       ? `Cleared orphan tags — ${bits.join(', ')}.`
-      : 'No orphan tags found.');
+      : 'No orphan tags found.';
+    emitShowtimeNotice(this.bus, { kind: 'house', text: msg, mark: bits.length ? '!' : '✓' });
   }
 
   async _composeHolidayEvent() {
     if (this._busy) return;
     const script = this._scriptMod();
     if (!script?._addCard) {
-      alert('Script module is not loaded — open the Script tab once, then retry.');
+      void showtimeAlert('Script module is not loaded — open the Script tab once, then retry.', { title: 'HOLIDAY EVENT' });
       return;
     }
     this._busy = true;
@@ -1196,7 +1490,7 @@ JSON:`;
       this.bus?.emit('script.updated', { reason: 'event-compose', uid: card.uid });
     } catch (err) {
       console.error('[Backstage event compose]', err);
-      alert(`Compose failed: ${err.message || err}`);
+      void showtimeAlert(`Compose failed: ${err.message || err}`, { title: 'HOLIDAY EVENT', danger: true });
     } finally {
       this._busy = false;
       if (this._door === 'production' && this.container) this.render(this.container);
@@ -1207,7 +1501,7 @@ JSON:`;
     if (!uid || this._busy) return;
     const script = this._scriptMod();
     const card = script?._getCard?.(uid);
-    if (!card) { alert('Event card not found.'); return; }
+    if (!card) { void showtimeAlert('Event card not found.', { title: 'PITCH CAST' }); return; }
     this._busy = true;
     this.render(this.container);
     try {
@@ -1268,7 +1562,7 @@ JSON:`;
       this.bus?.emit('showtime.stateChanged');
     } catch (err) {
       console.error('[Backstage event pitch]', err);
-      alert(`Pitch failed: ${err.message || err}`);
+      void showtimeAlert(`Pitch failed: ${err.message || err}`, { title: 'PITCH CAST', danger: true });
     } finally {
       this._busy = false;
       if (this._door === 'production' && this.container) this.render(this.container);
@@ -1278,7 +1572,7 @@ JSON:`;
   _cueEventNow(uid) {
     const script = this._scriptMod();
     const card = script?._getCard?.(uid);
-    if (!card) { alert('Event card not found.'); return; }
+    if (!card) { void showtimeAlert('Event card not found.', { title: 'CUE EVENT' }); return; }
     const st = this._db();
     const credits = (card.credits || []).map(c => c.name).filter(Boolean).slice(0, 6).join(', ');
     const text = [
@@ -1324,7 +1618,7 @@ JSON:`;
   _openEventJumpDialog(uid) {
     const script = this._scriptMod();
     const card = script?._getCard?.(uid);
-    if (!card) { alert('Event card not found.'); return; }
+    if (!card) { void showtimeAlert('Event card not found.', { title: 'JUMP TO EVENT' }); return; }
     const overlay = document.createElement('div');
     overlay.className = 'bst-dialog-overlay';
     overlay.innerHTML = `
@@ -1449,7 +1743,7 @@ BRIDGE:`;
       }
     } catch (err) {
       console.error('[Backstage event jump]', err);
-      alert(`Jump failed: ${err.message || err}`);
+      void showtimeAlert(`Jump failed: ${err.message || err}`, { title: 'JUMP TO EVENT', danger: true });
     } finally {
       this._busy = false;
       if (this._door === 'production' && this.container) this.render(this.container);
@@ -1586,9 +1880,9 @@ BRIDGE:`;
       assignedTo: rec?.id || ev.castId || '',
     });
     if (!result.hooked) {
-      alert(result.reason === 'no-director'
+      void showtimeAlert(result.reason === 'no-director'
         ? 'Add a Director cast card first.'
-        : 'Could not file a plot hook.');
+        : 'Could not file a plot hook.', { title: 'PLOT HOOK' });
       return;
     }
     (st.production.eventLog ??= []).push({
@@ -1609,7 +1903,7 @@ BRIDGE:`;
     const sel = this._eventPaperRoot()?.querySelector('[data-role="event-cast"]')?.value;
     const rec = matchCast(this.storage, sel || ev.castId);
     if (!rec) {
-      alert('Pick a cast member to play this event.');
+      void showtimeAlert('Pick a cast member to play this event.', { title: 'DIRECTOR EVENT' });
       return;
     }
     const text = ev.text;
@@ -1701,44 +1995,36 @@ BRIDGE:`;
     const interviewer = this._interviewerInfo();
     const turns = iv.turns || [];
     const flipped = iv.flippedNote || '';
+    const subName = subject?.name || '—';
+    const withName = interviewer.anonymous ? 'Anonymous' : (interviewer.name || '—');
+    const notesOpen = iv.notesOpen !== false;
     return `
-      <h2 class="bst-pane-title">Interview</h2>
-      <p class="bst-pane-sub">Sitting with <strong>${esc(subject?.name || '—')}</strong>. Settings are locked for this session.</p>
-
-      <section class="bst-section">
-        <div class="bst-row bst-iv-locked">
-          <div class="bst-iv-lockchip">
-            <span class="bst-iv-lockk">Subject</span>
-            <span class="bst-iv-lockv">${esc(subject?.name || '—')}</span>
-          </div>
-          <div class="bst-iv-lockchip">
-            <span class="bst-iv-lockk">Interviewer</span>
-            <span class="bst-iv-lockv">${esc(interviewer.name)}${interviewer.anonymous ? ' (anon)' : ''}</span>
-          </div>
-          <button type="button" class="bst-btn" data-action="interview-clear" title="Wipe the live desk only">Clear desk</button>
+      <section class="bst-iv-slate">
+        <div class="bst-iv-live"><span class="bst-iv-rec" aria-hidden="true"></span>LIVE NOW</div>
+        <p class="bst-iv-with">${esc(subName)} speaking with ${esc(withName)}</p>
+        <div class="bst-iv-model">(${esc(this._interviewProfileLabel())})</div>
+        <div class="bst-iv-slate-actions">
           <button type="button" class="bst-btn" data-action="interview-discard" title="Leave without filing a transcript">End without filing</button>
           <button type="button" class="bst-btn danger" data-action="interview-end" title="File transcript to the subject, then leave">End &amp; file</button>
-        </div>
-        <p class="bst-hint">Cast replies omit their name in the transcript — the whole desk is already theirs. Ending files the session under Motivation → Interviews.</p>
-        <div class="bst-row" style="margin-top:8px">
-          <label class="bst-field" style="flex:1;margin:0">
-            <span>Interview model</span>
-            <select data-g="profile-interview">${this._profileOpts(this._g().profiles.interview)}</select>
-          </label>
+          <button type="button" class="bst-btn bst-iv-clear" data-action="interview-clear" title="Wipe the live desk only">Clear desk</button>
         </div>
       </section>
 
       <div class="bst-stage bst-stage--interview">
         <div class="bst-transcript" data-role="iv-log">
           ${turns.length
-            ? turns.map(t => {
+            ? turns.map((t, i) => {
               const sys = t.name === 'Connections';
               const showWho = t.who === 'user' || sys;
               const cls = sys ? 'user bst-bubble--sys' : (t.who === 'user' ? 'user' : 'cast');
+              const retryBtn = t.who === 'cast' && !sys
+                ? `<button type="button" class="bst-iv-turn-retry" data-action="iv-retry-turn" data-idx="${i}" ${this._busy ? 'disabled' : ''} title="Regenerate this reply">Retry</button>`
+                : '';
               return `
               <div class="bst-bubble ${cls}">
                 ${showWho ? `<div class="bst-bubble-who">${esc(t.name || t.who)}</div>` : ''}
                 <div class="bst-bubble-text">${esc(t.text)}</div>
+                ${retryBtn}
               </div>`;
             }).join('')
             : `<div class="bst-empty">Flip a notecard or type a free question.</div>`}
@@ -1751,14 +2037,17 @@ BRIDGE:`;
           <button type="button" class="bst-btn" data-action="iv-retry-dismiss">Dismiss</button>
         </div>` : ''}
 
-        <div class="bst-ask-label">Ask about…</div>
-        ${this._interviewAlbumHTML(iv, flipped, subject)}
-
-        <div class="bst-row">
-          <input class="bst-input" style="flex:1" data-role="iv-line" placeholder="Or type a free question…" ${subject && !this._busy ? '' : 'disabled'}>
+        <div class="bst-row bst-iv-askbar">
+          <input class="bst-input" style="flex:1" data-role="iv-line" placeholder="Type a question…" ${subject && !this._busy ? '' : 'disabled'}>
           <button type="button" class="bst-btn gold" data-action="iv-send" ${subject && !this._busy ? '' : 'disabled'}>${this._busy ? '…' : 'Ask'}</button>
         </div>
-        <p class="bst-hint">Live desk only — Connections may still pick up readings/rumors from Cast asks. Full transcript files when you End.</p>
+
+        <details class="bst-iv-notes" data-role="iv-notes" ${notesOpen ? 'open' : ''}>
+          <summary>Notecards</summary>
+          <div class="bst-ask-label">Ask about…</div>
+          ${this._interviewAlbumHTML(iv, flipped, subject)}
+        </details>
+        <p class="bst-hint">Live desk only — relationship-web updates queue here and file when you End.</p>
       </div>`;
   }
 
@@ -1776,7 +2065,7 @@ BRIDGE:`;
     const n = NOTECARDS.length;
     const idx = this._ivNoteIdx(iv);
     const card = NOTECARDS[idx];
-    const openId = flipped === card.id || !flipped ? card.id : '';
+    const openId = flipped === card.id ? card.id : '';
     return `
       <div class="bst-iv-album">
         <div class="bst-iv-album-stage">
@@ -1834,13 +2123,24 @@ BRIDGE:`;
       interviewer: interviewer.name,
       interviewerMode: mode,
       interviewerId,
-      turns: turns.map(t => ({
-        who: t.who,
-        name: t.who === 'cast' ? '' : (t.name || ''),
-        text: String(t.text || ''),
-        at: t.at || Date.now(),
-      })),
+      turns: turns
+        .filter(t => t.who !== 'cast' || !this._interviewReplyTooShort(t.text))
+        .map(t => ({
+          who: t.who,
+          name: t.who === 'cast' ? '' : (t.name || ''),
+          text: String(t.text || ''),
+          at: t.at || Date.now(),
+        })),
     };
+
+    const pending = Array.isArray(st.interview.pendingConn) ? st.interview.pendingConn : [];
+    if (pending.length && this._applyInterviewConnPatches(pending, subject)) {
+      for (const t of session.turns) {
+        if (t.name === 'Connections' && /^To file:/i.test(t.text)) {
+          t.text = t.text.replace(/^To file:/i, 'Filed:');
+        }
+      }
+    }
 
     const motMod = window.Showtime?.modules?.get('motivation');
     if (motMod?._charState) {
@@ -1866,11 +2166,24 @@ BRIDGE:`;
     return session;
   }
 
-  _endInterview({ save = true } = {}) {
+  async _endInterview({ save = true } = {}) {
+    this._ivHarvestSeq = (this._ivHarvestSeq || 0) + 1;
     const st = this._db();
-    if (save) this._archiveInterviewSession();
+    if (save && (st.interview.turns || []).length) {
+      this._busy = true;
+      try { this._paintInterviewDesk(); } catch { /* desk may be closed */ }
+      try {
+        await this._fileInterviewConnections();
+      } catch (err) {
+        console.warn('[Backstage interview → Connections]', err);
+      } finally {
+        this._busy = false;
+      }
+      this._archiveInterviewSession();
+    }
     st.interview.active = false;
     st.interview.turns = [];
+    st.interview.pendingConn = [];
     st.interview.flippedNote = '';
     st.interview.startedAt = 0;
     st.interview.retry = null;
@@ -1878,14 +2191,85 @@ BRIDGE:`;
     return void this.render(this.container);
   }
 
+  _refreshInterviewAlbum() {
+    const host = this.container?.querySelector('.bst-iv-album');
+    if (!host) {
+      if (this.container) void this.render(this.container, { chrome: false });
+      return;
+    }
+    const st = this._db();
+    const html = this._interviewAlbumHTML(st.interview, st.interview.flippedNote || '', this._interviewSubject());
+    const wrap = document.createElement('div');
+    wrap.innerHTML = String(html || '').trim();
+    const next = wrap.firstElementChild;
+    if (next) host.replaceWith(next);
+  }
+
+  _paintInterviewDesk() {
+    if (this._door !== 'interview' || !this.container) return;
+    const body = this.container.querySelector('.bst-body');
+    if (!body) {
+      void this.render(this.container, { chrome: false });
+      return;
+    }
+    const ivTop = this.container.querySelector('[data-role="iv-log"]')?.scrollTop ?? 0;
+    const bodyTop = body.scrollTop;
+    const st = this._db();
+    body.innerHTML = this._interviewHTML(st);
+    this._bindInterviewNotes(this.container);
+    const iv = this.container.querySelector('[data-role="iv-log"]');
+    if (iv) iv.scrollTop = this._ivPinBottom ? iv.scrollHeight : ivTop;
+    body.scrollTop = bodyTop;
+    if (this._ivPinBottom) this._ivPinBottom = false;
+  }
+
+  _noteTargetOptionsHTML(targets, selectedId) {
+    const chunks = [];
+    let bucket = null;
+    let buf = [];
+    const flush = () => {
+      if (!buf.length) return;
+      const opts = buf.join('');
+      chunks.push(bucket ? `<optgroup label="${esc(bucket)}">${opts}</optgroup>` : opts);
+      buf = [];
+    };
+    for (const t of targets || []) {
+      const next = String(t.bucket || '');
+      if (buf.length && next !== bucket) flush();
+      bucket = next;
+      buf.push(`<option value="${esc(t.id)}" ${t.id === selectedId ? 'selected' : ''}>${esc(t.title)}</option>`);
+    }
+    flush();
+    return chunks.join('');
+  }
+
+  _fashionKit(char) {
+    if (char?.priority === 'star') {
+      try {
+        const inv = this.storage.getChat('inventory', { static: [], mobile: [] });
+        return starKitFromInventory(inv, { ownerId: char.id });
+      } catch { /* fall through */ }
+    }
+    return { wardrobe: char?.wardrobe || [], props: char?.props || [] };
+  }
+
   _noteCardHTML(card, flipped, subject, iv) {
     const open = flipped === card.id;
     const pick = (iv.notePick || {})[card.id] || {};
-    const targets = subject ? this._noteTargets(card.id, subject.id) : [];
+    const targets = (open && subject) ? this._noteTargets(card.id, subject.id) : [];
     const qIdx = Math.min(Number(pick.q) || 0, card.questions.length - 1);
     const disabled = !subject || this._busy;
+    const rephraseOpen = !!pick.rephraseOpen;
+    const aboutTarget = targets.find(t => t.id === pick.targetId);
+    const sitName = String(subject?.name || '').trim();
+    const aboutTitle = String(aboutTarget?.title || '').trim();
+    const rephraseHint = [
+      'Write your own question.',
+      aboutTitle ? `About: ${aboutTitle}` : '',
+      sitName ? `Sitting: ${sitName}` : '',
+    ].filter(Boolean).join(' ');
     return `
-      <div class="bst-flip${open ? ' open' : ''}" data-note="${card.id}">
+      <div class="bst-flip${open ? ' open' : ''}${open && rephraseOpen ? ' rephrase' : ''}" data-note="${card.id}">
         <div class="bst-flip-inner">
           <button type="button" class="bst-note-face front" data-action="note-flip" data-note="${card.id}" ${disabled ? 'disabled' : ''}>
             <span class="bst-note-t">${esc(card.label)}</span>
@@ -1894,33 +2278,34 @@ BRIDGE:`;
           <div class="bst-note-face back">
             <button type="button" class="bst-note-close" data-action="note-flip" data-note="${card.id}" title="Flip back">↩</button>
             <span class="bst-note-k">${esc(card.label)}</span>
+            ${rephraseOpen ? '' : `
             <label class="bst-field" style="margin:4px 0">
               <span>Question</span>
               <select data-note-q="${card.id}" ${disabled ? 'disabled' : ''}>
                 ${card.questions.map((q, i) =>
                   `<option value="${i}" ${i === qIdx ? 'selected' : ''}>${esc(q.text)}</option>`).join('')}
               </select>
-            </label>
+            </label>`}
             <label class="bst-field" style="margin:4px 0">
               <span>About</span>
               <select data-note-target="${card.id}" ${disabled ? 'disabled' : ''}>
                 <option value="">— pick a title —</option>
-                ${targets.map(t =>
-                  `<option value="${esc(t.id)}" ${t.id === pick.targetId ? 'selected' : ''}>${esc(t.title)}</option>`).join('')}
+                ${this._noteTargetOptionsHTML(targets, pick.targetId)}
               </select>
             </label>
-            <label class="bst-field bst-note-about-field">
-              <span>About this…</span>
-              <textarea class="bst-note-about" data-note-about="${card.id}" rows="3"
-                placeholder="Your angle, follow-up, or extra prompt…"
-                ${disabled ? 'disabled' : ''}>${esc(pick.about || '')}</textarea>
-            </label>
+            ${rephraseOpen ? `
+            <label class="bst-field bst-note-rephrase-field">
+              <span>Your prompt</span>
+              <textarea class="bst-note-about bst-note-rephrase" data-note-rephrased="${card.id}" rows="3"
+                placeholder="${esc(rephraseHint)}"
+                ${disabled ? 'disabled' : ''}>${esc(pick.rephrased || '')}</textarea>
+            </label>` : ''}
             <div class="bst-note-askrow">
               <button type="button" class="bst-btn gold" data-action="note-ask" data-note="${card.id}"
                 ${disabled || !targets.length ? 'disabled' : ''}>Ask</button>
-              <button type="button" class="bst-btn" data-action="note-ask-about" data-note="${card.id}"
-                title="Ask the stock question, then append your About this… line"
-                ${disabled || !targets.length ? 'disabled' : ''}>About This…</button>
+              <button type="button" class="bst-btn${rephraseOpen ? ' gold' : ''}" data-action="note-rephrase" data-note="${card.id}"
+                title="Write your own prompt instead of the stock question"
+                ${disabled ? 'disabled' : ''}>Rephrase</button>
             </div>
           </div>
         </div>
@@ -1989,6 +2374,10 @@ BRIDGE:`;
           </label>
         </div>` : ''}
         <div class="bst-row">
+          <label class="bst-field" style="flex:1;margin:0"><span>Poke</span>
+            <input type="text" data-field="poke" maxlength="160" value="${esc(p.poke || '')}" placeholder="Optional — what they should argue about"></label>
+        </div>
+        <div class="bst-row">
           <label class="bst-field" style="flex:1;margin:0"><span>Model</span>
             <select data-g="profile-event">${this._profileOpts(this._g().profiles.event)}</select>
           </label>
@@ -2042,24 +2431,89 @@ BRIDGE:`;
     }).map(m => ({
       id: m.id || m.name,
       name: m.name,
+      aliases: Array.isArray(m.aliases) ? m.aliases : [],
+      priority: m.priority || '',
       presence: normalizeCastPresence(m),
+      updatedAt: Number(m.updatedAt) || 0,
     }));
   }
 
-  _scanChatTrackers({ persist = false } = {}) {
+  _armBoardHold(scene, { bumpClap = true } = {}) {
+    if (!scene || typeof scene !== 'object') return;
+    scene.boardHeld = true;
+    scene.pendingCue = null;
+    if (bumpClap) scene.lastClapAt = Date.now();
+  }
+
+  _queuePendingCue(scene, partial = {}) {
+    if (!scene || typeof scene !== 'object') return false;
+    const merged = {
+      date: partial.date !== undefined ? partial.date : scene.pendingCue?.date,
+      time: partial.time !== undefined ? partial.time : scene.pendingCue?.time,
+      location: partial.location !== undefined ? partial.location : scene.pendingCue?.location,
+    };
+    const next = normalizePendingCue(merged);
+    if (!next) return false;
+    if (scene.ignoredCueSig && next.sig === scene.ignoredCueSig) return false;
+    scene.pendingCue = next;
+    return true;
+  }
+
+  _scanChatTrackers({ persist = false, force = false } = {}) {
     try {
       const st = this._db();
       st.trackers = normalizeTrackers(st.trackers);
       const chat = getContext()?.chat || [];
       const compass = ensureCompass(st);
       let ulChanged = false;
-      try { ulChanged = !!syncScriptLibraryUnlisted(compass, this.storage); } catch { /* ignore */ }
+      if (persist || force) {
+        try { ulChanged = !!syncScriptLibraryUnlisted(compass, this.storage); } catch { /* ignore */ }
+      }
       const sonar = this._runSonar(compass, { persist });
+      const scene = st.trackers.scene;
       const locKey = locationKeyFromStored(sonar.key);
-      if (locKey && st.trackers.scene && locationKeyFromStored(st.trackers.scene.lastLocationKey) !== locKey) {
-        st.trackers.scene.lastLocationKey = locKey;
-        if (st.trackers.scene.trackStar) {
-          this._pushComposerLocation(this._sceneLocationBits(compass, compass.sonar?.lastPlaceId, locKey));
+      const play = (Array.isArray(chat) ? chat : []).filter(m => m && !m.is_system);
+      const last = play[play.length - 1];
+      const newestMes = String(last?.mes || '').replace(/<[^>]+>/g, ' ');
+      const newestAt = parseMsgTimestamp(last);
+      const stale = Number(scene.lastClapAt) > 0 && newestAt > 0 && newestAt <= Number(scene.lastClapAt);
+      const headerLine = /[·•]/.test(newestMes);
+      const autoHeaderLoc = headerLine && (force || (!stale && (newestAt > 0 || !scene.boardHeld) && (!scene.boardHeld || newestAt > Number(scene.lastClapAt))));
+      const sonarPlaceId = String(compass.sonar?.lastPlaceId || '').trim();
+      const curPlaceId = String(scene.travel?.placeId || '').trim();
+      const placeChanged = (sonarPlaceId && sonarPlaceId !== curPlaceId)
+        || (locKey && locationKeyFromStored(scene.lastLocationKey) !== locKey);
+      const autoSonarRoom = !!(sonarPlaceId && compass.rooms?.[sonarPlaceId] && !stale && (newestAt > 0 || !Number(scene.lastClapAt)));
+      if (locKey && placeChanged) {
+        if (force || autoHeaderLoc || (persist && autoSonarRoom)) {
+          commitNow(this.storage, {
+            occupancy: { mode: 'compass', placeKey: locKey, placeId: sonarPlaceId },
+          }, { force: true, source: force ? 'clap' : (autoHeaderLoc ? 'header' : 'sonar'), scene, bus: this.bus });
+          this._scheduleSuiteBuild();
+          if (scene.trackStar) {
+            this._pushComposerLocation(this._sceneLocationBits(compass, compass.sonar?.lastPlaceId, locKey));
+          }
+        } else if (!stale) {
+          proposeNow(this.storage, {
+            occupancy: { mode: 'compass', placeKey: locKey, placeId: sonarPlaceId },
+            location: { key: locKey, placeId: sonarPlaceId, label: locKey },
+          }, { source: autoHeaderLoc ? 'header' : 'sonar', scene });
+        }
+        if (persist) {
+          try { this.saveState(); } catch { /* ignore */ }
+        }
+      } else if (locKey && normalizeTravel(scene.travel, { lastLocationKey: scene.lastLocationKey }).mode === 'moving'
+        && (autoHeaderLoc || force || (persist && autoSonarRoom))) {
+        if (force || (persist && autoSonarRoom)) {
+          commitNow(this.storage, {
+            occupancy: { mode: 'compass', placeKey: locKey, placeId: sonarPlaceId },
+          }, { force: true, source: force ? 'clap' : 'sonar', scene, bus: this.bus });
+          this._scheduleSuiteBuild();
+        } else {
+          proposeNow(this.storage, {
+            occupancy: { mode: 'compass', placeKey: locKey, placeId: sonarPlaceId },
+            location: { key: locKey, placeId: sonarPlaceId, label: locKey },
+          }, { source: 'header', scene });
         }
         if (persist) {
           try { this.saveState(); } catch { /* ignore */ }
@@ -2068,9 +2522,26 @@ BRIDGE:`;
         try { this.saveState(); } catch { /* ignore */ }
       }
       const cal = normalizeCalendar(this.storage.getChat('script', {})?.settings?.calendar);
-      const sceneHit = applySceneCuesFromChat(st.trackers.scene, chat, { calendar: cal });
+      const sceneHit = applySceneCuesFromChat(scene, chat, {
+        calendar: cal,
+        afterTs: force ? 0 : scene.lastClapAt,
+        force,
+      });
+      if (sceneHit.pending) {
+        this._queuePendingCue(scene, {
+          date: sceneHit.pending.date || null,
+          time: sceneHit.pending.time || null,
+        });
+        try {
+          proposeNow(this.storage, {
+            date: sceneHit.pending.date || undefined,
+            time: sceneHit.pending.time || undefined,
+          }, { source: 'cue', scene });
+        } catch { /* ignore */ }
+      }
       if (sceneHit.changed && sceneHit.time && Number.isFinite(Number(sceneHit.time.hour))) {
         this._syncTimelinePresent({
+          deltaDays: sceneHit.time.deltaDays,
           hour: Number(sceneHit.time.hour),
           minute: sceneHit.time.minute,
         });
@@ -2080,21 +2551,65 @@ BRIDGE:`;
           deltaDays: sceneHit.date.deltaDays,
           hour: sceneHit.date.hour,
           parts: sceneHit.date.parts,
+          create: sceneHit.date.kind === 'absolute',
         });
       }
-      if (persist && (sceneHit.changed || sceneHit.date)) {
+      if (sceneHit.changed || sceneHit.date || scene.pendingCue) {
         try {
-          const snap = this._sceneClapSnapshot(st);
-          if (st.trackers.scene.date && snap.date && snap.date !== '—') {
-            st.trackers.scene.lastDateLabel = snap.date;
+          if (sceneHit.changed) {
+            const snap = this._sceneClapSnapshot(st);
+            if (scene.date && snap.date && snap.date !== '—') {
+              scene.lastDateLabel = snap.date;
+            }
+            if (scene.time && snap.time) {
+              scene.lastTimeLabel = snap.time;
+            }
+            commitNow(this.storage, {
+              clock: {
+                timeLabel: scene.lastTimeLabel,
+                hour: scene.lastTimeHour,
+                minute: scene.lastTimeMinute,
+                dateLabel: scene.lastDateLabel,
+                weatherEmoji: scene.weatherEmoji,
+                weatherLabel: scene.weatherLabel,
+              },
+            }, { source: 'cue', scene });
           }
-          if (st.trackers.scene.time && snap.time) {
-            st.trackers.scene.lastTimeLabel = snap.time;
-          }
-          this.saveState();
+          if (persist) this.saveState();
         } catch { /* ignore */ }
       }
+      if (persist) this._syncAutoPresence();
     } catch { /* ignore */ }
+  }
+
+  _syncAutoPresence({ persist = true } = {}) {
+    try {
+      const st = this._db();
+      const scene = normalizeTrackers(st.trackers).scene;
+      const { doc } = ensureNow(this.storage, { scene });
+      const compass = ensureCompass(st);
+      const out = syncCastPresence(this.storage, {
+        chat: getContext()?.chat || [],
+        compass,
+        occupancy: doc.occupancy,
+        persist,
+      });
+      if (out?.members?.length) syncSonarPresence(compass, out.members);
+    } catch { /* ignore */ }
+  }
+
+  /** Focus a place from the Set list and drop a child inspect that belongs elsewhere. */
+  _focusIndexedPlace(st, placeId) {
+    const id = String(placeId || '').trim();
+    if (!id) return;
+    this._compassFocusId = id;
+    this._suiteFromChild = false;
+    const childId = this._suiteHighlightChild;
+    if (childId && childId !== id) {
+      const child = getPlace(ensureCompass(st), childId);
+      if (child?.parentId !== id) this._suiteHighlightChild = '';
+    }
+    this._openPlaceFloorplanIfNeeded(st, id);
   }
 
   _openPlaceFloorplanIfNeeded(st, placeId, { force = false } = {}) {
@@ -2104,40 +2619,116 @@ BRIDGE:`;
       const compass = ensureCompass(st);
       const place = getPlace(compass, id);
       if (!place || !isCompassPlaceKind(place.kind)) return;
-      const emptyHost = isSuiteHostKind(place.kind) && !listSuiteChildren(compass, place.id).length;
-      if (!force && !emptyHost) return;
+      if (isSuiteHostKind(place.kind)) {
+        const hasRooms = listSuiteChildren(compass, place.id).length > 0;
+        const hasUnits = listSuiteUnits(compass, place.id).length > 0;
+        if (hasRooms || hasUnits) return;
+      } else if (!force) {
+        return;
+      }
       if (compass.activeRoomId !== id) loadRoom(compass, id);
       this._compassSave(st);
     });
   }
 
-  _scheduleLocCadence() {
-    clearTimeout(this._locTrackTimer);
-    this._locTrackTimer = setTimeout(() => {
-      this._runLocCadence().catch(err => console.warn('[Showtime/location cadence]', err));
-    }, 1200);
+  _receiptCadenceId() {
+    try {
+      const rec = normalizeTrackers(this.storage.getChat('backstage', {})?.trackers).receipt;
+      if (!rec?.enabled) return '';
+      return rec.cadence || 'per_turn';
+    } catch {
+      return '';
+    }
   }
 
-  async _runLocCadence() {
-    if (this._locBusy) return;
+  _receiptCount() {
+    const chat = getContext()?.chat || [];
+    const play = chat.filter(m => m && !m.is_system);
+    const cad = this._receiptCadenceId();
+    if (cad === 'per_n' || cad === 'per_post') return play.filter(m => !m.is_user).length;
+    return play.length;
+  }
+
+  _scheduleReceiptCadence({ stampTarget } = {}) {
+    const cad = this._receiptCadenceId();
+    if (!cad || cad === 'manual') return;
+    const target = stampTarget || (cad === 'per_turn' ? 'user' : 'ai');
+    clearTimeout(this._locTrackTimer);
+    const kick = () => {
+      if (this._receiptBusy) {
+        this._locTrackTimer = setTimeout(kick, 800);
+        return;
+      }
+      this._receiptBusy = true;
+      console.log('[Showtime/receipt] scheduled run', { cadence: cad, target });
+      runReceiptFiling(this.storage, { bus: this.bus, cursor: this, stampTarget: target })
+        .then(() => this._scheduleSuiteBuild())
+        .catch(err => console.warn('[Showtime/receipt]', err))
+        .finally(() => { this._receiptBusy = false; });
+    };
+    this._locTrackTimer = setTimeout(kick, 800);
+  }
+
+  _scheduleWorldIndexAudit() {
+    clearTimeout(this._worldIndexTimer);
+    const kick = () => {
+      if (this._worldIndexBusy) {
+        this._worldIndexTimer = setTimeout(kick, 800);
+        return;
+      }
+      this._worldIndexBusy = true;
+      runWorldIndexAudit(this.storage, { bus: this.bus })
+        .catch(err => console.warn('[Showtime/WorldIndex]', err))
+        .finally(() => { this._worldIndexBusy = false; });
+    };
+    this._worldIndexTimer = setTimeout(kick, 900);
+  }
+
+  _scheduleLocCadence() {
+    this._scheduleReceiptCadence();
+  }
+
+  _scheduleLocFallbackCadence() {
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    if (st.trackers.receipt?.enabled !== false) return;
+    if (st.trackers.location?.enabled === false) return;
+    clearTimeout(this._locTrackTimer);
+    this._locTrackTimer = setTimeout(() => {
+      void this._runLocCadence().catch(err => console.warn('[Showtime/location cadence]', err));
+    }, 900);
+  }
+
+  _handleReceiptLocationNotice(receipt) {
     const st = this._db();
     st.trackers = normalizeTrackers(st.trackers);
     if (st.trackers.location?.enabled === false) return;
-    const status = st.trackers.status || {};
-    if (status.cadence === 'manual') return;
-    const chat = getContext()?.chat || [];
-    const n = chat.filter(m => m && !m.is_system).length;
-    const every = status.cadence === 'per_post' ? 1 : Math.max(1, Number(status.everyN) || 4);
-    if (!this._locTrackPrimed) {
-      this._locTrackPrimed = true;
-      this._locLastCount = n;
-      return;
+    const loc = receipt?.location;
+    if (!loc || loc.mode !== 'compass') return;
+    const rawPlace = String(loc.placeKey || loc.place || '').trim();
+    if (!rawPlace) return;
+    const compass = ensureCompass(st);
+    const prevPlaceId = String(compass.sonar?.lastPlaceId || '');
+    const prevPlace = prevPlaceId ? getPlace(compass, prevPlaceId) : null;
+    const filing = resolveLocationFiling(
+      { here: rawPlace, kind: loc.placeKind || '', parent: loc.parentName || '' },
+      { compass, storage: this.storage, trackerPlace: prevPlace },
+    );
+    if (!filing?.name) return;
+    if (!filing.known || (loc.changed && !st.trackers.scene?.pendingCue)) {
+      this._emitLocationNotice(filing);
     }
-    const prev = this._locLastCount || 0;
-    if (n - prev < every) return;
-    const windowRows = playMessagesSince(chat, prev);
+  }
+
+  async _runLocCadence({ skipIfLocationChanged = false } = {}) {
+    if (this._locBusy) return;
+    if (skipIfLocationChanged) return;
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    if (st.trackers.location?.enabled === false) return;
+    const chat = getContext()?.chat || [];
+    const windowRows = (chat.filter(m => m && !m.is_system) || []).slice(-8);
     const windowText = windowRows.map(m => formatChatLine(m, 480)).filter(Boolean).join('\n');
-    this._locLastCount = n;
     const compass = ensureCompass(st);
     if (!locCueHit(windowText, compass)) return;
     const scene = clipExcerptToLines(String(windowText || '').trim(), 1800);
@@ -2151,19 +2742,101 @@ BRIDGE:`;
       if ((getContext()?.chatMetadata ?? null) !== chatToken) return;
       const delta = parseLocationDelta(response);
       if (!delta) return;
-      const applied = applyLocationDelta(compass, this.storage, delta);
-      if (applied.key && st.trackers.scene) {
-        st.trackers.scene.lastLocationKey = locationKeyFromStored(applied.key);
+      if (delta.here && !confirmSettingHere(scene, delta.here)) delta.here = '';
+      const prevKey = locationKeyFromStored(st.trackers.scene?.lastLocationKey || '');
+      const prevPlaceId = String(compass.sonar?.lastPlaceId || '');
+      const prevPlace = prevPlaceId ? getPlace(compass, prevPlaceId) : null;
+      const filing = resolveLocationFiling(delta, {
+        compass,
+        storage: this.storage,
+        trackerPlace: prevPlace,
+      });
+      if (delta.here) {
+        const hereKey = locationKeyFromStored(delta.here || filing?.name || '');
+        if (hereKey && hereKey.toLowerCase() !== String(prevKey || '').toLowerCase()) {
+          this._queuePendingCue(st.trackers.scene, {
+            location: {
+              key: hereKey,
+              placeId: String(filing?.placeId || '').trim(),
+              label: hereKey,
+            },
+          });
+        }
+        delta.here = '';
       }
+      const applied = applyLocationDelta(compass, this.storage, delta);
+      const hereKey = locationKeyFromStored(applied.key || filing?.name || '');
+      const sameTracker = !!(filing?.placeId && prevPlaceId && filing.placeId === prevPlaceId)
+        || !!(hereKey && prevKey && hereKey.toLowerCase() === String(prevKey).toLowerCase());
       if (applied.changed) {
         try { this.saveState(); } catch { /* ignore */ }
       }
+      if (filing && hereKey && !sameTracker && !st.trackers.scene.pendingCue) {
+        this._emitLocationNotice(filing);
+      }
       this._scanChatTrackers({ persist: true });
-      try { this._syncFloatingClapper(); } catch { /* ignore */ }
+      try { this._syncFloatingClapper(false, { scan: false }); } catch { /* ignore */ }
       if (this.container && this._door === 'set') this.render(this.container);
     } finally {
       this._locBusy = false;
     }
+  }
+
+  _rememberListingCode(code) {
+    const v = canonicalizeListingCode(code);
+    if (!v) return;
+    const st = this._db();
+    const pal = collectListingPalette([...(st.customListingCodes || []), v, ...listingCodesFromPlaces(ensureCompass(st))]);
+    st.customListingCodes = pal.custom;
+    this.saveState();
+  }
+
+  _emitLocationNotice(filing) {
+    const st = this._db();
+    if (clapperIsShowing(st.trackers)) return;
+    const name = String(filing?.name || '').trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (this._locNoticeKey === key) return;
+    this._locNoticeKey = key;
+    const kindLabel = filing.kindLabel || filing.kind || '';
+    const nest = filing.parentName ? `nest under ${filing.parentName}?` : '';
+    const text = filing.known
+      ? `Scene moved · ${name}${kindLabel ? ` · ${kindLabel}` : ''} · update tracker?`
+      : `New scene · ${name}${kindLabel ? ` · ${kindLabel}` : ''}${nest ? ` · ${nest}` : ''}`;
+    this.bus?.emit('showtime.notice', {
+      kind: 'location',
+      items: [{
+        text,
+        mark: '?',
+        name,
+        locKey: key,
+        placeKind: filing.kind || '',
+        parentId: filing.parentId || '',
+        placeId: filing.placeId || '',
+      }],
+    });
+  }
+
+  _applyLocationDraft(draft = {}) {
+    const name = String(draft.name || '').trim();
+    const placeId = String(draft.placeId || '').trim();
+    const kind = String(draft.kind || '').trim();
+    const parentId = String(draft.parentId || '').trim();
+    this._door = 'set';
+    this._prodFolds ??= new Set();
+    this._prodFolds.add('set-places');
+    if (placeId) {
+      this._compassFocusId = placeId;
+      this._setCreateOpen = false;
+      this._setCreateDraft = null;
+    } else {
+      this._setCreateOpen = true;
+      this._setCreateDraft = { name, kind, parentId };
+    }
+    const shell = window.Showtime?.shell;
+    shell?.activate?.('backstage');
+    if (this.container) this.render(this.container);
   }
 
   _sceneLocationBits(compass, placeId, fallback = '') {
@@ -2174,7 +2847,24 @@ BRIDGE:`;
     return key ? [key] : [];
   }
 
-  _syncTimelinePresent({ hour, deltaDays, parts: cueParts, minute } = {}) {
+  _stampTimelinePresent(parts, cal) {
+    const y = Number(parts?.year);
+    const mi = Number(parts?.monthIndex);
+    const d = Math.max(1, Number(parts?.day) || 1);
+    const h = Number.isFinite(Number(parts?.hour)) ? Number(parts.hour) : 0;
+    const earth = (Number(cal?.monthsPerYear) || 12) === 12 && Number.isFinite(y) && Number.isFinite(mi);
+    const sort = earth
+      ? earthDateSort(Date.UTC(y, Math.max(0, mi), d, Math.min(23, Math.max(0, h))))
+      : calendarSort(parts, cal);
+    return {
+      parts,
+      sort: Number.isFinite(sort) ? sort : 0,
+      key: formatTimeKey(parts, cal) || '',
+      scale: earth ? 'date' : 'calendar',
+    };
+  }
+
+  _syncTimelinePresent({ hour, deltaDays, parts: cueParts, minute, create = false } = {}) {
     const hasHour = Number.isFinite(Number(hour));
     const days = Math.trunc(Number(deltaDays) || 0);
     const abs = cueParts && typeof cueParts === 'object' ? cueParts : null;
@@ -2182,9 +2872,17 @@ BRIDGE:`;
     try {
       const script = this.storage.getChat('script', {});
       script.settings ??= {};
-      const present = script.settings.timelinePresent;
-      if (!present?.parts || typeof present.parts !== 'object') return;
+      let present = script.settings.timelinePresent;
       const cal = normalizeCalendar(script.settings.calendar);
+      if ((!present?.parts || typeof present.parts !== 'object') && create) {
+        const seed = { ...(abs || {}) };
+        if (hasHour) seed.hour = Number(hour);
+        if (Number.isFinite(Number(minute))) seed.minute = Math.max(0, Math.min(59, Number(minute)));
+        script.settings.timelinePresent = this._stampTimelinePresent(seed, cal);
+        this.storage.saveChat();
+        return;
+      }
+      if (!present?.parts || typeof present.parts !== 'object') return;
       let parts = { ...present.parts };
       if (days) parts = shiftPartsByDays(parts, days, cal);
       if (abs) {
@@ -2197,9 +2895,7 @@ BRIDGE:`;
       }
       if (hasHour) parts.hour = Number(hour);
       if (Number.isFinite(Number(minute))) parts.minute = Math.max(0, Math.min(59, Number(minute)));
-      present.parts = parts;
-      const key = formatTimeKey(parts, cal);
-      if (key) present.key = key;
+      Object.assign(present, this._stampTimelinePresent(parts, cal));
       this.storage.saveChat();
     } catch { /* ignore */ }
   }
@@ -2210,13 +2906,32 @@ BRIDGE:`;
 
   _runSonar(compass, { persist = false } = {}) {
     try {
+      this._sonarAt = Date.now();
       const before = sonarFingerprint(compass?.sonar);
       const chat = getContext()?.chat || [];
+      const castMembers = this._sonarCast({ includeWrittenOut: true });
+      const st = this._db();
+      const scene = normalizeTrackers(st.trackers).scene;
+      const heldPlaceId = scene.boardHeld
+        ? String(scene.travel?.placeId || compass?.activeRoomId || '').trim()
+        : '';
+      const afterTs = scene.boardHeld ? (Number(scene.lastClapAt) || 0) : 0;
       const result = applySonarPings(compass, {
-        castMembers: this._sonarCast({ includeWrittenOut: true }),
+        castMembers,
+        storage: this.storage,
+        chat,
+        heldPlaceId,
+        afterTs,
+      });
+      const pinned = pinNarratedSplitScene(compass, {
+        chatId: String(getContext()?.chatId || ''),
+        castMembers,
         storage: this.storage,
         chat,
       });
+      if (pinned) {
+        try { this.saveState(); } catch { /* ignore */ }
+      }
       const status = summarizeSonarCheck(compass, {
         storage: this.storage,
         chat,
@@ -2273,22 +2988,32 @@ BRIDGE:`;
   _establishLocation({ placeId, cell } = {}) {
     const st = this._db();
     const compass = ensureCompass(st);
-    const place = getPlace(compass, placeId);
+    let place = getPlace(compass, placeId);
     if (!place) {
-      alert('Select a room on the suite plan, or open a room, then We’re here.');
+      void showtimeAlert('Select a room on the suite plan, or open a room, then We’re here.', { title: 'ESTABLISH LOCATION' });
       return;
     }
-    if (!isCompassPlaceKind(place.kind)) {
-      alert('Pick a room, hall, or building exterior — a unit isn’t a standing location.');
-      return;
+    if (!isScenePlaceKind(place.kind)) {
+      const childId = defaultStandingChild(compass, place.id);
+      const childPlace = childId ? getPlace(compass, childId) : null;
+      if (childPlace) {
+        place = childPlace;
+      } else {
+        void showtimeAlert('Pick a room, hall, building exterior, or an area / city / country — a unit isn’t a standing location.', { title: 'ESTABLISH LOCATION' });
+        return;
+      }
     }
     let cellId = 'C';
     try { cellId = normalizeCell(cell || this._compassSelCell || 'C'); } catch { cellId = 'C'; }
     this._compassTry(() => {
-      loadRoom(compass, place.id);
+      if (isCompassPlaceKind(place.kind)) {
+        loadRoom(compass, place.id);
+      }
       this._compassSelCell = cellId;
       const focus = getPlace(compass, this._compassFocusId);
-      if (isSuiteHostKind(focus?.kind) && place.parentId === focus.id) {
+      if (!isCompassPlaceKind(place.kind)) {
+        this._compassFocusId = place.id;
+      } else if (isSuiteHostKind(focus?.kind) && place.parentId === focus.id) {
         this._suiteHighlightChild = place.id;
       } else if (this._door === 'set' && focus?.id !== place.id && place.parentId) {
         const parent = getPlace(compass, place.parentId);
@@ -2303,15 +3028,19 @@ BRIDGE:`;
       const key = String((place.locationTags || []).find(t => String(t || '').trim()) || place.name || place.id).trim();
       const rawKey = mostPreciseGeoName(compass, place) || locationKeyFromStored(key) || place.name;
       st.trackers = normalizeTrackers(st.trackers);
-      st.trackers.scene.lastLocationKey = rawKey;
       st.trackers.scene.lastClapAt = Date.now();
+      commitNow(this.storage, {
+        occupancy: { mode: 'compass', placeKey: rawKey, placeId: place.id },
+      }, { force: true, source: 'pin', scene: st.trackers.scene, bus: this.bus });
+      this._armBoardHold(st.trackers.scene);
       compass.sonar = compass.sonar && typeof compass.sonar === 'object' ? compass.sonar : { pings: {} };
       compass.sonar.pings = compass.sonar.pings && typeof compass.sonar.pings === 'object'
         ? compass.sonar.pings
         : {};
+      const now = Date.now();
       compass.sonar.lastKey = rawKey;
       compass.sonar.lastPlaceId = place.id;
-      compass.sonar.lastAt = Date.now();
+      compass.sonar.lastAt = now;
       const star = getStarMember(this.storage);
       if (star?.name) {
         const id = String(star.id || star.name);
@@ -2321,20 +3050,133 @@ BRIDGE:`;
           placeId: place.id,
           cell: cellId,
           key: rawKey,
-          at: Date.now(),
+          at: now,
           manual: true,
+          away: false,
+          awayLabel: '',
+          departedFrom: '',
+          listening: false,
+          listeningVia: '',
+          listeningPlaceId: '',
         };
       }
+      const castMembers = this._sonarCast({ includeWrittenOut: true });
+      for (const m of castMembers) {
+        if (!m?.name || m.presence !== 'inPlay') continue;
+        const id = String(m.id || m.name);
+        const prev = compass.sonar.pings[id] || {};
+        if (prev.locked) continue;
+        compass.sonar.pings[id] = {
+          ...prev,
+          name: m.name,
+          castId: id,
+          placeId: place.id,
+          cell: (star?.name && id === String(star.id || star.name)) ? cellId : (prev.cell || cellId),
+          key: rawKey,
+          at: now,
+          manual: true,
+          away: false,
+          awayLabel: '',
+          departedFrom: '',
+          listening: false,
+          listeningVia: '',
+          listeningPlaceId: '',
+        };
+      }
+      reconcileRoomOccupants(compass, castMembers);
       this._pushComposerLocation(this._sceneLocationBits(compass, place.id, rawKey));
       this._compassSave(st);
     });
+    this._syncAutoPresence();
     this._syncStageBackground();
     this._syncWeatherOverlay();
-    this._syncFloatingClapper();
+    this._syncFloatingClapper(false, { scan: false });
     this.bus?.emit('showtime.stateChanged');
-    if (this._door === 'set' || this._door === 'placement' || this._door === 'studio-trackers') {
+    if (this._door === 'set' || this._door === 'placement' || this._door === 'production') {
       this.render(this.container);
     }
+    this._scheduleSuiteBuild();
+  }
+
+  _suiteSceneClip() {
+    const chat = getContext()?.chat || [];
+    return chat.slice(-12).map(m => `${m?.name || ''}: ${String(m?.mes || '').slice(0, 400)}`).join('\n');
+  }
+
+  _scheduleSuiteBuild() {
+    clearTimeout(this._suiteBuildTimer);
+    this._suiteBuildTimer = setTimeout(() => { void this._kickSuiteBuild(); }, 900);
+  }
+
+  async _kickSuiteBuild() {
+    if (this._suiteBuildBusy) {
+      this._scheduleSuiteBuild();
+      return;
+    }
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const travel = normalizeTravel(st.trackers.scene?.travel, {
+      lastLocationKey: st.trackers.scene?.lastLocationKey,
+    });
+    if (travel.mode !== 'compass') return;
+    const compass = ensureCompass(st);
+    this._suiteBuildBusy = true;
+    try {
+      const hit = await runSuiteProgram(this.storage, compass, travel, {
+        scene: this._suiteSceneClip(),
+      });
+      if (!hit?.draft) return;
+      this.saveState();
+      this.bus?.emit('showtime.notice', {
+        kind: 'suite',
+        items: [{
+          text: `Compass builder · ${hit.draft.hostName || 'suite'}`,
+          mark: '+',
+          hostId: hit.draft.hostId,
+        }],
+      });
+      this.bus?.emit('showtime.stateChanged');
+      if (this.container && this._door === 'set') this.render(this.container);
+    } catch (err) {
+      console.warn('[Showtime/SuiteBuild]', err);
+    } finally {
+      this._suiteBuildBusy = false;
+    }
+  }
+
+  _openSuiteDraft(draft = {}) {
+    this._door = 'set';
+    const hostId = String(draft.hostId || '').trim();
+    if (hostId) this._compassFocusId = hostId;
+    const shell = window.Showtime?.shell;
+    shell?.activate?.('backstage');
+    if (this.container) this.render(this.container);
+  }
+
+  async _acceptSuiteDraft() {
+    const st = this._db();
+    const compass = ensureCompass(st);
+    this._busy = true;
+    try {
+      const result = await commitSuiteDraft(this.storage, compass, {
+        scene: this._suiteSceneClip(),
+      });
+      if (result?.hostId) this._compassFocusId = result.hostId;
+      this._compassSave(st);
+    } catch (err) {
+      console.warn('[Showtime/SuiteBuild]', err);
+      void showtimeAlert(err?.message || 'Could not build those rooms.', { title: 'SUITE BUILDER', danger: true });
+    } finally {
+      this._busy = false;
+    }
+  }
+
+  _dismissSuiteDraft() {
+    const st = this._db();
+    const compass = ensureCompass(st);
+    dismissSuiteDraft(compass);
+    this.saveState();
+    if (this.container && this._door === 'set') this.render(this.container);
   }
 
   _setHTML(st) {
@@ -2343,6 +3185,7 @@ BRIDGE:`;
     if (!this._compassFocusId) this._compassFocusId = compass.activeRoomId || '';
     if (!this._compassSelCell) this._compassSelCell = 'C';
     const focus = getPlace(compass, this._compassFocusId);
+    if (!isSuiteHostKind(focus?.kind)) this._suiteFromChild = false;
     if (isSuiteHostKind(focus?.kind)) {
       try {
         const { dirty } = ensureSuiteLayout(compass, focus.id);
@@ -2350,7 +3193,6 @@ BRIDGE:`;
       } catch { /* ignore */ }
     }
     const sonar = this._runSonar(compass);
-    const auditReport = auditCompass(compass, { focusId: this._compassFocusId || compass.activeRoomId || '' });
     return buildSetHtml({
       compass,
       active,
@@ -2363,7 +3205,11 @@ BRIDGE:`;
       suiteMode: ['arrange', 'walls', 'fixtures'].includes(this._suiteMode) ? this._suiteMode : 'browse',
       suiteFixtureAct: this._suiteFixtureAct === 'remove' ? 'remove' : (this._suiteFixtureAct === 'place' ? 'place' : ''),
       suiteHighlightChild: this._suiteHighlightChild || '',
-      herePlaceId: compass.activeRoomId || '',
+      suiteFromChild: !!this._suiteFromChild,
+      herePlaceId: this._trackerPlace(compass, normalizeTrackers(st.trackers).scene)?.id
+        || compass.sonar?.lastPlaceId
+        || compass.activeRoomId
+        || '',
       hereCell: this._compassSelCell || 'C',
       selectedShared: this._suiteSelShared || null,
       selectedEdge: this._suiteSelEdge || null,
@@ -2375,8 +3221,11 @@ BRIDGE:`;
       sonarStatus: sonar.status,
       sonarCast: this._sonarCast(),
       lastOpening: this._lastOpening || null,
-      storyFocus: this._suiteStoryFocus === 'lower' ? 'lower' : 'upper',
-      auditReport,
+      storyFocus: (this._suiteStoryFocus === 'lower' || this._suiteStoryFocus === 'upper')
+        ? this._suiteStoryFocus
+        : (this._suiteStoryFocus != null && this._suiteStoryFocus !== '' && Number.isFinite(Number(this._suiteStoryFocus))
+          ? String(Math.round(Number(this._suiteStoryFocus)))
+          : 'upper'),
       storage: this.storage,
       createOpen: !!this._setCreateOpen,
       sonarFilter: this._sonarFilter || '',
@@ -2385,6 +3234,7 @@ BRIDGE:`;
       placesFold: [...(this._placesFold || [])],
       placesFoldAuto: !this._placesFoldUser,
       placesEditId: this._placesEditId || '',
+      createDraft: this._setCreateDraft || null,
       esc,
     });
   }
@@ -2419,23 +3269,51 @@ BRIDGE:`;
     return buildEffectsHtml(effects, scene, { esc, roomExposed: this._activeRoomExposed() });
   }
 
-  _studioTrackersHTML(st) {
+  _studioTrackersInner(st) {
     const trackers = normalizeTrackers(st.trackers);
     const clap = this._sceneClapSnapshot(st);
     const seasonHint = clap.season || '';
-    return buildTrackersHtml(trackers, { esc, clap, seasonHint });
+    const draft = this._sceneSetDraft(st);
+    return buildTrackersHtml(trackers, {
+      esc,
+      clap,
+      seasonHint,
+      calendar: draft.calendar,
+      setDraft: draft,
+      embedded: true,
+    });
   }
 
-  _sceneClapSnapshot(st = this._db()) {
+  _openDoor(door) {
+    const id = String(door || '').trim();
+    if (this._doorShut(id)) {
+      this._door = '';
+      return;
+    }
+    if (id === 'studio-trackers') {
+      this._door = 'production';
+      this._prodFolds ??= new Set();
+      this._prodFolds.add('trackers');
+      return;
+    }
+    this._door = id;
+  }
+
+  _sceneClapSnapshot(st = this._db(), { lite = false } = {}) {
     const t = normalizeTrackers(st.trackers);
     const scene = t.scene;
     const compass = ensureCompass(st);
-    // Sonar pings only exist on `compass` once _runSonar has scanned the
-    // latest message into it — without this, listSonarPingsInPlace below
-    // always reads an empty ping table and "star" never shows a position.
-    this._runSonar(compass);
-    const trackerPlace = this._trackerPlace(compass, scene);
-    let location = locationKeyFromStored(scene.lastLocationKey)
+    // Use the last saved pings. A fresh scan walks every room and tag, and
+    // the clapper paints on chat load — that is what locks the page after
+    // the messages are up. Generate and the Set view still scan.
+    const trackerPlace = this._trackerPlace(compass, scene, { scanFormatted: !lite });
+    let travel = normalizeTravel(scene.travel, { lastLocationKey: scene.lastLocationKey });
+    try {
+      const now = ensureNow(this.storage, { scene });
+      travel = now.doc.occupancy;
+      if (now.doc.lastLocationKey) scene.lastLocationKey = now.doc.lastLocationKey;
+    } catch { /* ignore */ }
+    let location = locationKeyFromStored(travel.placeKey || scene.lastLocationKey)
       || locationKeyFromStored(compass.sonar?.lastKey)
       || '';
     let star = '—';
@@ -2451,29 +3329,29 @@ BRIDGE:`;
       } else if (starName) {
         star = starName;
       }
-      location = formatSceneLocation({
-        compass,
-        storage: this.storage,
-        placeId: trackerPlace?.id || '',
-        key: location,
-      });
+      if (travel.mode === 'moving') {
+        location = formatOccupancyLabel(travel, { lastLocationKey: scene.lastLocationKey });
+      } else {
+        location = formatSceneLocation({
+          compass,
+          storage: this.storage,
+          placeId: travel.placeId || trackerPlace?.id || '',
+          key: location,
+        });
+      }
     } catch { /* ignore */ }
 
     let season = '';
     let dateLabel = scene.lastDateLabel || '';
     let timeLabel = scene.lastTimeLabel || '';
     try {
-      const scriptMod = window.Showtime?.modules?.get('script');
       const script = this.storage.getChat('script', {});
       const cal = normalizeCalendar(script?.settings?.calendar);
       let parts = null;
-      if (scene.followTimeline !== false) {
-        const present = typeof scriptMod?.getTimelinePresent === 'function'
-          ? scriptMod.getTimelinePresent()
-          : getTimelinePresent(script, {
-            selectedUid: scriptMod?._selectedUid,
-            focusedUid: scriptMod?._focusedUid,
-          });
+      const labelsReady = !!(scene.lastDateLabel || scene.lastTimeLabel || scene.lastTimeHour != null);
+      // Lite skips the script-deck walk. Stored board labels already say when it is.
+      if (scene.followTimeline !== false && !(lite && labelsReady)) {
+        const present = currentTimelinePresent(this.storage);
         if (present?.parts) parts = present.parts;
       }
 
@@ -2484,11 +3362,15 @@ BRIDGE:`;
         season = seasonHit?.label || '';
       }
       if (scene.date) {
-        const absCue = String(scene.lastDateCueSig || '').startsWith('absolute');
-        if (absCue && scene.lastDateLabel) {
+        if (scene.boardHeld && scene.lastDateLabel) {
           dateLabel = scene.lastDateLabel;
-        } else if (parts) {
-          dateLabel = formatSceneDate(parts, cal, scene.dateParts) || dateLabel;
+        } else {
+          const absCue = String(scene.lastDateCueSig || '').startsWith('absolute');
+          if (absCue && scene.lastDateLabel) {
+            dateLabel = scene.lastDateLabel;
+          } else if (parts) {
+            dateLabel = formatSceneDate(parts, cal, scene.dateParts) || dateLabel;
+          }
         }
       }
       if (scene.time) {
@@ -2519,12 +3401,88 @@ BRIDGE:`;
   }
 
   _studioVisualsHTML(st) {
+    if (this._houseClosed()) return this._productionGalleryHTML();
     const compass = ensureCompass(st);
     const places = Object.values(compass.rooms || {})
       .filter(p => p.kind === 'room' || p.kind === 'transitional' || p.kind === 'hall')
       .sort((a, b) => a.name.localeCompare(b.name));
     const ctx = this._bgContext();
     return buildVisualsHtml(normalizeVisuals(st.visuals), { esc, places, ctx, placeName: ctx.placeName });
+  }
+
+  _productionGallery() {
+    const g = this._g();
+    if (!g.gallery || typeof g.gallery !== 'object') g.gallery = { plates: [] };
+    if (!Array.isArray(g.gallery.plates)) g.gallery.plates = [];
+    return g.gallery;
+  }
+
+  _productionNames() {
+    const names = [];
+    const seen = new Set();
+    const push = (raw) => {
+      const name = String(raw || '').trim();
+      const key = name.toLowerCase();
+      if (!name || seen.has(key)) return;
+      seen.add(key);
+      names.push(name);
+    };
+    try {
+      for (const row of listReelCatalog(extension_settings)) push(row.title || row.file);
+    } catch { /* reel shelf is optional */ }
+    for (const plate of this._productionGallery().plates) {
+      for (const name of plate.productions || []) push(name);
+    }
+    return names;
+  }
+
+  _productionGalleryHTML() {
+    const plates = this._productionGallery().plates;
+    const names = this._productionNames();
+    const chips = names.length
+      ? `<div class="bst-chip-row">${names.map(name =>
+        `<button type="button" class="bst-chip" data-action="gallery-fill" data-prod="${esc(name)}">${esc(name)}</button>`).join('')}</div>`
+      : '<p class="bst-hint">Export a reel and its title shows up here. A plate can carry more than one.</p>';
+    const cards = plates.length
+      ? plates.map(plate => {
+        const src = String(plate.url || '').replace(/"/g, '');
+        const prods = (plate.productions || []).map(name =>
+          `<button type="button" class="bst-chip on" data-action="gallery-untag" data-id="${esc(plate.id)}" data-prod="${esc(name)}">${esc(name)} ×</button>`).join('');
+        return `<article class="bst-gallery-plate">
+          ${src ? `<img src="${esc(src)}" alt="">` : '<div class="bst-gallery-blank">No image</div>'}
+          <div>
+            <strong>${esc(plate.title || 'Untitled')}</strong>
+            <div class="bst-chip-row">${prods || '<span class="bst-k">No production yet</span>'}</div>
+            <div class="bst-row">
+              <input type="text" data-gallery-prod="${esc(plate.id)}" placeholder="Add a production" maxlength="80">
+              <button type="button" class="bst-btn" data-action="gallery-tag" data-id="${esc(plate.id)}">Add</button>
+              <button type="button" class="bst-btn" data-action="gallery-drop" data-id="${esc(plate.id)}">Delete</button>
+            </div>
+          </div>
+        </article>`;
+      }).join('')
+      : '<p class="bst-hint">No plates yet. A plate can belong to several productions at once.</p>';
+    return `
+      <h2 class="bst-pane-title">Visuals</h2>
+      <p class="bst-pane-sub">A gallery for productions. One plate can hang on more than one reel.</p>
+      <section class="bst-section">
+        <label class="bst-field"><span>Title</span>
+          <input type="text" data-gallery-title maxlength="80" placeholder="Night train">
+        </label>
+        <label class="bst-field"><span>Image address</span>
+          <input type="text" data-gallery-url placeholder="https://…">
+        </label>
+        <label class="bst-field"><span>Productions</span>
+          <input type="text" data-gallery-productions placeholder="Lost &amp; Found, Other">
+        </label>
+        ${chips}
+        <button type="button" class="bst-btn gold" data-action="gallery-add">Add plate</button>
+      </section>
+      <div class="bst-gallery">${cards}</div>`;
+  }
+
+  _splitProductions(raw) {
+    return [...new Set(String(raw || '').split(/[,;\n]/).map(s => s.trim()).filter(Boolean))];
   }
 
   _compassSave(st) {
@@ -2544,12 +3502,49 @@ BRIDGE:`;
       fn();
       return true;
     } catch (err) {
-      alert(err.message || String(err));
+      void showtimeAlert(err.message || String(err), { title: 'SET COMPASS', danger: true });
       return false;
     }
   }
 
   // ── Settings ───────────────────────────────────────────────────────────────
+
+  _houseHealthLines({ measure = false } = {}) {
+    if (measure) {
+      try { this.injector?.refreshAlwaysOn?.(); } catch { /* ignore */ }
+    }
+    return formatHouseHealthLines({
+      health: readHouseHealth(this.storage),
+      injects: this.injector?.lastAlwaysOn || [],
+    });
+  }
+
+  _houseHealthRows(lines) {
+    const row = (k, v) => `<div class="bst-health-row"><span>${esc(k)}</span><span class="bst-k">${esc(v)}</span></div>`;
+    return `<div class="bst-health-rows" data-role="house-health-rows">
+        ${row('Receipt', lines.receipt)}
+        ${row('Presence', lines.presence)}
+        ${row('Cue', lines.cue)}
+        ${row('Injects', lines.injects)}
+      </div>`;
+  }
+
+  _houseHealthHTML() {
+    const lines = this._houseHealthLines({ measure: true });
+    return `
+      <section class="bst-section bst-health" data-role="house-health">
+        <h3 class="bst-section-h">House health</h3>
+        <p class="bst-hint">Whether Showtime ran — not whether the model filed the right story.</p>
+        ${this._houseHealthRows(lines)}
+      </section>`;
+  }
+
+  _refreshHouseHealth() {
+    if (this._door !== 'settings' || !this.container) return;
+    const host = this.container.querySelector('[data-role="house-health-rows"]');
+    if (!host) return;
+    host.outerHTML = this._houseHealthRows(this._houseHealthLines());
+  }
 
   _settingsHTML() {
     const g = this._g();
@@ -2572,33 +3567,23 @@ BRIDGE:`;
 
       ${root.masterOff ? `<div class="bst-warn">Master off is engaged. Injections and trackers are silenced.</div>` : ''}
 
+      ${this._houseHealthHTML()}
+
       <section class="bst-section">
         <h3 class="bst-section-h">Handbook</h3>
         <div class="bst-handbook">
-          <p>Showtime is a production desk for SillyTavern. Tabs share a cream marquee; each owns a slice of chat or global memory.</p>
-          <h4>Quick start</h4>
-          <ol>
-            <li>Cast — mark a Star, fill cards.</li>
-            <li>Script — Agent from chat or Library cubbies; use <strong>Configure</strong> for levels, calendar, and activation.</li>
-            <li>Library — file lore into cubbies; Twins / Hide extras for duplicates.</li>
-            <li>Backstage — Director, interviews, gallery, set, and these house settings.</li>
-          </ol>
-          <h4>Spotify (Composer)</h4>
-          <p>Create a Spotify Developer app, paste the <strong>Redirect URI</strong> shown in Composer → Spotify (the Showtime <code>spotify-callback.html</code> page — not SillyTavern’s main <code>/</code>), then paste only the <strong>Client ID</strong> in Composer. OAuth uses PKCE — no client secret. Returns land back in the marquee.</p>
+          <p>The program is the player glossary: what each tab is for, and what the theatre words mean. The same program opens from the curtain while the house is closed.</p>
+          <button type="button" class="bst-btn gold" data-action="open-program">Open program</button>
         </div>
       </section>
 
       <section class="bst-section">
         <h3 class="bst-section-h">Connection profiles</h3>
-        <p class="bst-hint">Pick which SillyTavern connection profile audits, Motivation, interviews, and Director events / Peanut Gallery should use. Script Agent budgets live under Script → Configure.</p>
-        <div class="bst-field"><span>Audits (Cast / Inventory / Reputation)</span>
-          <select data-g="profile-audit">${profileOpts(g.profiles.audit)}</select></div>
-        <div class="bst-field"><span>Motivation (Audit + narrative sonar)</span>
-          <select data-g="profile-motivation">${profileOpts(g.profiles.motivation)}</select></div>
-        <div class="bst-field"><span>Interview</span>
-          <select data-g="profile-interview">${profileOpts(g.profiles.interview)}</select></div>
-        <div class="bst-field"><span>Director events / Peanut Gallery</span>
-          <select data-g="profile-event">${profileOpts(g.profiles.event)}</select></div>
+        <p class="bst-hint">House defaults for quiet Showtime jobs. Empty = whichever model is currently selected in Connection Manager. Script Agent may still override the Script slot per chat under Script → Configure.</p>
+        ${PROFILE_SLOTS.map(s => `
+        <div class="bst-field"><span>${esc(s.label)}</span>
+          <select data-g="profile-${esc(s.id)}">${profileOpts(g.profiles[s.id])}</select>
+          <span class="bst-k">${esc(s.hint)}</span></div>`).join('')}
       </section>
 
       <section class="bst-section">
@@ -2684,14 +3669,32 @@ BRIDGE:`;
         if (k) k.textContent = `${clampParticleIntensity(e.target.value)}%`;
       }
     });
-    this._bindFloorplanDrag(root);
-    this._bindFloorplanViewport(root);
-    this._bindSuiteCanvas(root);
-    this._bindLocationTagPickers(root);
-    this._applySonarFilter(root);
+    if (this._door !== 'interview') {
+      this._bindFloorplanDrag(root);
+      this._bindFloorplanViewport(root);
+      this._bindSuiteCanvas(root);
+      this._bindLocationTagPickers(root);
+      this._applySonarFilter(root);
+    }
+    this._bindInterviewNotes(root);
     root.querySelectorAll('.bst-set-fold > summary, .bst-sonar-sum, .bst-places-sum').forEach(sum => {
+      // A control inside a summary must not toggle the folder. preventDefault
+      // cancels that toggle; the click still bubbles so Open / Edit / Compass run.
+      // stopPropagation here used to eat the click, which meant a building or
+      // unit row (they live in the summary) could never be focused.
       sum.addEventListener('click', (e) => {
-        if (e.target.closest('[data-action="set-open-place"], [data-action="place-open-compass"], [data-action="place-edit"], [data-action="place-edit-save"], [data-action="place-edit-cancel"], [data-action="place-edit-remove"], [data-action="place-edit-merge"], [data-action="place-unlisted-dismiss"], [data-action="set-sonar-check"], [data-action="set-toggle-create"], [data-role="place-edit-kind"], [data-role="place-edit-parent"], [data-role="place-edit-merge"]')) e.preventDefault();
+        if (e.target.closest('button, select, input, textarea, label, [data-action], [data-role^="place-edit"]')) {
+          e.preventDefault();
+        }
+      }, true);
+      sum.addEventListener('dblclick', (e) => {
+        if (e.target.closest('[data-action="place-edit"], [data-action="place-open-compass"], [data-action="place-unlisted-dismiss"], [data-action="place-edit-save"], [data-action="place-edit-cancel"]')) return;
+        const row = e.target.closest('[data-action="set-open-place"]') || sum.querySelector('[data-action="set-open-place"]');
+        const placeId = row?.dataset.place || '';
+        if (!placeId) return;
+        e.preventDefault();
+        this._focusIndexedPlace(this._db(), placeId);
+        this.render(this.container);
       });
     });
     root.querySelectorAll('details[data-role="places-fold"]').forEach(el => {
@@ -2720,6 +3723,17 @@ BRIDGE:`;
     });
   }
 
+  _bindInterviewNotes(root) {
+    root?.querySelectorAll?.('details[data-role="iv-notes"]').forEach(el => {
+      el.addEventListener('toggle', () => {
+        const st = this._db();
+        if (!st.interview?.active) return;
+        st.interview.notesOpen = !!el.open;
+        this.saveState();
+      });
+    });
+  }
+
   _applySonarFilter(root = this.container) {
     if (!root) return;
     const q = String(this._sonarFilter || '').trim().toLowerCase();
@@ -2742,11 +3756,11 @@ BRIDGE:`;
 
   _bindLocationTagPickers(root) {
     root.querySelectorAll('.st-loctag-wrap[data-role="place-loctags"]').forEach(wrap => {
-      bindLocationCatalogPicker(wrap, this.storage);
+      bindNarrativeLocationPicker(wrap, this.storage);
     });
     root.querySelectorAll('.st-loctag-wrap[data-role="focus-loctags"]').forEach(wrap => {
       const place = this._compassFocusId;
-      bindLocationCatalogPicker(wrap, this.storage, {
+      bindNarrativeLocationPicker(wrap, this.storage, {
         onChange: (tags) => {
           if (!place) return;
           this._compassTry(() => {
@@ -2913,12 +3927,20 @@ BRIDGE:`;
       if (!dragging) return;
       if (dragging.kind === 'child') {
         const w = clientToWorld(ev);
+        const dxW = w.x - dragging.startWorld.x;
+        const dyW = w.y - dragging.startWorld.y;
         dragging.pose = normalizeSuitePose({
-          x: dragging.startPose.x + (w.x - dragging.startWorld.x),
-          y: dragging.startPose.y + (w.y - dragging.startWorld.y),
+          x: dragging.startPose.x + dxW,
+          y: dragging.startPose.y + dyW,
           rot: dragging.startPose.rot,
         });
         dragging.moved = true;
+        if (dragging.isNestedUnit && dragging.g) {
+          const dxPx = (dxW / bounds.w) * svgW;
+          const dyPx = (dyW / bounds.h) * svgH;
+          dragging.g.setAttribute('transform', `translate(${dxPx.toFixed(1)}, ${dyPx.toFixed(1)})`);
+          return;
+        }
         const verts = worldPolygon(dragging.room, dragging.pose);
         const poly = dragging.g?.querySelector('.bst-suite-poly');
         if (poly) poly.setAttribute('points', projectVerts(verts));
@@ -2972,6 +3994,7 @@ BRIDGE:`;
         outline.setAttribute('points', projectVerts(previewVerts));
         dragging.worldVerts = previewVerts;
         dragging.worldTarget = w;
+        dragging.step = step;
         return;
       }
       if (dragging.kind === 'opening') {
@@ -3056,6 +4079,7 @@ BRIDGE:`;
               compass,
               link,
               existing: op,
+              castMembers: getCastMembers(this.storage),
               onSave: (patch) => {
                 this._compassTry(() => {
                   updateOpening(ensureCompass(st), d.placeId, link.id, op.id, patch);
@@ -3087,6 +4111,7 @@ BRIDGE:`;
             d.worldTarget,
             this._suiteSelEdges,
             d.worldVerts,
+            d.step,
           );
         } else if (d.kind === 'opening') {
           updateOpening(compass, d.placeId, d.linkId, d.opnId, { along: d.along });
@@ -3111,13 +4136,29 @@ BRIDGE:`;
         const unit = getPlace(compass, unitId);
         const room = getPlace(compass, childId);
         if (!unit || !room) return;
-        const pose = normalizeSuitePose(unit.suiteLayout?.[childId] || { x: 0, y: 0, rot: 0 });
+        const isNestedUnit = room.kind === 'unit';
+        let startPoseRaw = unit.suiteLayout?.[childId];
+        if (!startPoseRaw && isNestedUnit) {
+          const handleCx = Number(handle.getAttribute('cx')) || 0;
+          const handleCy = Number(handle.getAttribute('cy')) || 0;
+          const sil = suiteUnitOuterSilhouette(room, listSuiteChildren(compass, childId));
+          const b = sil.bounds || { minX: 0, maxX: 8, minY: 0, maxY: 8 };
+          const wCx = bounds.minX + (handleCx / svgW) * bounds.w;
+          const wCy = bounds.minY + (handleCy / svgH) * bounds.h;
+          startPoseRaw = {
+            x: wCx - (b.maxX - b.minX) / 2,
+            y: wCy - (b.maxY - b.minY) / 2,
+            rot: 0,
+          };
+        }
+        const pose = normalizeSuitePose(startPoseRaw || { x: 0, y: 0, rot: 0 });
         const g = svg.querySelector(`[data-suite-child="${childId}"]`) || handle.closest('[data-suite-child]');
         dragging = {
           kind: 'child',
           unitId,
           childId,
           room,
+          isNestedUnit,
           g,
           startPose: pose,
           pose,
@@ -3201,7 +4242,19 @@ BRIDGE:`;
           e.stopPropagation();
           const childId = edgeEl.dataset.place || '';
           const edge = Number(edgeEl.dataset.edge);
-          const pair = sharedPairForSuiteEdge(compass, unitId, childId, edge);
+          let clickAlong = null;
+          try {
+            const room = getPlace(compass, childId);
+            const pose = normalizeSuitePose(unit.suiteLayout?.[childId] || { x: 0, y: 0, rot: 0 });
+            const wpt = clientToWorld(e);
+            const geoFp = unit.suiteVisualFootprints?.[childId] || room?.footprint;
+            if (room && geoFp) {
+              const norm = worldToFootprintNorm(wpt.x, wpt.y, { ...room, footprint: geoFp }, pose);
+              const { a, b } = edgeEndpoints(geoFp, edge);
+              clickAlong = alongEdgeFromPoint(a, b, norm.x, norm.y);
+            }
+          } catch { /* ignore */ }
+          const pair = sharedPairForSuiteEdge(compass, unitId, childId, edge, clickAlong);
           if (pair) {
             this._suiteSelShared = {
               aId: pair.aId,
@@ -3266,17 +4319,34 @@ BRIDGE:`;
     const FP_PAD = 28;
     let dragging = null;
 
-    const clientToNorm = (ev) => {
+    const gridFor = (placeId) => {
+      try {
+        const room = getPlace(ensureCompass(this._db()), placeId);
+        const grid = Math.max(2, Number(room?.footprint?.grid) || 8);
+        return 1 / grid;
+      } catch { return 1 / 8; }
+    };
+    const snapNorm = (v, step, ev) => {
+      if (!step || ev?.shiftKey) return v;
+      const s = ev?.altKey ? step / 2 : step;
+      return Math.round(v / s) * s;
+    };
+    const clientToNorm = (ev, placeId) => {
       const rect = svg.getBoundingClientRect();
       const inner = FP_SIZE - FP_PAD * 2;
-      const x = Math.max(0, Math.min(1, ((ev.clientX - rect.left) / rect.width * FP_SIZE - FP_PAD) / inner));
-      const y = Math.max(0, Math.min(1, ((ev.clientY - rect.top) / rect.height * FP_SIZE - FP_PAD) / inner));
+      let x = Math.max(0, Math.min(1, ((ev.clientX - rect.left) / rect.width * FP_SIZE - FP_PAD) / inner));
+      let y = Math.max(0, Math.min(1, ((ev.clientY - rect.top) / rect.height * FP_SIZE - FP_PAD) / inner));
+      if (placeId) {
+        const step = gridFor(placeId);
+        x = snapNorm(x, step, ev);
+        y = snapNorm(y, step, ev);
+      }
       return { x, y };
     };
 
     const onMove = rafMove((ev) => {
       if (!dragging) return;
-      const { x, y } = clientToNorm(ev);
+      const { x, y } = clientToNorm(ev, dragging.placeId);
       if (dragging.kind === 'room') {
         dragging.dx = x - dragging.startX;
         dragging.dy = y - dragging.startY;
@@ -3460,6 +4530,7 @@ BRIDGE:`;
               compass,
               link,
               existing: op,
+              castMembers: getCastMembers(this.storage),
               onSave: (patch) => {
                 this._compassTry(() => {
                   updateOpening(ensureCompass(st), d.placeId, link.id, op.id, patch);
@@ -3525,7 +4596,7 @@ BRIDGE:`;
         if (mode === 'fixtures' && this._fpFixtureAct !== 'place') return;
         ev.preventDefault();
         ev.stopPropagation();
-        const { x, y } = clientToNorm(ev);
+        const { x, y } = clientToNorm(ev, el.dataset.place);
         dragging = {
           kind: 'edge',
           placeId: el.dataset.place,
@@ -3584,7 +4655,7 @@ BRIDGE:`;
           const st = this._db();
           const room = getPlace(ensureCompass(st), placeId);
           if (!room) return;
-          const { x, y } = clientToNorm(ev);
+          const { x, y } = clientToNorm(ev, placeId);
           dragging = {
             kind: 'room',
             placeId,
@@ -3619,7 +4690,7 @@ BRIDGE:`;
         if (ev.target.closest('.bst-fp-edge-hit, .bst-fp-vert, .bst-fp-opening')) return;
         ev.preventDefault();
         ev.stopPropagation();
-        const { x, y } = clientToNorm(ev);
+        const { x, y } = clientToNorm(ev, placeId);
         dragging = {
           kind: 'draw-wall',
           placeId,
@@ -3639,17 +4710,17 @@ BRIDGE:`;
     const st = this._db();
     const type = this.container.querySelector('[data-role="fp-fixture-type"]')?.value || 'door';
     if (isVerticalOpeningType(type)) {
-      alert('Pick an area on the floorplan for ascent / descent (stairs, ladders, trapdoors).');
+      void showtimeAlert('Pick an area on the floorplan for ascent / descent (stairs, ladders, trapdoors).', { title: 'FLOORPLAN FIXTURE' });
       return;
     }
     this._compassTry(() => {
       const compass = ensureCompass(st);
       const room = getPlace(compass, placeId);
       if (!room) return;
-      const link = ensureEdgeLink(compass, placeId, edge);
       const { a, b } = edgeEndpoints(room.footprint, edge);
       let along = alongEdgeFromPoint(a, b, x, y);
       along = Math.max(0.1, Math.min(0.9, along));
+      const link = ensureEdgeLink(compass, placeId, edge, along);
       addOpening(compass, placeId, link.id, {
         type,
         along,
@@ -3699,10 +4770,10 @@ BRIDGE:`;
       const geoFootprint = unit.suiteVisualFootprints?.[placeId] || room.footprint;
       const geoRoom = { ...room, footprint: geoFootprint };
       const norm = worldToFootprintNorm(world.x, world.y, geoRoom, pose);
-      const link = ensureEdgeLink(compass, placeId, edge);
       const { a, b } = edgeEndpoints(geoFootprint, edge);
       let along = alongEdgeFromPoint(a, b, norm.x, norm.y);
       along = Math.max(0.1, Math.min(0.9, along));
+      const link = ensureEdgeLink(compass, placeId, edge, along);
       addOpening(compass, placeId, link.id, {
         type,
         along,
@@ -3785,8 +4856,62 @@ BRIDGE:`;
       this._door = 'stage';
       return void this.render(this.container);
     }
+    if (action === 'close-desk') {
+      window.Showtime?.shell?.closeClosedHouseDesk?.();
+      return;
+    }
+    if (action === 'gallery-fill') {
+      const input = this.container?.querySelector('[data-gallery-productions]');
+      if (!input) return;
+      const next = this._splitProductions(`${input.value}, ${act.dataset.prod || ''}`);
+      input.value = next.join(', ');
+      return;
+    }
+    if (action === 'gallery-add') {
+      const title = this.container?.querySelector('[data-gallery-title]')?.value || '';
+      const url = this.container?.querySelector('[data-gallery-url]')?.value || '';
+      const productions = this._splitProductions(this.container?.querySelector('[data-gallery-productions]')?.value);
+      const plate = {
+        id: (crypto.randomUUID?.() || `plate-${Date.now()}`),
+        title: String(title).trim() || 'Untitled',
+        url: String(url).trim(),
+        productions,
+      };
+      if (!/^https?:\/\//i.test(plate.url) && !plate.url.startsWith('/')) {
+        void showtimeAlert('Use an image address.', { title: 'GALLERY PLATE' });
+        return;
+      }
+      this._productionGallery().plates.unshift(plate);
+      this._saveG();
+      return void this.render(this.container);
+    }
+    if (action === 'gallery-tag') {
+      const id = act.dataset.id || '';
+      const input = this.container?.querySelector(`[data-gallery-prod="${CSS.escape(id)}"]`);
+      const extra = this._splitProductions(input?.value);
+      const plate = this._productionGallery().plates.find(p => p.id === id);
+      if (!plate || !extra.length) return;
+      plate.productions = this._splitProductions([...(plate.productions || []), ...extra].join(', '));
+      this._saveG();
+      return void this.render(this.container);
+    }
+    if (action === 'gallery-untag') {
+      const plate = this._productionGallery().plates.find(p => p.id === act.dataset.id);
+      if (!plate) return;
+      const drop = String(act.dataset.prod || '').toLowerCase();
+      plate.productions = (plate.productions || []).filter(name => name.toLowerCase() !== drop);
+      this._saveG();
+      return void this.render(this.container);
+    }
+    if (action === 'gallery-drop') {
+      const bag = this._productionGallery();
+      bag.plates = bag.plates.filter(p => p.id !== act.dataset.id);
+      this._saveG();
+      return void this.render(this.container);
+    }
     if (action === 'open') {
-      this._door = act.dataset.door || '';
+      if (this._doorShut(act.dataset.door || '')) return;
+      this._openDoor(act.dataset.door || '');
       return void this.render(this.container);
     }
     if (action === 'director-check') return this._directorCheck();
@@ -3805,18 +4930,49 @@ BRIDGE:`;
       this.container.querySelector('[data-role="import-file"]')?.click();
       return;
     }
+    if (action === 'merge-reel') {
+      const file = this.container.querySelector('[data-role="merge-reel"]')?.value;
+      if (!file) {
+        void showtimeAlert('Pick a reel from the shelf.', { title: 'MERGE REEL' });
+        return;
+      }
+      const box = this.container.querySelector('[data-import-merge]');
+      if (box) box.checked = true;
+      return this._openShelfReel(file);
+    }
     if (action === 'export-tab') return this._exportBackstageChat();
+    if (action === 'reel-sort') {
+      this._reelSort = act.dataset.sort === 'title' ? 'title' : 'newest';
+      return void this.render(this.container);
+    }
+    if (action === 'reel-open') return this._openShelfReel(act.dataset.file);
+    if (action === 'reel-download') return this._downloadShelfReel(act.dataset.file);
+    if (action === 'reel-delete') return this._deleteShelfReel(act.dataset.file);
     if (action === 'wipe') return this._wipe();
     if (action === 'note-flip') {
       if (!st.interview.active) return;
       const id = act.dataset.note || '';
       st.interview.flippedNote = st.interview.flippedNote === id ? '' : id;
       this.saveState();
-      return void this.render(this.container);
+      return void this._refreshInterviewAlbum();
     }
-    if (action === 'note-ask' || action === 'note-ask-about') {
+    if (action === 'note-ask') {
       if (!st.interview.active) return;
-      return this._interviewNoteAsk(act.dataset.note, { about: action === 'note-ask-about' });
+      return this._interviewNoteAsk(act.dataset.note);
+    }
+    if (action === 'note-rephrase') {
+      if (!st.interview.active) return;
+      const noteId = act.dataset.note || '';
+      if (!noteId) return;
+      st.interview.notePick ??= {};
+      st.interview.notePick[noteId] ??= {};
+      st.interview.notePick[noteId].rephraseOpen = !st.interview.notePick[noteId].rephraseOpen;
+      this.saveState();
+      this._refreshInterviewAlbum();
+      if (st.interview.notePick[noteId].rephraseOpen) {
+        queueMicrotask(() => this.container?.querySelector(`[data-note-rephrased="${noteId}"]`)?.focus());
+      }
+      return;
     }
     if (action === 'iv-send') {
       if (!st.interview.active) return;
@@ -3825,12 +4981,30 @@ BRIDGE:`;
     if (action === 'iv-retry') {
       const retry = st.interview.retry;
       if (!retry?.question) return;
-      return this._interviewTurn(retry.question, retry.askKind || 'free', retry.meta || {}, { replay: true });
+      return this._interviewTurn(retry.question, retry.askKind || 'free', retry.meta || {}, {
+        replay: true,
+        replaceIdx: Number.isInteger(retry.replaceIdx) ? retry.replaceIdx : null,
+      });
+    }
+    if (action === 'iv-retry-turn') {
+      if (!st.interview.active) return;
+      const idx = Number(act.dataset.idx);
+      const turns = st.interview.turns || [];
+      const turn = turns[idx];
+      if (!turn || turn.who !== 'cast' || turn.name === 'Connections') return;
+      let qIdx = idx - 1;
+      while (qIdx >= 0 && (turns[qIdx].who !== 'user' || turns[qIdx].name === 'Connections')) qIdx--;
+      const qTurn = turns[qIdx];
+      if (!qTurn?.text && !qTurn?.asked) return;
+      return this._interviewTurn(qTurn.asked || qTurn.text, qTurn.askKind || 'free', {
+        target: qTurn.target || null,
+        display: qTurn.asked ? qTurn.text : '',
+      }, { replay: true, replaceIdx: idx });
     }
     if (action === 'iv-retry-dismiss') {
       st.interview.retry = null;
       this.saveState();
-      return void this.render(this.container);
+      return void this._paintInterviewDesk();
     }
     if (action === 'iv-album-step' || action === 'iv-album-shuffle') {
       if (!st.interview.active) return;
@@ -3838,9 +5012,9 @@ BRIDGE:`;
       const n = NOTECARDS.length;
       const next = (this._ivNoteIdx(st.interview) + dir + n) % n;
       st.interview.noteIdx = next;
-      st.interview.flippedNote = NOTECARDS[next].id;
+      st.interview.flippedNote = '';
       this.saveState();
-      return void this.render(this.container);
+      return void this._refreshInterviewAlbum();
     }
     if (action === 'iv-anon') {
       if (st.interview.active) return;
@@ -3859,14 +5033,15 @@ BRIDGE:`;
       if (!st.interview.subjectId) {
         const first = getCastMembers(this.storage)
           .find(c => c.priority !== 'star' && c.priority !== 'director');
-        if (!first) { alert('Add a cast card first.'); return; }
+        if (!first) { void showtimeAlert('Add a cast card first.', { title: 'INTERVIEW' }); return; }
         st.interview.subjectId = first.id;
       }
       st.interview.active = true;
       st.interview.startedAt = Date.now();
       st.interview.turns = [];
+      st.interview.pendingConn = [];
       st.interview.noteIdx = 0;
-      st.interview.flippedNote = NOTECARDS[0].id;
+      st.interview.flippedNote = '';
       st.interview.retry = null;
       this.saveState();
       return void this.render(this.container);
@@ -3875,14 +5050,19 @@ BRIDGE:`;
       return this._endInterview({ save: true });
     }
     if (action === 'interview-discard') {
-      if ((st.interview.turns || []).length
-        && !confirm('End this interview without filing? The live desk will be wiped.')) return;
+      if ((st.interview.turns || []).length) {
+        void showtimeConfirm('End this interview without filing? The live desk will be wiped.', { title: 'DISCARD INTERVIEW', danger: true, confirmLabel: 'Discard' }).then(ok => {
+          if (ok) this._endInterview({ save: false });
+        });
+        return;
+      }
       return this._endInterview({ save: false });
     }
     if (action === 'interview-clear') {
       st.interview.turns = [];
+      st.interview.pendingConn = [];
       this.saveState();
-      return void this.render(this.container);
+      return void this._paintInterviewDesk();
     }
     if (action === 'listen') return this._listen();
     if (action === 'pg-toggle-focus') {
@@ -3895,18 +5075,24 @@ BRIDGE:`;
       const sessions = st.peanut.sessions || [];
       const active = sessions[this._pgActiveIdx(st)];
       if (!active) return;
-      if (!confirm('Clear all comments on the active topic?')) return;
-      active.comments = [];
-      this.saveState();
-      return void this.render(this.container);
+      void showtimeConfirm('Clear all comments on the active topic?', { title: 'CLEAR TOPIC', danger: true, confirmLabel: 'Clear' }).then(ok => {
+        if (!ok) return;
+        active.comments = [];
+        this.saveState();
+        this.render(this.container);
+      });
+      return;
     }
     if (action === 'pg-clear-all') {
       if (!(st.peanut.sessions || []).length) return;
-      if (!confirm('Wipe every Peanut Gallery topic?')) return;
-      st.peanut.sessions = [];
-      st.peanut.activeIdx = -1;
-      this.saveState();
-      return void this.render(this.container);
+      void showtimeConfirm('Wipe every Peanut Gallery topic?', { title: 'CLEAR PEANUT GALLERY', danger: true, confirmLabel: 'Wipe all' }).then(ok => {
+        if (!ok) return;
+        st.peanut.sessions = [];
+        st.peanut.activeIdx = -1;
+        this.saveState();
+        this.render(this.container);
+      });
+      return;
     }
     if (action === 'pg-drop-comment') {
       const sessions = st.peanut.sessions || [];
@@ -3934,6 +5120,28 @@ BRIDGE:`;
       });
       return void this.render(this.container);
     }
+    if (action === 'sonar-privy') {
+      const castId = act.dataset.cast || '';
+      const member = this._sonarCast().find(m => String(m.id) === String(castId));
+      if (!member) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const curPing = compass.sonar?.pings?.[castId];
+        const nextListening = !(member.presence === 'privy' || curPing?.listening);
+        setSonarListening(compass, member, { listening: nextListening });
+        try {
+          const castBag = this.storage.getChat('cast', { characters: [] });
+          const rec = (castBag.characters || []).find(c => String(c.id || c.name) === String(castId));
+          if (rec) {
+            rec.presence = nextListening ? 'privy' : 'inPlay';
+            rec.updatedAt = Date.now();
+            this.bus?.emit('cast.updated', { character: rec });
+          }
+        } catch { /* ignore */ }
+        this._compassSave(st);
+      });
+      return void this.render(this.container);
+    }
     if (action === 'sonar-pin' || action === 'sonar-follow') {
       const castId = act.dataset.cast || '';
       const member = this._sonarCast().find(m => String(m.id) === String(castId));
@@ -3942,11 +5150,24 @@ BRIDGE:`;
       this._compassTry(() => {
         const compass = ensureCompass(st);
         if (action === 'sonar-follow') {
+          const prevPing = compass.sonar?.pings?.[castId] || {};
+          const restorePlace = prevPing.placeId || prevPing.departedFrom || prevPing.listeningPlaceId || compass.sonar?.lastPlaceId || compass.activeRoomId || '';
           pinSonarPing(compass, member, {
-            placeId: compass.sonar?.pings?.[castId]?.placeId || '',
-            cell: compass.sonar?.pings?.[castId]?.cell || 'C',
+            placeId: restorePlace,
+            cell: prevPing.cell || 'C',
             locked: false,
           });
+          if (member.presence === 'privy') {
+            try {
+              const castBag = this.storage.getChat('cast', { characters: [] });
+              const rec = (castBag.characters || []).find(c => String(c.id || c.name) === String(castId));
+              if (rec) {
+                rec.presence = 'inPlay';
+                rec.updatedAt = Date.now();
+                this.bus?.emit('cast.updated', { character: rec });
+              }
+            } catch { /* ignore */ }
+          }
         } else {
           const row = this.container.querySelector(`.bst-sonar-cast[data-cast="${CSS.escape(castId)}"]`);
           const placeId = row?.querySelector('[data-role="sonar-place"]')?.value || '';
@@ -4011,43 +5232,38 @@ BRIDGE:`;
     if (action === 'suite-opn-link') {
       const pick = this.container.querySelector('[data-role="suite-opn-pick"]')?.value || '';
       const toPlaceId = this.container.querySelector('[data-role="suite-opn-to"]')?.value || '';
-      const [placeId, linkId] = pick.split('|');
-      if (!placeId || !linkId) { alert('Pick an opening first.'); return; }
-      if (!toPlaceId) { alert('Pick a room to link.'); return; }
-      this._compassTry(() => {
-        linkWallToRoom(ensureCompass(st), placeId, linkId, toPlaceId);
-        this._lastOpening = { placeId, linkId };
-        this._compassSave(st);
-      });
-      return;
-    }
-    if (action === 'set-audit') {
-      return void this.render(this.container);
-    }
-    if (action === 'set-audit-fix') {
+      const [placeId, linkId, opnId] = pick.split('|');
+      if (!placeId || !linkId) { void showtimeAlert('Pick an opening first.', { title: 'SUITE OPENING' }); return; }
+      if (!toPlaceId) { void showtimeAlert('Pick a room to link.', { title: 'SUITE OPENING' }); return; }
       this._compassTry(() => {
         const compass = ensureCompass(st);
-        const { findings } = auditCompass(compass, {
-          focusId: this._compassFocusId || compass.activeRoomId || '',
-        });
-        const n = applySafeAuditFixes(compass, findings);
-        if (!n) {
-          alert('No safe auto-fixes (only unlinked exterior doors/windows).');
-          return;
+        const dest = getPlace(compass, toPlaceId);
+        if (toPlaceId === '__exterior__' || (dest && (isSuiteHostKind(dest.kind) || isExteriorHostKind(dest.kind)) && toPlaceId === act.dataset.unit)) {
+          linkWallToExterior(compass, placeId, linkId);
+        } else {
+          linkWallToRoom(compass, placeId, linkId, toPlaceId);
         }
+        this._lastOpening = { placeId, linkId, opnId };
         this._compassSave(st);
       });
       return;
     }
-    if (action === 'compass-create') {
+    if (action === 'compass-create' || action === 'compass-create-populate') {
       const id = this.container.querySelector('[data-role="room-id"]')?.value?.trim();
       const name = this.container.querySelector('[data-role="room-name"]')?.value?.trim() || id;
-      const kind = this.container.querySelector('[data-role="place-kind"]')?.value || 'room';
+      let kind = this.container.querySelector('[data-role="place-kind"]')?.value || 'room';
       const parentId = this.container.querySelector('[data-role="place-parent"]')?.value || '';
+      const category = kind === 'building'
+        ? (this.container.querySelector('[data-role="place-category"]')?.value || '')
+        : '';
       const locWrap = this.container.querySelector('.st-loctag-wrap[data-role="place-loctags"]');
       const locationTags = readLocationTags(locWrap);
       const description = this.container.querySelector('[data-role="place-desc"]')?.value?.trim() || '';
-      if (!name && !id) { alert('Name or id is required.'); return; }
+      if (!name && !id) { void showtimeAlert('Name or id is required.', { title: 'NEW PLACE' }); return; }
+      if (action === 'compass-create-populate' && kind !== 'building') {
+        void showtimeAlert('Populate adds rooms inside a building. Set Kind to Building first.', { title: 'POPULATE BUILDING' });
+        return;
+      }
       this._compassTry(() => {
         const compass = ensureCompass(st);
         const room = createAndStoreRoom(compass, {
@@ -4057,12 +5273,83 @@ BRIDGE:`;
           parentId,
           locationTags,
           description,
+          category,
         });
+        if (action === 'compass-create-populate') {
+          const chatNarrative = collectRecentChatNarrative(getContext()?.chat || []);
+          populatePlaceFromCategory(compass, room.id, category, { narrativeText: chatNarrative });
+        }
+        try { syncLocationCatalogFromCompass(this.storage, compass); } catch { /* ignore */ }
         this._compassFocusId = room.id;
         if (isCompassPlaceKind(room.kind)) {
           loadRoom(compass, room.id);
         }
         this._compassSave(st);
+      });
+      this._setCreateOpen = false;
+      this._setCreateDraft = null;
+      return;
+    }
+    if (action === 'compass-populate-category') {
+      const placeId = act.dataset.place || this._compassFocusId || '';
+      const editWrap = act.closest('.bst-set-edit');
+      const catVal = editWrap?.querySelector('[data-role="place-edit-category"]')?.value
+        || act.parentElement?.querySelector('[data-role="suite-category-select"], [data-role="stage-head-category"], [data-role="focus-category"]')?.value
+        || this.container.querySelector(`[data-role="suite-category-select"][data-place="${CSS.escape(placeId)}"]`)?.value
+        || this.container.querySelector(`[data-role="stage-head-category"][data-place="${CSS.escape(placeId)}"]`)?.value
+        || this.container.querySelector(`[data-role="focus-category"][data-place="${CSS.escape(placeId)}"]`)?.value
+        || '';
+      if (!placeId) return;
+      const host = getPlace(ensureCompass(st), placeId);
+      if (host && host.kind !== 'building') {
+        void showtimeAlert('Populate adds rooms inside a building. Set Kind to Building first.', { title: 'POPULATE BUILDING' });
+        return;
+      }
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const chatNarrative = collectRecentChatNarrative(getContext()?.chat || []);
+        populatePlaceFromCategory(compass, placeId, catVal, { narrativeText: chatNarrative });
+        try { syncLocationCatalogFromCompass(this.storage, compass); } catch { /* ignore */ }
+        this._compassFocusId = placeId;
+        this._placesEditId = '';
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'compass-populate-narrative' || action === 'compass-populate-from-chat') {
+      const placeId = act.dataset.place || this._compassFocusId || '';
+      const cell = act.dataset.cell || this._compassSelCell || 'C';
+      if (!placeId) return;
+      const wrap = act.closest('.bst-narrative-populate') || this.container;
+      const textEl = wrap?.querySelector(`[data-role="narrative-populate-text"][data-place="${CSS.escape(placeId)}"]`)
+        || wrap?.querySelector('[data-role="narrative-populate-text"]');
+      const scopeEl = wrap?.querySelector(`[data-role="narrative-populate-scope"][data-place="${CSS.escape(placeId)}"]`)
+        || wrap?.querySelector('[data-role="narrative-populate-scope"]');
+      const scope = scopeEl?.value || 'auto';
+      let narrativeText = action === 'compass-populate-from-chat'
+        ? collectRecentChatNarrative(getContext()?.chat || [])
+        : String(textEl?.value || '').trim();
+      if (!narrativeText && action === 'compass-populate-narrative') {
+        narrativeText = collectRecentChatNarrative(getContext()?.chat || []);
+      }
+      if (!narrativeText) {
+        void showtimeAlert('Paste narrative text or send a chat message describing the room first.', { title: 'POPULATE ROOM' });
+        return;
+      }
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const res = populateRoomsFromNarrative(compass, narrativeText, {
+          targetPlaceId: placeId,
+          defaultCell: cell,
+          scope,
+          createMissingRooms: scope !== 'room',
+        });
+        try { syncLocationCatalogFromCompass(this.storage, compass); } catch { /* ignore */ }
+        if (res.addedCount || res.updatedCount || res.touchedRoomIds?.length || res.createdRoomIds?.length) {
+          this._compassSave(st);
+        } else {
+          void showtimeAlert('No new room items or doors detected in the narrative text.', { title: 'POPULATE ROOM' });
+        }
       });
       return;
     }
@@ -4079,14 +5366,37 @@ BRIDGE:`;
       this._setCreateOpen = !this._setCreateOpen;
       this._prodFolds ??= new Set();
       if (this._setCreateOpen) this._prodFolds.add('set-places');
+      else this._setCreateDraft = null;
+      return void this.render(this.container);
+    }
+    if (action === 'suite-listing-code') {
+      const placeId = act.dataset.place || '';
+      if (placeId) {
+        this._suiteHighlightChild = placeId;
+        this._compassFocusId = act.dataset.unit || this._compassFocusId;
+      }
+      return void this.render(this.container);
+    }
+    if (action === 'place-listing-add') {
+      const wrap = act.closest('.bst-set-edit') || this.container.querySelector(`.bst-set-edit[data-node="${CSS.escape(act.dataset.node || '')}"]`);
+      const custom = canonicalizeListingCode(wrap?.querySelector('[data-role="place-edit-listing-custom"]')?.value);
+      const placeId = act.dataset.place || wrap?.dataset.place || '';
+      if (!custom) return;
+      this._rememberListingCode(custom);
+      if (placeId) {
+        this._compassTry(() => {
+          setPlaceListingCode(ensureCompass(st), placeId, custom);
+          this._compassSave(st);
+        });
+      }
+      this._placesEditId = act.dataset.node || wrap?.dataset.node || this._placesEditId;
       return void this.render(this.container);
     }
     if (action === 'set-open-place') {
       const placeId = act.dataset.place || '';
       const tag = String(act.dataset.tag || '').trim();
       if (placeId) {
-        this._compassFocusId = placeId;
-        this._openPlaceFloorplanIfNeeded(st, placeId);
+        this._focusIndexedPlace(st, placeId);
         return void this.render(this.container);
       }
       if (act.dataset.unlisted === '1') {
@@ -4121,7 +5431,7 @@ BRIDGE:`;
     if (action === 'place-open-compass') {
       const placeId = act.dataset.place || '';
       if (!placeId) return;
-      this._compassFocusId = placeId;
+      this._focusIndexedPlace(st, placeId);
       this._openPlaceFloorplanIfNeeded(st, placeId, { force: true });
       return void this.render(this.container);
     }
@@ -4142,6 +5452,11 @@ BRIDGE:`;
       const kind = PLACE_KIND_SET.has(kindRaw) ? kindRaw : (GROUP_TO_COMPASS[kindRaw] || '');
       const aliases = String(wrap?.querySelector('[data-role="place-edit-aliases"]')?.value || '')
         .split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+      const listingSel = String(wrap?.querySelector('[data-role="place-edit-listing"]')?.value || '').trim();
+      const listingCustom = String(wrap?.querySelector('[data-role="place-edit-listing-custom"]')?.value || '').trim();
+      const listingCode = canonicalizeListingCode(listingCustom || listingSel);
+      const categoryEl = wrap?.querySelector('[data-role="place-edit-category"]');
+      const category = String(categoryEl?.value || '').trim();
       this._compassTry(() => {
         const compass = ensureCompass(st);
         const allow = PLACE_NEST_PARENTS[kind] || [];
@@ -4149,13 +5464,13 @@ BRIDGE:`;
         const parent = parentId ? compass.rooms[parentId] : null;
         if (!allow.length || !parent || !allow.includes(parent.kind)) parentId = '';
         const rowName = name || oldTag;
-        let id = '';
-        if (placeId && compass.rooms[placeId]
-          && String(compass.rooms[placeId].name || '').trim().toLowerCase() === rowName.toLowerCase()) {
-          id = placeId;
-        } else {
-          id = findPlaceByExactName(compass, rowName)?.id
-            || findPlaceByExactName(compass, oldTag)?.id
+        // The row being edited is the place to move. Looking the name up under
+        // the newly chosen parent adopted the room that already lived there
+        // and then created a second copy of this one.
+        let id = (placeId && compass.rooms[placeId]) ? placeId : '';
+        if (!id) {
+          id = findPlaceByExactName(compass, oldTag)?.id
+            || findPlaceByExactName(compass, rowName)?.id
             || '';
         }
         if (id && parentId === id) parentId = '';
@@ -4166,6 +5481,7 @@ BRIDGE:`;
             parentId,
             locationTags: [name],
             aliases,
+            category,
           });
           id = room.id;
           this._compassFocusId = room.id;
@@ -4175,6 +5491,11 @@ BRIDGE:`;
           if (kind) setPlaceKind(compass, id, kind);
           setParent(compass, id, parentId);
           setPlaceAliases(compass, id, aliases);
+          if (categoryEl) setPlaceCategory(compass, id, category);
+          if (kind === 'room' || kind === 'transitional' || compass.rooms[id]?.kind === 'room' || compass.rooms[id]?.kind === 'transitional') {
+            setPlaceListingCode(compass, id, listingCode);
+            if (listingCode) this._rememberListingCode(listingCode);
+          }
         } else if (oldTag) {
           const node = findLocationNodeByName(this.storage, oldTag);
           if (node) {
@@ -4184,9 +5505,19 @@ BRIDGE:`;
           }
         }
         const catalogKind = COMPASS_TO_GROUP[kind] || '';
-        if (kind && name && id) {
+        const moved = id ? compass.rooms[id] : null;
+        const roomish = moved && !GEO_PLACE_KIND_SET.has(moved.kind);
+        const editedNode = findLocationNodeById(this.storage, act.dataset.node || wrap?.dataset.node || '')
+          || (id ? findLocationNodeByPlaceId(this.storage, id) : null);
+        if (editedNode && (!editedNode.placeId || editedNode.placeId === id || !compass.rooms[editedNode.placeId])) {
+          if (name) editedNode.name = name;
+          if (id) editedNode.placeId = id;
+          const parentNode = parentId ? findLocationNodeByPlaceId(this.storage, parentId) : null;
+          if (parentNode && parentNode.id !== editedNode.id) editedNode.parentId = parentNode.id;
+          else if (!parentId) editedNode.parentId = '';
+        } else if (!roomish && kind && name && id) {
           const parentCat = parentId
-            ? findLocationNodeByName(this.storage, compass.rooms[parentId]?.name)
+            ? findLocationNodeByPlaceId(this.storage, parentId)
             : null;
           upsertLocationNode(this.storage, {
             name,
@@ -4223,23 +5554,25 @@ BRIDGE:`;
       const nodeId = act.dataset.node || wrap?.dataset.node || '';
       const tag = String(act.dataset.tag || wrap?.dataset.tag || '').trim();
       const label = tag || 'this location';
-      if (!confirm(`Remove "${label}" and every Script / Library / Compass tag that names it?\n\nNested places stay and move up one level.`)) return;
-      this._compassTry(() => {
-        const compass = ensureCompass(st);
-        const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
-        const id = placeId || ident.place?.id || '';
-        if (id && compass.rooms[id]) {
-          deletePlace(compass, id, { reparent: true });
-          if (this._compassFocusId === id) this._compassFocusId = '';
-        }
-        rewriteLocationTagNames(this.storage, compass, { removeKeys: ident.keys });
-        const catNode = ident.node || findLocationNodeById(this.storage, nodeId)
-          || findLocationNodeByPlaceId(this.storage, id)
-          || findLocationNodeByName(this.storage, tag);
-        if (catNode) removeLocationNode(this.storage, catNode.id);
-        this._placesEditId = '';
-        this.storage.saveChat();
-        this._compassSave(st);
+      void showtimeConfirm(`Remove "${label}" and every Script / Library / Compass tag that names it?\n\nNested places stay and move up one level.`, { title: 'REMOVE PLACE', danger: true, confirmLabel: 'Remove' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          const compass = ensureCompass(st);
+          const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
+          const id = placeId || ident.place?.id || '';
+          if (id && compass.rooms[id]) {
+            deletePlace(compass, id, { reparent: true });
+            if (this._compassFocusId === id) this._compassFocusId = '';
+          }
+          rewriteLocationTagNames(this.storage, compass, { removeKeys: ident.keys });
+          const catNode = ident.node || findLocationNodeById(this.storage, nodeId)
+            || findLocationNodeByPlaceId(this.storage, id)
+            || findLocationNodeByName(this.storage, tag);
+          if (catNode) removeLocationNode(this.storage, catNode.id);
+          this._placesEditId = '';
+          this.storage.saveChat();
+          this._compassSave(st);
+        });
       });
       return;
     }
@@ -4249,79 +5582,82 @@ BRIDGE:`;
       const nodeId = act.dataset.node || wrap?.dataset.node || '';
       const tag = String(act.dataset.tag || wrap?.dataset.tag || '').trim();
       const raw = String(wrap?.querySelector('[data-role="place-edit-merge"]')?.value || '').trim();
-      if (!raw) { alert('Pick a location to merge into.'); return; }
-      this._compassTry(() => {
-        const compass = ensureCompass(st);
-        let targetPlaceId = raw.startsWith('place:') ? raw.slice(6) : '';
-        let targetNodeId = raw.startsWith('node:') ? raw.slice(5) : '';
-        if (targetPlaceId) {
-          const byPlace = findLocationNodeByPlaceId(this.storage, targetPlaceId);
-          if (byPlace) targetNodeId = byPlace.id;
-        } else if (targetNodeId) {
-          const tNode = findLocationNodeById(this.storage, targetNodeId);
-          targetPlaceId = tNode?.placeId || findPlaceForTag(compass, tNode?.name)?.id || '';
-        }
-        const targetPlace = targetPlaceId ? compass.rooms[targetPlaceId] : null;
-        const targetNode = targetNodeId
-          ? findLocationNodeById(this.storage, targetNodeId)
-          : (targetPlace ? findLocationNodeByPlaceId(this.storage, targetPlace.id) || findLocationNodeByName(this.storage, targetPlace.name) : null);
-        const destName = String(targetPlace?.name || targetNode?.name || '').trim();
-        if (!destName) throw new Error('Pick a location to merge into.');
-        const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
-        const sourceId = placeId || ident.place?.id || '';
-        if ((sourceId && targetPlaceId && sourceId === targetPlaceId)
-          || (ident.node && targetNode && ident.node.id === targetNode.id)) {
-          throw new Error('Cannot merge a place into itself.');
-        }
-        if (!confirm(`Merge "${tag || ident.names[0] || 'this location'}" into "${destName}"?\n\nTags, aliases, and nested places move to ${destName}.`)) return;
-        let destId = targetPlaceId;
-        if (!destId && targetNode) {
-          const kind = GROUP_TO_COMPASS[targetNode.kind] || 'room';
-          const room = createAndStoreRoom(compass, {
-            name: destName,
-            kind,
-            locationTags: [destName],
-          });
-          destId = room.id;
-          targetNode.placeId = destId;
-        }
-        if (sourceId && destId && sourceId !== destId && compass.rooms[sourceId]) {
-          mergePlaces(compass, sourceId, destId);
-          if (this._compassFocusId === sourceId) this._compassFocusId = destId;
-        } else if (destId && ident.names.length) {
-          const dest = compass.rooms[destId];
-          if (dest) {
-            const aliases = [...(dest.aliases || [])];
-            for (const n of ident.names) {
-              if (n.toLowerCase() === destName.toLowerCase()) continue;
-              if (!aliases.some(a => String(a).toLowerCase() === n.toLowerCase())) aliases.push(n);
-            }
-            dest.aliases = aliases;
+      if (!raw) { void showtimeAlert('Pick a location to merge into.', { title: 'MERGE PLACE' }); return; }
+      const compass = ensureCompass(st);
+      let targetPlaceId = raw.startsWith('place:') ? raw.slice(6) : '';
+      let targetNodeId = raw.startsWith('node:') ? raw.slice(5) : '';
+      if (targetPlaceId) {
+        const byPlace = findLocationNodeByPlaceId(this.storage, targetPlaceId);
+        if (byPlace) targetNodeId = byPlace.id;
+      } else if (targetNodeId) {
+        const tNode = findLocationNodeById(this.storage, targetNodeId);
+        targetPlaceId = tNode?.placeId || findPlaceForTag(compass, tNode?.name)?.id || '';
+      }
+      const targetPlace = targetPlaceId ? compass.rooms[targetPlaceId] : null;
+      const targetNode = targetNodeId
+        ? findLocationNodeById(this.storage, targetNodeId)
+        : (targetPlace ? findLocationNodeByPlaceId(this.storage, targetPlace.id) || findLocationNodeByName(this.storage, targetPlace.name) : null);
+      const destName = String(targetPlace?.name || targetNode?.name || '').trim();
+      if (!destName) { void showtimeAlert('Pick a location to merge into.', { title: 'MERGE PLACE' }); return; }
+      const ident = collectLocationIdentity(this.storage, compass, { placeId, nodeId, name: tag });
+      const sourceId = placeId || ident.place?.id || '';
+      if ((sourceId && targetPlaceId && sourceId === targetPlaceId)
+        || (ident.node && targetNode && ident.node.id === targetNode.id)) {
+        void showtimeAlert('Cannot merge a place into itself.', { title: 'MERGE PLACE' });
+        return;
+      }
+      void showtimeConfirm(`Merge "${tag || ident.names[0] || 'this location'}" into "${destName}"?\n\nTags, aliases, and nested places move to ${destName}.`, { title: 'MERGE PLACE', confirmLabel: 'Merge' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          let destId = targetPlaceId;
+          if (!destId && targetNode) {
+            const kind = GROUP_TO_COMPASS[targetNode.kind] || 'room';
+            const room = createAndStoreRoom(compass, {
+              name: destName,
+              kind,
+              locationTags: [destName],
+            });
+            destId = room.id;
+            targetNode.placeId = destId;
           }
-        }
-        rewriteLocationTagNames(this.storage, compass, {
-          removeKeys: ident.keys,
-          replaceWith: destName,
-          skipAliasPlaceIds: destId ? [destId] : [],
+          if (sourceId && destId && sourceId !== destId && compass.rooms[sourceId]) {
+            mergePlaces(compass, sourceId, destId);
+            if (this._compassFocusId === sourceId) this._compassFocusId = destId;
+          } else if (destId && ident.names.length) {
+            const dest = compass.rooms[destId];
+            if (dest) {
+              const aliases = [...(dest.aliases || [])];
+              for (const n of ident.names) {
+                if (n.toLowerCase() === destName.toLowerCase()) continue;
+                if (!aliases.some(a => String(a).toLowerCase() === n.toLowerCase())) aliases.push(n);
+              }
+              dest.aliases = aliases;
+            }
+          }
+          rewriteLocationTagNames(this.storage, compass, {
+            removeKeys: ident.keys,
+            replaceWith: destName,
+            skipAliasPlaceIds: destId ? [destId] : [],
+          });
+          const destNode = targetNode
+            || findLocationNodeByPlaceId(this.storage, destId)
+            || findLocationNodeByName(this.storage, destName);
+          const srcNode = ident.node || findLocationNodeById(this.storage, nodeId)
+            || findLocationNodeByPlaceId(this.storage, sourceId)
+            || findLocationNodeByName(this.storage, tag);
+          if (srcNode && destNode && srcNode.id !== destNode.id) {
+            mergeLocationNodes(this.storage, srcNode.id, destNode.id);
+            destNode.placeId = destId || destNode.placeId;
+          } else if (srcNode && !destNode) {
+            srcNode.placeId = destId || srcNode.placeId;
+            if (destName) srcNode.name = destName;
+          } else if (srcNode && destNode && srcNode.id === destNode.id) {
+            destNode.placeId = destId || destNode.placeId;
+          }
+          this._placesEditId = '';
+          this.storage.saveChat();
+          this._compassSave(st);
         });
-        const destNode = targetNode
-          || findLocationNodeByPlaceId(this.storage, destId)
-          || findLocationNodeByName(this.storage, destName);
-        const srcNode = ident.node || findLocationNodeById(this.storage, nodeId)
-          || findLocationNodeByPlaceId(this.storage, sourceId)
-          || findLocationNodeByName(this.storage, tag);
-        if (srcNode && destNode && srcNode.id !== destNode.id) {
-          mergeLocationNodes(this.storage, srcNode.id, destNode.id);
-          destNode.placeId = destId || destNode.placeId;
-        } else if (srcNode && !destNode) {
-          srcNode.placeId = destId || srcNode.placeId;
-          if (destName) srcNode.name = destName;
-        } else if (srcNode && destNode && srcNode.id === destNode.id) {
-          destNode.placeId = destId || destNode.placeId;
-        }
-        this._placesEditId = '';
-        this.storage.saveChat();
-        this._compassSave(st);
       });
       return;
     }
@@ -4331,9 +5667,29 @@ BRIDGE:`;
       return void this.render(this.container);
     }
     if (action === 'suite-story-focus') {
-      this._suiteStoryFocus = act.dataset.focus === 'lower' ? 'lower' : 'upper';
+      const f = act.dataset.focus;
+      this._suiteStoryFocus = (f === 'lower' || f === 'upper')
+        ? f
+        : (f != null && f !== '' && Number.isFinite(Number(f)) ? String(Math.round(Number(f))) : 'upper');
       if (act.dataset.unit) this._compassFocusId = act.dataset.unit;
       return void this.render(this.container);
+    }
+    if (action === 'suite-room-story') {
+      const placeId = act.dataset.place || '';
+      const unitId = act.dataset.unit || '';
+      const nextStory = act.dataset.story;
+      if (!placeId) return;
+      const st = this._db();
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        setRoomStory(compass, placeId, nextStory);
+        if (nextStory != null && nextStory !== '' && Number.isFinite(Number(nextStory))) {
+          this._suiteStoryFocus = String(Math.round(Number(nextStory)));
+        }
+        if (unitId) this._compassFocusId = unitId;
+        this._compassSave(st);
+      });
+      return;
     }
     if (action === 'suite-fixture-act') {
       const next = act.dataset.act === 'remove' ? 'remove' : 'place';
@@ -4346,7 +5702,13 @@ BRIDGE:`;
       return void this._suitePlaceFixtureOnEdge(act.dataset.place, Number(act.dataset.edge), e);
     }
     if (action === 'suite-focus-child') {
-      this._suiteHighlightChild = act.dataset.place || '';
+      const childId = act.dataset.place || '';
+      if (e.detail === 2 && (this._suiteMode || 'browse') === 'browse') {
+        this._compassFocusId = childId;
+        this._suiteHighlightChild = '';
+        return void this.render(this.container);
+      }
+      this._suiteHighlightChild = childId;
       const unitId = act.dataset.unit || '';
       if (unitId) this._compassFocusId = unitId;
       return void this.render(this.container);
@@ -4356,11 +5718,67 @@ BRIDGE:`;
       this._suiteHighlightChild = '';
       return void this.render(this.container);
     }
+    if (action === 'suite-stub-clear') {
+      const placeId = act.dataset.place || '';
+      const linkId = act.dataset.link || '';
+      if (!placeId || !linkId) return;
+      this._compassTry(() => {
+        clearForeignWallLink(ensureCompass(st), placeId, linkId);
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-stub-open') {
+      const dest = act.dataset.to || '';
+      if (!dest) return;
+      this._compassFocusId = dest;
+      this._suiteHighlightChild = '';
+      return void this.render(this.container);
+    }
+    if (action === 'suite-stub-link') {
+      const placeId = act.dataset.place || '';
+      const rawEdge = act.dataset.edge;
+      const edge = rawEdge === '' || rawEdge == null ? NaN : Number(rawEdge);
+      if (!Number.isFinite(edge)) {
+        this._compassFocusId = placeId;
+        this._suiteHighlightChild = '';
+        return void this.render(this.container);
+      }
+      this._suiteMode = 'walls';
+      this._suiteSelEdge = { placeId, edge };
+      this._suiteSelShared = null;
+      this._suiteSelEdges = [{ placeId, edge }];
+      return void this.render(this.container);
+    }
+    if (action === 'suite-mark-external') {
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const n = applySafeAuditFixes(compass, [{
+          fix: {
+            type: 'mark-external',
+            placeId: act.dataset.place || '',
+            linkId: act.dataset.link || '',
+          },
+        }]);
+        if (!n) {
+          void showtimeAlert('Could not mark that opening external.', { title: 'SUITE OPENING' });
+          return;
+        }
+        this._compassSave(st);
+      });
+      return;
+    }
     if (action === 'set-here') {
       return void this._establishLocation({
         placeId: act.dataset.place || '',
         cell: act.dataset.cell || this._compassSelCell || 'C',
       });
+    }
+    if (action === 'suite-draft-accept') {
+      return void this._acceptSuiteDraft();
+    }
+    if (action === 'suite-draft-dismiss') {
+      return void this._dismissSuiteDraft();
     }
     if (action === 'suite-select-shared') {
       this._suiteMode = 'walls';
@@ -4383,34 +5801,36 @@ BRIDGE:`;
         const dropId = keepId === sel.aId ? sel.bId : sel.aId;
         const keepName = getPlace(compass, keepId)?.name || keepId;
         const dropName = getPlace(compass, dropId)?.name || dropId;
-        if (!confirm(`Merge "${dropName}" into "${keepName}"?\n\nThey become one room with one arrange handle. "${dropName}" is kept as an alias.`)) return;
-        const ident = collectLocationIdentity(this.storage, compass, { placeId: dropId, name: dropName });
-        this._compassTry(() => {
-          const fused = fuseSuiteRoomsAlongWall(ensureCompass(st), unitId, sel.aId, sel.bId, keepId);
-          const destId = fused?.id || keepId;
-          rewriteLocationTagNames(this.storage, ensureCompass(st), {
-            removeKeys: ident.keys,
-            replaceWith: keepName,
-            skipAliasPlaceIds: destId ? [destId] : [],
+        void showtimeConfirm(`Merge "${dropName}" into "${keepName}"?\n\nThey become one room with one arrange handle. "${dropName}" is kept as an alias.`, { title: 'MERGE ROOMS', confirmLabel: 'Merge' }).then(ok => {
+          if (!ok) return;
+          const ident = collectLocationIdentity(this.storage, compass, { placeId: dropId, name: dropName });
+          this._compassTry(() => {
+            const fused = fuseSuiteRoomsAlongWall(ensureCompass(st), unitId, sel.aId, sel.bId, keepId);
+            const destId = fused?.id || keepId;
+            rewriteLocationTagNames(this.storage, ensureCompass(st), {
+              removeKeys: ident.keys,
+              replaceWith: keepName,
+              skipAliasPlaceIds: destId ? [destId] : [],
+            });
+            const srcNode = ident.node || findLocationNodeByPlaceId(this.storage, dropId)
+              || findLocationNodeByName(this.storage, dropName);
+            const destNode = findLocationNodeByPlaceId(this.storage, destId)
+              || findLocationNodeByName(this.storage, keepName);
+            if (srcNode && destNode && srcNode.id !== destNode.id) {
+              mergeLocationNodes(this.storage, srcNode.id, destNode.id);
+              destNode.placeId = destId || destNode.placeId;
+            } else if (srcNode && !destNode) {
+              srcNode.placeId = destId || srcNode.placeId;
+              if (keepName) srcNode.name = keepName;
+            }
+            this._suiteSelShared = null;
+            this._suiteSelEdge = null;
+            this._suiteSelEdges = [];
+            this._suiteHighlightChild = destId;
+            if (this._compassFocusId === dropId) this._compassFocusId = destId;
+            this.storage.saveChat();
+            this._compassSave(st);
           });
-          const srcNode = ident.node || findLocationNodeByPlaceId(this.storage, dropId)
-            || findLocationNodeByName(this.storage, dropName);
-          const destNode = findLocationNodeByPlaceId(this.storage, destId)
-            || findLocationNodeByName(this.storage, keepName);
-          if (srcNode && destNode && srcNode.id !== destNode.id) {
-            mergeLocationNodes(this.storage, srcNode.id, destNode.id);
-            destNode.placeId = destId || destNode.placeId;
-          } else if (srcNode && !destNode) {
-            srcNode.placeId = destId || srcNode.placeId;
-            if (keepName) srcNode.name = keepName;
-          }
-          this._suiteSelShared = null;
-          this._suiteSelEdge = null;
-          this._suiteSelEdges = [];
-          this._suiteHighlightChild = destId;
-          if (this._compassFocusId === dropId) this._compassFocusId = destId;
-          this.storage.saveChat();
-          this._compassSave(st);
         });
         return;
       }
@@ -4436,12 +5856,12 @@ BRIDGE:`;
         });
         return;
       }
-      alert('Select a shared wall first.');
+      void showtimeAlert('Select a shared wall first.', { title: 'SUITE WALLS' });
       return;
     }
     if (action === 'suite-delete-shared') {
       const sel = this._suiteSelShared;
-      if (!sel?.aId || !sel?.bId) { alert('Select an interior shared wall first.'); return; }
+      if (!sel?.aId || !sel?.bId) { void showtimeAlert('Select an interior shared wall first.', { title: 'SUITE WALLS' }); return; }
       this._compassTry(() => {
         deleteInteriorSharedWall(ensureCompass(st), sel.aId, sel.bId, sel.wallA, sel.wallB);
         this._suiteSelShared = null;
@@ -4483,7 +5903,7 @@ BRIDGE:`;
         ? Number(act.dataset.edge)
         : (this._suiteSelEdge?.edge ?? this._suiteSelEdges?.[0]?.edge);
       if (!placeId || !Number.isFinite(Number(edge))) {
-        alert('Click a leftover split segment first.');
+        void showtimeAlert('Click a leftover split segment first.', { title: 'SUITE WALLS' });
         return;
       }
       this._compassTry(() => {
@@ -4494,7 +5914,7 @@ BRIDGE:`;
     }
     if (action === 'suite-clean-vertices') {
       const placeId = act.dataset.place || this._suiteSelEdge?.placeId || this._suiteHighlightChild || '';
-      if (!placeId) { alert('Click a room (or one of its walls) first.'); return; }
+      if (!placeId) { void showtimeAlert('Click a room (or one of its walls) first.', { title: 'SUITE WALLS' }); return; }
       this._compassTry(() => {
         simplifySuiteRoomFootprint(ensureCompass(st), placeId);
         this._compassSave(st);
@@ -4507,7 +5927,7 @@ BRIDGE:`;
       this._compassTry(() => {
         const n = insertSuiteCornerVertices(ensureCompass(st), unitId);
         this._compassSave(st);
-        if (!n) alert('No corners sitting on another wall — nudge rooms so a corner meets a face, then try again.');
+        if (!n) void showtimeAlert('No corners sitting on another wall — nudge rooms so a corner meets a face, then try again.', { title: 'SUITE WALLS' });
       });
       return;
     }
@@ -4531,7 +5951,7 @@ BRIDGE:`;
     }
     if (action === 'suite-select-face') {
       const edges = this._suiteSelEdges || [];
-      if (!edges.length) { alert('Click a wall first.'); return; }
+      if (!edges.length) { void showtimeAlert('Click a wall first.', { title: 'SUITE WALLS' }); return; }
       const unitId = act.dataset.unit || '';
       const compass = ensureCompass(st);
       const unit = getPlace(compass, unitId);
@@ -4547,7 +5967,7 @@ BRIDGE:`;
     if (action === 'suite-divide-room') {
       const edges = this._suiteSelEdges || [];
       if (edges.length !== 2 || edges[0].placeId !== edges[1].placeId) {
-        alert('Click (not drag) exactly 2 walls on the same room first.');
+        void showtimeAlert('Click (not drag) exactly 2 walls on the same room first.', { title: 'DIVIDE ROOM' });
         return;
       }
       const placeId = edges[0].placeId;
@@ -4567,7 +5987,7 @@ BRIDGE:`;
       const toPlaceId = this.container.querySelector('[data-role="suite-wl-link-to"]')?.value || '';
       const description = this.container.querySelector('[data-role="suite-wl-link-desc"]')?.value?.trim() || '';
       if (!placeId || !Number.isFinite(edge)) return;
-      if (!toPlaceId) { alert('Pick a neighbor room first.'); return; }
+      if (!toPlaceId) { void showtimeAlert('Pick a neighbor room first.', { title: 'WALL LINK' }); return; }
       this._compassTry(() => {
         addLink(ensureCompass(st), placeId, { edge, toPlaceId, description });
         this._compassSave(st);
@@ -4593,24 +6013,104 @@ BRIDGE:`;
       });
       return;
     }
-    if (action === 'suite-wl-add-opening') {
+    if (action === 'suite-wall-quick-opn') {
       const placeId = act.dataset.place || '';
+      const edge = Number(act.dataset.edge);
+      const type = act.dataset.type || 'door';
+      if (!placeId || !Number.isFinite(edge)) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const link = ensureEdgeLink(compass, placeId, edge, 0.5);
+        const op = addOpening(compass, placeId, link.id, { type, along: 0.5 });
+        this._lastOpening = { placeId, linkId: link.id, opnId: op?.id || '' };
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-edit-opn') {
+      const placeId = act.dataset.place || '';
+      const linkId = act.dataset.link || '';
+      const opnId = act.dataset.opn || '';
       const compass = ensureCompass(st);
       const room = getPlace(compass, placeId);
-      const link = (room?.links || []).find(l => l.id === act.dataset.link);
-      if (!room || !link) return;
+      const link = (room?.links || []).find(l => l.id === linkId);
+      const op = (link?.openings || []).find(o => o.id === opnId);
+      if (!room || !link || !op) return;
       openOpeningDialog({
         room,
         compass,
         link,
+        existing: op,
+        defaultCell: op.cell || 'C',
+        castMembers: getCastMembers(this.storage),
+        onSave: (patch) => {
+          this._compassTry(() => {
+            const c = ensureCompass(st);
+            updateOpening(c, placeId, link.id, op.id, patch);
+            if (patch.toPlaceId === '__exterior__') {
+              linkWallToExterior(c, placeId, link.id);
+            } else if (patch.toPlaceId === '__none__') {
+              setWallConnection(c, placeId, link.edge, '__none__', { linkId: link.id });
+            } else if (patch.toPlaceId) {
+              linkWallToRoom(c, placeId, link.id, patch.toPlaceId);
+            }
+            this._lastOpening = { placeId, linkId: link.id, opnId: op.id };
+            this._compassSave(st);
+          });
+        },
+        onDelete: () => {
+          this._compassTry(() => {
+            removeOpening(ensureCompass(st), placeId, link.id, op.id);
+            this._compassSave(st);
+          });
+        },
+      });
+      return;
+    }
+    if (action === 'suite-del-opn') {
+      const placeId = act.dataset.place || '';
+      const linkId = act.dataset.link || '';
+      const opnId = act.dataset.opn || '';
+      if (!placeId || !linkId || !opnId) return;
+      this._compassTry(() => {
+        removeOpening(ensureCompass(st), placeId, linkId, opnId);
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'suite-wl-add-opening') {
+      const placeId = act.dataset.place || '';
+      const edgeIdx = Number(act.dataset.edge);
+      const compass = ensureCompass(st);
+      const room = getPlace(compass, placeId);
+      if (!room) return;
+      let link = (room.links || []).find(l => l.id === act.dataset.link);
+      if (!link && Number.isFinite(edgeIdx)) {
+        try {
+          link = ensureEdgeLink(compass, placeId, edgeIdx, 0.5);
+          this._compassSave(st);
+        } catch { /* ignore */ }
+      }
+      if (!link) return;
+      openOpeningDialog({
+        room: getPlace(compass, placeId) || room,
+        compass,
+        link,
         existing: null,
+        castMembers: getCastMembers(this.storage),
         onSave: (payload) => {
           this._compassTry(() => {
             const compass = ensureCompass(st);
             const lid = payload.linkId || link.id;
-            addOpening(compass, placeId, lid, payload);
-            if (payload.toPlaceId) linkWallToRoom(compass, placeId, lid, payload.toPlaceId);
-            this._lastOpening = { placeId, linkId: lid };
+            const op = addOpening(compass, placeId, lid, payload);
+            if (payload.toPlaceId === '__exterior__') {
+              linkWallToExterior(compass, placeId, lid);
+            } else if (payload.toPlaceId === '__none__') {
+              setWallConnection(compass, placeId, link.edge, '__none__', { linkId: lid });
+            } else if (payload.toPlaceId) {
+              linkWallToRoom(compass, placeId, lid, payload.toPlaceId);
+            }
+            this._lastOpening = { placeId, linkId: lid, opnId: op?.id || '' };
             this._compassSave(st);
           });
         },
@@ -4628,6 +6128,7 @@ BRIDGE:`;
       const parentId = act.dataset.parent || '';
       const childId = act.dataset.place || '';
       if (!parentId) return;
+      this._suiteFromChild = true;
       this._suiteHighlightChild = childId;
       this._compassFocusId = parentId;
       this._suiteMode = ['arrange', 'walls', 'fixtures'].includes(this._suiteMode) ? this._suiteMode : 'browse';
@@ -4698,15 +6199,44 @@ BRIDGE:`;
               this._compassSave(st);
             });
           },
+          movePiece: (cellId, layer, itemId, { toCell, toLayer } = {}) => {
+            this._compassTry(() => {
+              moveItem(ensureCompass(st), placeId, {
+                itemId,
+                cell: cellId,
+                layer,
+                toCell,
+                toLayer,
+              });
+              if (toCell) this._compassSelCell = toCell;
+              this._compassSave(st);
+            });
+          },
           addOccupant: (cellId, { name, castId, description }) => {
             this._compassTry(() => {
-              addOccupant(ensureCompass(st), placeId, { name, cell: cellId, castId, description });
+              const compass = ensureCompass(st);
+              addOccupant(compass, placeId, { name, cell: cellId, castId, description });
+              const member = this._sonarCast({ includeWrittenOut: true }).find(m =>
+                (castId && String(m.id) === String(castId))
+                || String(m.name || '').toLowerCase() === String(name || '').toLowerCase());
+              if (member) {
+                pinSonarPing(compass, member, { placeId, cell: cellId, locked: true });
+              }
               this._compassSave(st);
             });
           },
           removeOccupant: (name) => {
             this._compassTry(() => {
-              removeOccupant(ensureCompass(st), placeId, { name });
+              const compass = ensureCompass(st);
+              removeOccupant(compass, placeId, { name });
+              const member = this._sonarCast({ includeWrittenOut: true }).find(m =>
+                String(m.name || '').toLowerCase() === String(name || '').toLowerCase());
+              if (member && compass.sonar?.pings) {
+                const prev = compass.sonar.pings[member.id];
+                if (prev && prev.placeId === placeId) {
+                  delete compass.sonar.pings[member.id];
+                }
+              }
               this._compassSave(st);
             });
           },
@@ -4718,7 +6248,17 @@ BRIDGE:`;
           },
           moveOccupant: (name, cell) => {
             this._compassTry(() => {
-              moveOccupant(ensureCompass(st), placeId, { name, cell });
+              const compass = ensureCompass(st);
+              moveOccupant(compass, placeId, { name, cell });
+              const member = this._sonarCast({ includeWrittenOut: true }).find(m =>
+                String(m.name || '').toLowerCase() === String(name || '').toLowerCase());
+              if (member && compass.sonar?.pings?.[member.id]) {
+                compass.sonar.pings[member.id].placeId = placeId;
+                compass.sonar.pings[member.id].cell = cell;
+                compass.sonar.pings[member.id].at = Date.now();
+                compass.sonar.pings[member.id].away = false;
+                compass.sonar.pings[member.id].listening = false;
+              }
               this._compassSave(st);
             });
           },
@@ -4726,7 +6266,11 @@ BRIDGE:`;
             this._compassTry(() => {
               const compass = ensureCompass(st);
               addOpening(compass, placeId, payload.linkId, payload);
-              if (payload.toPlaceId) linkWallToRoom(compass, placeId, payload.linkId, payload.toPlaceId);
+              if (payload.toPlaceId === '__exterior__') {
+                linkWallToExterior(compass, placeId, payload.linkId);
+              } else if (payload.toPlaceId && payload.toPlaceId !== '__none__') {
+                linkWallToRoom(compass, placeId, payload.linkId, payload.toPlaceId);
+              }
               this._lastOpening = { placeId, linkId: payload.linkId };
               this._compassSave(st);
             });
@@ -4735,7 +6279,11 @@ BRIDGE:`;
             this._compassTry(() => {
               const compass = ensureCompass(st);
               updateOpening(compass, placeId, linkId, openingId, patch);
-              if (patch.toPlaceId) linkWallToRoom(compass, placeId, linkId, patch.toPlaceId);
+              if (patch.toPlaceId === '__exterior__') {
+                linkWallToExterior(compass, placeId, linkId);
+              } else if (patch.toPlaceId && patch.toPlaceId !== '__none__') {
+                linkWallToRoom(compass, placeId, linkId, patch.toPlaceId);
+              }
               this._lastOpening = { placeId, linkId };
               this._compassSave(st);
             });
@@ -4778,7 +6326,7 @@ BRIDGE:`;
     }
     if (action === 'placement-focus') {
       const placeId = this.container.querySelector('[data-role="placement-place"]')?.value || '';
-      if (!placeId) { alert('Pick a room, hall, or building exterior.'); return; }
+      if (!placeId) { void showtimeAlert('Pick a room, hall, or building exterior.', { title: 'PLACEMENT' }); return; }
       this._compassFocusId = placeId;
       this._povPreviewText = '';
       return void this.render(this.container);
@@ -4841,15 +6389,41 @@ BRIDGE:`;
       });
       return;
     }
-    if (action === 'placement-del-piece') {
-      if (!confirm('Send this piece to Lost & Found?')) return;
+    if (action === 'placement-order-piece') {
       this._compassTry(() => {
-        sendItemToLostAndFound(ensureCompass(st), act.dataset.place, {
+        reorderCellItem(ensureCompass(st), act.dataset.place, {
+          itemId: act.dataset.id,
+          cell: act.dataset.cell,
+          layer: act.dataset.layer,
+          dir: Number(act.dataset.dir) || 0,
+        });
+        this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'placement-pickup-piece') {
+      this._compassTry(() => {
+        const taken = pickupItem(ensureCompass(st), act.dataset.place, {
           itemId: act.dataset.id,
           cell: act.dataset.cell,
           layer: act.dataset.layer,
         });
+        addPickupToInventory(this.storage, taken, this.bus);
         this._compassSave(st);
+      });
+      return;
+    }
+    if (action === 'placement-del-piece') {
+      void showtimeConfirm('Send this piece to Lost & Found?', { title: 'LOST & FOUND', confirmLabel: 'Send' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          sendItemToLostAndFound(ensureCompass(st), act.dataset.place, {
+            itemId: act.dataset.id,
+            cell: act.dataset.cell,
+            layer: act.dataset.layer,
+          });
+          this._compassSave(st);
+        });
       });
       return;
     }
@@ -4867,19 +6441,22 @@ BRIDGE:`;
       return;
     }
     if (action === 'lost-destroy') {
-      if (!confirm('Permanently destroy this Lost & Found item?')) return;
-      this._compassTry(() => {
-        removeFromLostAndFound(ensureCompass(st), act.dataset.id);
-        this._compassSave(st);
+      void showtimeConfirm('Permanently destroy this Lost & Found item?', { title: 'DESTROY ITEM', danger: true, confirmLabel: 'Destroy' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          removeFromLostAndFound(ensureCompass(st), act.dataset.id);
+          this._compassSave(st);
+        });
       });
       return;
     }
     if (action === 'lost-add') {
-      const name = prompt('Lost & Found item name?');
-      if (!name?.trim()) return;
-      this._compassTry(() => {
-        addToLostAndFound(ensureCompass(st), { name: name.trim() }, { layer: 'clutter' });
-        this._compassSave(st);
+      void showtimePrompt('Lost & Found item name?', { title: 'LOST & FOUND', confirmLabel: 'Add' }).then(name => {
+        if (!name?.trim()) return;
+        this._compassTry(() => {
+          addToLostAndFound(ensureCompass(st), { name: name.trim() }, { layer: 'clutter' });
+          this._compassSave(st);
+        });
       });
       return;
     }
@@ -4935,10 +6512,12 @@ BRIDGE:`;
     if (action === 'compass-barrier-del') {
       const placeId = act.dataset.place;
       const wallId = act.dataset.wall;
-      if (!confirm('Remove this internal wall?')) return;
-      this._compassTry(() => {
-        removeInternalWall(ensureCompass(st), placeId, wallId);
-        this._compassSave(st);
+      void showtimeConfirm('Remove this internal wall?', { title: 'REMOVE WALL', danger: true, confirmLabel: 'Remove' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          removeInternalWall(ensureCompass(st), placeId, wallId);
+          this._compassSave(st);
+        });
       });
       return;
     }
@@ -4956,7 +6535,7 @@ BRIDGE:`;
     }
     if (action === 'compass-fp-add-vert') {
       const edges = [...(this._compassSelEdges || [])];
-      if (!edges.length) { alert('Select a wall first.'); return; }
+      if (!edges.length) { void showtimeAlert('Select a wall first.', { title: 'FLOORPLAN' }); return; }
       const edge = Number(edges[0]);
       this._compassTry(() => {
         insertFootprintVertex(ensureCompass(st), act.dataset.place, edge, 0.5);
@@ -4999,6 +6578,7 @@ BRIDGE:`;
         compass,
         link,
         existing: op,
+        castMembers: getCastMembers(this.storage),
         onSave: (patch) => {
           this._compassTry(() => {
             updateOpening(ensureCompass(st), placeId, link.id, op.id, patch);
@@ -5026,6 +6606,7 @@ BRIDGE:`;
         link,
         existing: null,
         defaultCell: this._compassSelCell || 'C',
+        castMembers: getCastMembers(this.storage),
         onSave: (payload) => {
           this._compassTry(() => {
             const compass = ensureCompass(st);
@@ -5104,11 +6685,13 @@ BRIDGE:`;
     }
     if (action === 'compass-delete') {
       const place = act.dataset.place;
-      if (!confirm(`Delete place "${place}"?`)) return;
-      this._compassTry(() => {
-        deletePlace(ensureCompass(st), place);
-        if (this._compassFocusId === place) this._compassFocusId = '';
-        this._compassSave(st);
+      void showtimeConfirm(`Delete place "${place}"?`, { title: 'DELETE PLACE', danger: true, confirmLabel: 'Delete' }).then(ok => {
+        if (!ok) return;
+        this._compassTry(() => {
+          deletePlace(ensureCompass(st), place);
+          if (this._compassFocusId === place) this._compassFocusId = '';
+          this._compassSave(st);
+        });
       });
       return;
     }
@@ -5136,8 +6719,8 @@ BRIDGE:`;
         .filter(w => w === 'above' || w === 'below');
       const toPlaceId = this.container.querySelector('[data-role="link-to"]')?.value;
       const description = this.container.querySelector('[data-role="link-desc"]')?.value?.trim() || '';
-      if (!edges.length && !vertical.length) { alert('Select floorplan wall(s) and/or above/below.'); return; }
-      if (!toPlaceId) { alert('Pick a neighbor place.'); return; }
+      if (!edges.length && !vertical.length) { void showtimeAlert('Select floorplan wall(s) and/or above/below.', { title: 'WALL LINK' }); return; }
+      if (!toPlaceId) { void showtimeAlert('Pick a neighbor place.', { title: 'WALL LINK' }); return; }
       this._compassTry(() => {
         const compass = ensureCompass(st);
         for (const edge of edges) {
@@ -5156,7 +6739,7 @@ BRIDGE:`;
         .map(el => el.dataset.wall)
         .filter(w => w === 'above' || w === 'below');
       const description = this.container.querySelector('[data-role="link-desc"]')?.value?.trim() || '';
-      if (!edges.length && !vertical.length) { alert('Select floorplan wall(s) and/or above/below.'); return; }
+      if (!edges.length && !vertical.length) { void showtimeAlert('Select floorplan wall(s) and/or above/below.', { title: 'WALL LINK' }); return; }
       this._compassTry(() => {
         const compass = ensureCompass(st);
         for (const edge of edges) {
@@ -5171,7 +6754,7 @@ BRIDGE:`;
     }
     if (action === 'compass-divide-room') {
       const edges = [...(this._compassSelEdges || [])].map(Number).filter(n => Number.isFinite(n));
-      if (edges.length !== 2) { alert('Select exactly 2 walls on the floorplan first.'); return; }
+      if (edges.length !== 2) { void showtimeAlert('Select exactly 2 walls on the floorplan first.', { title: 'DIVIDE ROOM' }); return; }
       const placeId = act.dataset.place || '';
       this._compassTry(() => {
         const compass = ensureCompass(st);
@@ -5210,6 +6793,10 @@ BRIDGE:`;
     if (action === 'toggle-cell' || action === 'grid-apply' || action === 'grid-clear'
       || action === 'asset-add' || action === 'asset-drop') {
       // Legacy Stage mark-grid / assets removed — Room Compass supersedes them.
+      return;
+    }
+    if (action === 'open-program') {
+      openPlaybill();
       return;
     }
     if (action === 'theme') {
@@ -5259,16 +6846,19 @@ BRIDGE:`;
     if (action === 'script-deep') {
       const script = window.Showtime?.modules?.get('script');
       if (script?._openSettings) script._openSettings();
-      else alert('Script module is not loaded.');
+      else void showtimeAlert('Script module is not loaded.', { title: 'SCRIPT CONFIGURE' });
       return;
     }
     if (action === 'tracker-pane') {
       st.trackers = normalizeTrackers(st.trackers);
       st.trackers.pane = act.dataset.pane || 'status';
+      this._prodFolds ??= new Set();
+      this._prodFolds.add('trackers');
       this.saveState();
       return void this.render(this.container);
     }
     if (action === 'scene-clap') return this._sceneClap();
+    if (action === 'scene-set') return this._sceneSetManual(act);
     if (action === 'scene-weather-shift') return this._sceneWeatherShift();
     if (action === 'clap-show') {
       st.trackers = normalizeTrackers(st.trackers);
@@ -5286,6 +6876,8 @@ BRIDGE:`;
       this.saveState();
       this.bus?.emit('showtime.stateChanged');
       this.bus?.emit('trackers.updated');
+      this._prodFolds ??= new Set();
+      this._prodFolds.add('trackers');
       return void this.render(this.container);
     }
     if (action === 'bg-add') return this._openBackgroundDialog(null);
@@ -5352,18 +6944,25 @@ BRIDGE:`;
       this.saveState();
       this._syncStageBackground();
       const where = [ctx.placeName || ctx.placeId, ctx.cellId ? `area ${ctx.cellId}` : ''].filter(Boolean).join(' · ') || 'here';
-      alert(`Linked “${bg.title}” to ${where}. Auto-select will show it here.`);
+      emitShowtimeNotice(this.bus, {
+        kind: 'house',
+        text: `Linked “${bg.title}” to ${where}.`,
+        mark: '+',
+      });
       return void this.render(this.container);
     }
     if (action === 'bg-del') {
-      if (!confirm('Delete this background?')) return;
-      st.visuals = normalizeVisuals(st.visuals);
-      st.visuals.backgrounds = st.visuals.backgrounds.filter(b => b.id !== act.dataset.id);
-      if (st.visuals.activeId === act.dataset.id) st.visuals.activeId = '';
-      if (st.visuals.pinnedId === act.dataset.id) st.visuals.pinnedId = '';
-      this.saveState();
-      this._syncStageBackground();
-      return void this.render(this.container);
+      void showtimeConfirm('Delete this background?', { title: 'DELETE BACKGROUND', danger: true, confirmLabel: 'Delete' }).then(ok => {
+        if (!ok) return;
+        st.visuals = normalizeVisuals(st.visuals);
+        st.visuals.backgrounds = st.visuals.backgrounds.filter(b => b.id !== act.dataset.id);
+        if (st.visuals.activeId === act.dataset.id) st.visuals.activeId = '';
+        if (st.visuals.pinnedId === act.dataset.id) st.visuals.pinnedId = '';
+        this.saveState();
+        this._syncStageBackground();
+        this.render(this.container);
+      });
+      return;
     }
     if (action === 'bg-up' || action === 'bg-down') {
       st.visuals = normalizeVisuals(st.visuals);
@@ -5396,9 +6995,12 @@ BRIDGE:`;
     if (style.textContent !== CLAPPER_CSS) style.textContent = CLAPPER_CSS;
   }
 
-  _syncFloatingClapper(forceShow = false) {
+  _syncFloatingClapper(forceShow = false, { scan = true, lite = false } = {}) {
+    this._closeClapperEdit();
     this._injectClapperCss();
-    try { this._scanChatTrackers({ persist: false }); } catch { /* ignore */ }
+    if (scan) {
+      try { this._scanChatTrackers({ persist: false }); } catch { /* ignore */ }
+    }
     const st = this._db();
     const scene = normalizeTrackers(st.trackers).scene;
     let root = document.getElementById('st-clapper-float');
@@ -5420,7 +7022,7 @@ BRIDGE:`;
       root.addEventListener('click', e => this._onClapperClick(e));
       this._bindClapperDrag(root);
     }
-    const clap = this._sceneClapSnapshot(st);
+    const clap = this._sceneClapSnapshot(st, { lite });
     const pinned = !!scene.clapperPinned;
     root.classList.toggle('pinned', pinned);
     root.hidden = false;
@@ -5496,7 +7098,15 @@ BRIDGE:`;
       return;
     }
     if (action === 'clap-refresh') return this._sceneClap();
+    if (action === 'scene-set') return this._sceneSetManual(act);
+    if (action === 'cue-accept') return this._acceptPendingCue();
+    if (action === 'cue-ignore') return this._ignorePendingCue();
+    if (action === 'clap-edit') {
+      this._openClapperEdit(act.dataset.field || '');
+      return;
+    }
     if (action === 'clap-hide') {
+      this._closeClapperEdit();
       st.trackers = normalizeTrackers(st.trackers);
       if (st.trackers.scene.clapperPinned) {
         act.title = 'Unpin first to hide';
@@ -5535,9 +7145,14 @@ BRIDGE:`;
     }
   }
 
-  /** Scene tracker / clapper place — lastLocationKey wins over a stale sonar ping. */
-  _trackerPlace(compass, scene) {
-    const raw = String(scene?.lastLocationKey || compass?.sonar?.lastKey || '').trim();
+  /** Scene tracker / clapper place — travel occupancy wins over a stale sonar ping. */
+  _trackerPlace(compass, scene, { scanFormatted = true } = {}) {
+    const travel = normalizeTravel(scene?.travel, { lastLocationKey: scene?.lastLocationKey });
+    if (travel.placeId) {
+      const pinned = getPlace(compass, travel.placeId);
+      if (pinned) return pinned;
+    }
+    const raw = String(travel.placeKey || scene?.lastLocationKey || compass?.sonar?.lastKey || '').trim();
     const lastKey = locationKeyFromStored(raw);
     const unit = (raw.match(/\(([^)]+)\)\s*$/) || [])[1] || '';
     if (unit) {
@@ -5556,28 +7171,39 @@ BRIDGE:`;
     if (lastKey) {
       const tagged = findPlaceForTag(compass, lastKey) || findPlaceByExactName(compass, lastKey);
       if (tagged) return tagged;
-      const needle = lastKey.toLowerCase();
-      const hit = Object.values(compass?.rooms || {}).find((p) => {
-        try {
-          const formatted = formatSceneLocation({ compass, placeId: p.id });
-          const fk = locationKeyFromStored(formatted).toLowerCase();
-          return fk === needle || formatted.toLowerCase().includes(needle);
-        } catch { return false; }
-      });
-      if (hit) return hit;
+      // Formatting every room's full path is what locks the page while the
+      // chat is still trying to paint. Exact name and tags are enough then.
+      if (scanFormatted) {
+        const needle = lastKey.toLowerCase();
+        const hits = [];
+        for (const p of Object.values(compass?.rooms || {})) {
+          try {
+            const formatted = formatSceneLocation({ compass, placeId: p.id });
+            const fk = locationKeyFromStored(formatted).toLowerCase();
+            if (fk === needle || formatted.toLowerCase().includes(needle)) hits.push(p);
+          } catch { /* ignore */ }
+        }
+        if (hits.length === 1) return hits[0];
+        const rawL = raw.toLowerCase();
+        const narrowed = hits.filter(p => {
+          const parent = compass.rooms?.[p.parentId];
+          return parent && rawL.includes(String(parent.name || '').toLowerCase());
+        });
+        if (narrowed.length === 1) return narrowed[0];
+      }
     }
     const storyPlaceId = String(compass?.sonar?.lastPlaceId || '').trim();
     return storyPlaceId ? getPlace(compass, storyPlaceId) : null;
   }
 
   /** Scene context used to auto-select / link backgrounds (place, area, tags). */
-  _bgContext() {
+  _bgContext({ scanFormatted = true } = {}) {
     const st = this._db();
     const compass = ensureCompass(st);
     const scene = normalizeTrackers(st.trackers).scene;
     const lastRaw = String(scene.lastLocationKey || compass.sonar?.lastKey || '').trim();
     const lastKey = locationKeyFromStored(lastRaw);
-    const place = this._trackerPlace(compass, scene);
+    const place = this._trackerPlace(compass, scene, { scanFormatted });
     const locationTags = [];
     const seen = new Set();
     const push = (t) => {
@@ -5628,11 +7254,11 @@ BRIDGE:`;
     };
   }
 
-  _syncStageBackground() {
+  _syncStageBackground({ lite = false } = {}) {
     let layer = document.getElementById('st-stage-bg');
     const st = this._db();
     const visuals = normalizeVisuals(st.visuals);
-    const ctx = this._bgContext();
+    const ctx = this._bgContext({ scanFormatted: !lite });
     const bg = pickBackground(visuals, {
       locationTags: ctx.locationTags,
       narrativeTags: ctx.narrativeTags,
@@ -5708,7 +7334,7 @@ BRIDGE:`;
     overlay.querySelector('[data-a="cancel"]').addEventListener('click', close);
     overlay.querySelector('[data-a="save"]').addEventListener('click', () => {
       const name = overlay.querySelector('[data-f="name"]').value.trim();
-      if (!name) { alert('Name is required.'); return; }
+      if (!name) { void showtimeAlert('Name is required.', { title: 'CUSTOM STATUS BAR' }); return; }
       const levelMode = overlay.querySelector('input[name="bst-lv-mode"]:checked')?.value || 'label';
       const direction = overlay.querySelector('input[name="bst-bar-dir"]:checked')?.value || 'up';
       const levels = String(overlay.querySelector('[data-f="levels"]').value || '')
@@ -5737,6 +7363,8 @@ BRIDGE:`;
       this.bus?.emit('showtime.stateChanged');
       this.bus?.emit('trackers.updated');
       close();
+      this._prodFolds ??= new Set();
+      this._prodFolds.add('trackers');
       this.render(this.container);
     });
     document.body.appendChild(overlay);
@@ -5838,7 +7466,7 @@ BRIDGE:`;
         updatedAt: Date.now(),
       });
       if (!next.url && !next.backupUrl && !next.fileData) {
-        alert('Add a URL or upload an image.');
+        void showtimeAlert('Add a URL or upload an image.', { title: 'BACKGROUND' });
         return;
       }
       const st2 = this._db();
@@ -5869,11 +7497,11 @@ BRIDGE:`;
       images = Array.isArray(data?.images) ? data.images : [];
     } catch (err) {
       console.error('[Backstage] ST backgrounds fetch failed', err);
-      alert(`Could not read SillyTavern backgrounds: ${err.message || err}`);
+      void showtimeAlert(`Could not read SillyTavern backgrounds: ${err.message || err}`, { title: 'IMPORT BACKGROUNDS', danger: true });
       return;
     }
     if (!images.length) {
-      alert('SillyTavern has no backgrounds to import.');
+      void showtimeAlert('SillyTavern has no backgrounds to import.', { title: 'IMPORT BACKGROUNDS' });
       return;
     }
 
@@ -5929,7 +7557,7 @@ BRIDGE:`;
         .map(el => el.dataset.stBg)
         .filter(Boolean);
       if (!picked.length) {
-        alert('Pick at least one background.');
+        void showtimeAlert('Pick at least one background.', { title: 'IMPORT BACKGROUNDS' });
         return;
       }
       const st2 = this._db();
@@ -5957,7 +7585,7 @@ BRIDGE:`;
       this._syncStageBackground();
       close();
       this.render(this.container);
-      if (!added) alert('Nothing new to import — those were already in the library.');
+      if (!added) void showtimeAlert('Nothing new to import — those were already in the library.', { title: 'IMPORT BACKGROUNDS' });
     });
     document.body.appendChild(overlay);
   }
@@ -5976,17 +7604,289 @@ BRIDGE:`;
     cur[parts[parts.length - 1]] = value;
     st.trackers = normalizeTrackers(st.trackers);
     this.saveState();
+    if (/^receipt\./.test(path) || /^status\./.test(path)) {
+      this.bus?.emit('trackers.updated');
+    }
+  }
+
+  _sceneSetDraft(st = this._db()) {
+    const scene = normalizeTrackers(st.trackers).scene;
+    const script = this.storage.getChat('script', {});
+    const cal = normalizeCalendar(script?.settings?.calendar);
+    let parts = null;
+    try {
+      const present = currentTimelinePresent(this.storage);
+      if (present?.parts) parts = present.parts;
+    } catch { /* ignore */ }
+    let monthIndex = parts?.monthIndex;
+    let day = parts?.day;
+    let year = parts?.year;
+    if (scene.lastDateLabel && (monthIndex == null || day == null)) {
+      try {
+        const parsed = parseTimeKey(scene.lastDateLabel, cal, { fillMissing: false });
+        if (parsed?.parts) {
+          if (monthIndex == null) monthIndex = parsed.parts.monthIndex;
+          if (day == null) day = parsed.parts.day;
+          if (year == null) year = parsed.parts.year;
+        }
+      } catch { /* ignore */ }
+    }
+    const hour = scene.lastTimeHour != null && Number.isFinite(Number(scene.lastTimeHour))
+      ? Number(scene.lastTimeHour)
+      : (Number.isFinite(Number(parts?.hour)) ? Number(parts.hour) : 9);
+    const minute = Number.isFinite(Number(scene.lastTimeMinute)) ? Number(scene.lastTimeMinute) : 0;
+    return {
+      calendar: cal,
+      monthIndex: Number.isFinite(Number(monthIndex)) ? Number(monthIndex) : 0,
+      day: Number.isFinite(Number(day)) ? Number(day) : 1,
+      year: year != null && year !== '' ? year : '',
+      hour,
+      minute,
+    };
+  }
+
+  _sceneSetLocationFormHtml() {
+    const st = this._db();
+    const compass = ensureCompass(st);
+    const scene = normalizeTrackers(st.trackers).scene;
+    const here = this._trackerPlace(compass, scene);
+    const selectedId = here?.id || compass.sonar?.lastPlaceId || '';
+    const opts = renderCompassPlaceOptions(compass, {
+      esc,
+      selectedId,
+      emptyLabel: '— Location —',
+      includeGeoParents: true,
+    });
+    return `
+      <div class="st-scene-set" data-role="scene-set-form" data-kind="location">
+        <div class="st-scene-set-row">
+          <label class="st-scene-set-field st-scene-set-field--place"><span>Location</span>
+            <select class="bst-input" data-role="scene-set-place">${opts}</select>
+          </label>
+          <button type="button" class="bst-btn gold" data-action="scene-set">Set</button>
+        </div>
+      </div>`;
+  }
+
+  _sceneSetManual(fromEl) {
+    const form = fromEl?.closest?.('[data-role="scene-set-form"]')
+      || fromEl?.querySelector?.('[data-role="scene-set-form"]')
+      || this.container?.querySelector('[data-role="scene-set-form"]');
+    if (!form) return;
+    const placeEl = form.querySelector('[data-role="scene-set-place"]');
+    if (placeEl) {
+      const placeId = String(placeEl.value || '').trim();
+      this._closeClapperEdit();
+      if (!placeId) return;
+      return this._establishLocation({ placeId, cell: this._compassSelCell || 'C' });
+    }
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const scene = st.trackers.scene;
+    const script = this.storage.getChat('script', {});
+    const cal = normalizeCalendar(script?.settings?.calendar);
+    const hpd = Math.max(1, Number(cal.hoursPerDay) || 24);
+
+    let hour;
+    let minute = 0;
+    const fuzzy = form.querySelector('[data-role="scene-set-fuzzy"]');
+    if (fuzzy) {
+      hour = Number(fuzzy.value);
+      minute = 0;
+    } else {
+      hour = Number(form.querySelector('[data-role="scene-set-hour"]')?.value);
+      minute = Number(form.querySelector('[data-role="scene-set-minute"]')?.value);
+    }
+
+    const cueParts = {};
+    const monthEl = form.querySelector('[data-role="scene-set-month"]');
+    const dayEl = form.querySelector('[data-role="scene-set-day"]');
+    const yearEl = form.querySelector('[data-role="scene-set-year"]');
+    if (monthEl && monthEl.value !== '') {
+      const mi = Number(monthEl.value);
+      if (Number.isFinite(mi)) cueParts.monthIndex = mi;
+    }
+    if (dayEl && dayEl.value !== '') {
+      const d = Number(dayEl.value);
+      if (Number.isFinite(d) && d >= 1) cueParts.day = Math.min(31, Math.trunc(d));
+    }
+    if (yearEl && String(yearEl.value).trim() !== '') {
+      const y = Number(yearEl.value);
+      if (Number.isFinite(y)) cueParts.year = y;
+    }
+
+    if (scene.time !== false && Number.isFinite(hour)) {
+      hour = ((Math.floor(hour) % hpd) + hpd) % hpd;
+      minute = Number.isFinite(minute) ? Math.max(0, Math.min(59, Math.floor(minute))) : 0;
+      scene.lastTimeHour = hour;
+      scene.lastTimeMinute = minute;
+      scene.lastTimeLabel = formatTrackerTimeFromHour(scene.timeMode, hour, hpd, minute) || scene.lastTimeLabel;
+    } else {
+      hour = undefined;
+      minute = undefined;
+    }
+
+    const hasDate = scene.date !== false && (cueParts.day != null || cueParts.monthIndex != null);
+    if (hasDate) {
+      const label = formatSceneDate(cueParts, cal, scene.dateParts);
+      if (label) scene.lastDateLabel = label;
+      scene.lastDateCueSig = `absolute:${cueParts.day ?? ''}:${cueParts.monthIndex ?? ''}:${cueParts.year ?? ''}`;
+    }
+
+    scene.lastClapAt = Date.now();
+    this._armBoardHold(scene);
+    this._syncTimelinePresent({
+      hour,
+      minute,
+      parts: hasDate ? cueParts : null,
+      create: true,
+    });
+    this.saveState();
+    this._closeClapperEdit();
+    this._syncFloatingClapper(false, { scan: false });
+    this._syncWeatherOverlay();
+    if (this._door === 'production') return void this.render(this.container);
+  }
+
+  _acceptPendingCue() {
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const scene = st.trackers.scene;
+    const cue = normalizePendingCue(scene.pendingCue);
+    this._closeClapperEdit();
+    if (!cue) return;
+    const script = this.storage.getChat('script', {});
+    const cal = normalizeCalendar(script?.settings?.calendar);
+    const hpd = Math.max(1, Number(cal.hoursPerDay) || 24);
+    let hour;
+    let minute;
+    if (cue.time && Number.isFinite(Number(cue.time.hour))) {
+      hour = ((Math.floor(Number(cue.time.hour)) % hpd) + hpd) % hpd;
+      minute = cue.time.clock
+        ? Math.max(0, Math.min(59, Number(cue.time.minute) || 0))
+        : 0;
+      scene.lastTimeHour = hour;
+      scene.lastTimeMinute = minute;
+      scene.lastTimeLabel = formatTrackerTimeFromHour(scene.timeMode, hour, hpd, minute)
+        || cue.time.fuzzy
+        || scene.lastTimeLabel;
+    }
+    if (cue.date) {
+      if (cue.date.kind === 'absolute') {
+        if (cue.date.label) scene.lastDateLabel = cue.date.label;
+        if (cue.date.sig) scene.lastDateCueSig = cue.date.sig;
+        this._syncTimelinePresent({
+          hour,
+          minute,
+          parts: cue.date.parts || null,
+          create: true,
+        });
+      } else {
+        scene.lastDateCueSig = cue.date.sig
+          || `relative:${cue.date.deltaDays ?? ''}:${String(cue.date.fuzzy || '')}`;
+        this._syncTimelinePresent({
+          deltaDays: cue.date.deltaDays,
+          hour: cue.date.hour ?? hour,
+          minute,
+        });
+        try {
+          const snap = this._sceneClapSnapshot(st);
+          if (snap.date && snap.date !== '—') scene.lastDateLabel = snap.date;
+        } catch { /* ignore */ }
+      }
+    } else if (hour != null) {
+      this._syncTimelinePresent({ hour, minute });
+    }
+    const loc = cue.location;
+    this._armBoardHold(scene);
+    if (loc?.placeId) {
+      acceptNow(this.storage, { scene, bus: this.bus, applyOccupancy: false });
+      return this._establishLocation({ placeId: loc.placeId, cell: this._compassSelCell || 'C' });
+    }
+    if (loc?.key) {
+      acceptNow(this.storage, { scene, bus: this.bus });
+      this._scheduleSuiteBuild();
+    } else {
+      acceptNow(this.storage, { scene, bus: this.bus, applyOccupancy: false });
+    }
+    this._syncAutoPresence();
+    this.saveState();
+    this._syncFloatingClapper(false, { scan: false });
+    this._syncWeatherOverlay();
+    if (this._door === 'production') return void this.render(this.container);
+  }
+
+  _ignorePendingCue() {
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const scene = st.trackers.scene;
+    ignoreNow(this.storage, { scene });
+    this.saveState();
+    this._closeClapperEdit();
+    this._syncFloatingClapper(false, { scan: false });
+  }
+
+  _closeClapperEdit() {
+    document.getElementById('st-clap-edit-pop')?.remove();
+    if (this._clapEditAway) {
+      document.removeEventListener('mousedown', this._clapEditAway, true);
+      this._clapEditAway = null;
+    }
+  }
+
+  _openClapperEdit(field = '') {
+    const root = document.getElementById('st-clapper-float');
+    if (!root) return;
+    const existing = document.getElementById('st-clap-edit-pop');
+    const same = existing && existing.dataset.field === String(field || '');
+    if (existing) this._closeClapperEdit();
+    if (same) return;
+    const st = this._db();
+    const scene = normalizeTrackers(st.trackers).scene;
+    const draft = this._sceneSetDraft(st);
+    const pop = document.createElement('div');
+    pop.id = 'st-clap-edit-pop';
+    pop.className = 'st-clap-edit';
+    pop.dataset.field = String(field || '');
+    pop.innerHTML = field === 'location'
+      ? this._sceneSetLocationFormHtml()
+      : buildSceneSetFormHtml({
+        esc,
+        scene,
+        calendar: draft.calendar,
+        draft,
+      });
+    if (!String(pop.innerHTML || '').trim()) return;
+    root.appendChild(pop);
+    this._clapEditAway = (ev) => {
+      if (pop.contains(ev.target)) return;
+      if (ev.target.closest?.('[data-action="clap-edit"]')) return;
+      if (ev.target.closest?.('select, option')) return;
+      this._closeClapperEdit();
+    };
+    setTimeout(() => document.addEventListener('mousedown', this._clapEditAway, true), 0);
   }
 
   _sceneClap() {
-    try { this._scanChatTrackers({ persist: true }); } catch { /* ignore */ }
+    try { this._scanChatTrackers({ persist: true, force: true }); } catch { /* ignore */ }
     const st = this._db();
     st.trackers = normalizeTrackers(st.trackers);
     const snap = this._sceneClapSnapshot(st);
-    const locKey = locationKeyFromStored(st.trackers.scene.lastLocationKey)
+    const locKey = locationKeyFromStored(st.trackers.scene.travel?.placeKey)
+      || locationKeyFromStored(st.trackers.scene.lastLocationKey)
       || locationKeyFromStored(ensureCompass(st).sonar?.lastKey)
       || locationKeyFromStored(snap.location);
-    st.trackers.scene.lastLocationKey = locKey;
+    if (locKey && !/^Moving:/i.test(locKey)) {
+      commitNow(this.storage, {
+        occupancy: {
+          mode: 'compass',
+          placeKey: locKey,
+          placeId: String(ensureCompass(st).sonar?.lastPlaceId || st.trackers.scene.travel?.placeId || '').trim(),
+        },
+      }, { force: true, source: 'clap', scene: st.trackers.scene, bus: this.bus });
+      this._scheduleSuiteBuild();
+    }
+    this._syncAutoPresence();
     st.trackers.scene.lastTimeLabel = st.trackers.scene.time
       ? (snap.time || '')
       : '';
@@ -5994,6 +7894,7 @@ BRIDGE:`;
       ? snap.date
       : '';
     st.trackers.scene.lastClapAt = Date.now();
+    this._armBoardHold(st.trackers.scene);
     // Soft-sync composer scene location when we have a key
     try {
       if (st.trackers.scene.trackStar && locKey) {
@@ -6006,14 +7907,14 @@ BRIDGE:`;
     } catch { /* ignore */ }
     this.saveState();
     this.bus?.emit('showtime.stateChanged');
-    this._syncFloatingClapper();
+    this._syncFloatingClapper(false, { scan: false });
     this._syncWeatherOverlay();
     const float = document.getElementById('st-clapper-float');
     if (float) {
       float.classList.add('clapping');
       setTimeout(() => float.classList.remove('clapping'), 220);
     }
-    if (this._door === 'studio-trackers') return void this.render(this.container);
+    if (this._door === 'production') return void this.render(this.container);
     return;
   }
 
@@ -6032,17 +7933,107 @@ BRIDGE:`;
     this.saveState();
     this._syncFloatingClapper();
     this._syncWeatherOverlay();
-    if (this._door === 'studio-trackers' || this._door === 'studio-effects') return void this.render(this.container);
+    if (this._door === 'production' || this._door === 'studio-effects') return void this.render(this.container);
   }
 
   _onChange(e) {
     const el = e.target;
     const st = this._db();
 
+    if (el.dataset.wi) {
+      st.worldIndex = normalizeWorldIndex(st.worldIndex);
+      const key = el.dataset.wi;
+      if (key === 'retrieveMode') st.worldIndex.retrieveMode = el.value === 'llm' ? 'llm' : 'keyword';
+      else if (key === 'topN') st.worldIndex.topN = Math.max(1, Math.min(24, Number(el.value) || 5));
+      else if (key === 'charBudget') st.worldIndex.charBudget = Math.max(400, Math.min(12000, Number(el.value) || 2500));
+      this.saveState();
+      this.bus?.emit('showtime.stateChanged');
+      if (this.container) this.render(this.container);
+      return;
+    }
+
     if (el.dataset.g && String(el.dataset.g).startsWith('profile-')) {
       const slot = el.dataset.g.slice('profile-'.length);
       this._saveProfileSlot(slot, el.value);
       return;
+    }
+
+    if (el.dataset.role === 'suite-wall-target') {
+      const placeId = el.dataset.place || '';
+      const edgeIdx = Number(el.dataset.edge);
+      const linkId = el.dataset.link || '';
+      const target = el.value || '__none__';
+      if (!placeId) return;
+      this._compassTry(() => {
+        setWallConnection(ensureCompass(st), placeId, edgeIdx, target, { linkId });
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'suite-opn-pick') {
+      const [placeId, linkId, opnId] = String(el.value || '').split('|');
+      if (placeId && linkId) {
+        this._lastOpening = { placeId, linkId, opnId };
+        return void this.render(this.container);
+      }
+      return;
+    }
+
+    if (el.dataset.role === 'suite-opn-target') {
+      const placeId = el.dataset.place || '';
+      const linkId = el.dataset.link || '';
+      const opnId = el.dataset.opn || '';
+      const target = el.value || '__none__';
+      if (!placeId) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        const room = getPlace(compass, placeId);
+        const link = (room?.links || []).find(l => l.id === linkId);
+        const op = (link?.openings || []).find(o => o.id === opnId);
+        const resLink = setWallConnection(compass, placeId, link?.edge, target, {
+          linkId,
+          along: Number.isFinite(op?.along) ? op.along : 0.5,
+        });
+        this._lastOpening = { placeId, linkId: resLink?.id || linkId, opnId };
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'suite-room-story') {
+      const placeId = el.dataset.place || '';
+      const unitId = el.dataset.unit || '';
+      const nextStory = el.value;
+      if (!placeId) return;
+      this._compassTry(() => {
+        const compass = ensureCompass(st);
+        setRoomStory(compass, placeId, nextStory);
+        if (Number.isFinite(Number(nextStory))) {
+          this._suiteStoryFocus = String(Math.round(Number(nextStory)));
+        }
+        if (unitId) this._compassFocusId = unitId;
+        this._suiteHighlightChild = placeId;
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'stage-head-category' || el.dataset.role === 'suite-category-select' || el.dataset.role === 'focus-category') {
+      const placeId = el.dataset.place || '';
+      if (!placeId) return;
+      this._compassTry(() => {
+        setPlaceCategory(ensureCompass(st), placeId, el.value || '');
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'place-kind' || el.dataset.role === 'focus-kind' || el.dataset.role === 'place-edit-kind') {
+      const show = el.value === 'building';
+      const scope = el.closest('.bst-compass-create, .bst-fold-body, .bst-set-edit') || el.parentElement;
+      const fields = scope?.querySelectorAll?.('[data-role="create-category-field"], [data-action="compass-create-populate"], [data-role="focus-category-field"], [data-role="focus-populate"], [data-role="place-edit-category-wrap"]');
+      fields?.forEach(node => { node.hidden = !show; });
     }
 
     if (el.dataset.role === 'place-edit-kind') {
@@ -6138,6 +8129,53 @@ BRIDGE:`;
       return;
     }
 
+    if (el.dataset.role === 'placement-layer-piece') {
+      const toLayer = el.value;
+      if (!toLayer || toLayer === el.dataset.layer) return;
+      this._compassTry(() => {
+        moveItem(ensureCompass(st), el.dataset.place, {
+          itemId: el.dataset.id,
+          cell: el.dataset.cell,
+          layer: el.dataset.layer,
+          toLayer,
+        });
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'placement-surface-piece') {
+      const surface = el.value || '';
+      const parentId = el.selectedOptions?.[0]?.dataset?.parentId || '';
+      this._compassTry(() => {
+        moveItem(ensureCompass(st), el.dataset.place, {
+          itemId: el.dataset.id,
+          cell: el.dataset.cell,
+          layer: el.dataset.layer,
+          surface,
+          parentId,
+        });
+        this._compassSave(st);
+      });
+      return;
+    }
+
+    if (el.dataset.role === 'placement-room-piece') {
+      const toRoomId = el.value;
+      if (!toRoomId || toRoomId === el.dataset.place) return;
+      this._compassTry(() => {
+        moveItem(ensureCompass(st), el.dataset.place, {
+          itemId: el.dataset.id,
+          cell: el.dataset.cell,
+          layer: el.dataset.layer,
+          toRoomId,
+          toCell: 'C',
+        });
+        this._compassSave(st);
+      });
+      return;
+    }
+
     if (el.dataset.role === 'import-file' && el.files?.[0]) {
       return void this._importProduction(el.files[0]);
     }
@@ -6148,6 +8186,11 @@ BRIDGE:`;
     }
     if (el.dataset.field === 'eventGuidance') {
       st.production.eventGuidance = el.value;
+      this.saveState();
+      return;
+    }
+    if (el.dataset.field === 'productionTitle') {
+      st.production.title = clipReelTitle(el.value);
       this.saveState();
       return;
     }
@@ -6213,10 +8256,14 @@ BRIDGE:`;
         this._syncFloatingClapper();
         this._syncWeatherOverlay();
       }
-      const needsRender = /^(status\.cadence|status\.enabled|scene\.|location\.|connection\.enabled|items\.enabled|pane)/.test(path)
+      const needsRender = /^(status\.cadence|status\.enabled|scene\.|receipt\.|location\.|connection\.enabled|items\.enabled|pane)/.test(path)
         || el.type === 'radio'
         || el.type === 'checkbox';
-      if (needsRender) return void this.render(this.container);
+      if (needsRender) {
+        this._prodFolds ??= new Set();
+        this._prodFolds.add('trackers');
+        return void this.render(this.container);
+      }
       return;
     }
     if (el.dataset.vis) {
@@ -6282,13 +8329,21 @@ BRIDGE:`;
       this.saveState();
       return void this.render(this.container);
     }
-    if (el.dataset.noteQ != null || el.dataset.noteTarget != null || el.dataset.noteAbout != null) {
-      const noteId = el.dataset.noteQ || el.dataset.noteTarget || el.dataset.noteAbout;
+    if (el.dataset.noteQ != null || el.dataset.noteTarget != null
+      || el.dataset.noteAbout != null || el.dataset.noteRephrased != null) {
+      const noteId = el.dataset.noteQ || el.dataset.noteTarget
+        || el.dataset.noteAbout || el.dataset.noteRephrased;
       st.interview.notePick ??= {};
       st.interview.notePick[noteId] ??= {};
       if (el.dataset.noteQ != null) st.interview.notePick[noteId].q = Number(el.value) || 0;
       if (el.dataset.noteTarget != null) st.interview.notePick[noteId].targetId = el.value;
       if (el.dataset.noteAbout != null) st.interview.notePick[noteId].about = el.value;
+      if (el.dataset.noteRephrased != null) st.interview.notePick[noteId].rephrased = el.value;
+      this.saveState();
+      return;
+    }
+    if (el.dataset.field === 'poke') {
+      st.peanut.poke = String(el.value || '').slice(0, 160);
       this.saveState();
       return;
     }
@@ -6328,7 +8383,7 @@ BRIDGE:`;
   async _directorCheck({ auto = false, force = false, settings = null, picks = null } = {}) {
     const st = this._db();
     if ((!st.production.directorOn && !force) || this._busy) {
-      if (force && this._busy) alert('Director is already rolling.');
+      if (force && this._busy) void showtimeAlert('Director is already rolling.', { title: 'DIRECTOR' });
       return;
     }
     this._busy = true;
@@ -6407,13 +8462,13 @@ JSON:`;
         }
         if (ev) this._presentDirectorEvent(ev);
       } else if (force) {
-        alert('Director returned no beat. Try again or pin a cue from the pool.');
+        void showtimeAlert('Director returned no beat. Try again or pin a cue from the pool.', { title: 'DIRECTOR' });
       }
       st.production.eventLog = (st.production.eventLog || []).filter(e => e.kind === 'event').slice(-40);
       this.saveState();
     } catch (err) {
       console.error('[Backstage director]', err);
-      if (!auto) alert(`Director check failed: ${err.message || err}`);
+      if (!auto) void showtimeAlert(`Director check failed: ${err.message || err}`, { title: 'DIRECTOR', danger: true });
     } finally {
       restoreRun();
       this._busy = false;
@@ -6421,33 +8476,64 @@ JSON:`;
     }
   }
 
-  async _interviewNoteAsk(noteId, { about = false } = {}) {
+  async _interviewNoteAsk(noteId) {
     const card = NOTECARDS.find(c => c.id === noteId);
     if (!card) return;
     const st = this._db();
     const qEl = this.container.querySelector(`[data-note-q="${noteId}"]`);
     const tEl = this.container.querySelector(`[data-note-target="${noteId}"]`);
-    const aEl = this.container.querySelector(`[data-note-about="${noteId}"]`);
-    const qIdx = Math.min(Number(qEl?.value) || 0, card.questions.length - 1);
-    const targetId = tEl?.value || '';
-    const aboutText = String(aEl?.value || '').trim();
-    if (!targetId) { alert('Pick a title on the notecard back.'); return; }
-    if (about && !aboutText) {
-      alert('Add a line in About this… first.');
-      aEl?.focus();
+    const rEl = this.container.querySelector(`[data-note-rephrased="${noteId}"]`);
+    const prev = st.interview.notePick?.[noteId] || {};
+    const qIdx = Math.min(Number(qEl?.value ?? prev.q) || 0, card.questions.length - 1);
+    const targetId = tEl?.value || prev.targetId || '';
+    const rephraseOpen = !!prev.rephraseOpen;
+    const rephrased = String(rEl?.value ?? prev.rephrased ?? '').trim();
+    if (!targetId) { void showtimeAlert('Pick a title on the notecard back.', { title: 'INTERVIEW' }); return; }
+    if (rephraseOpen && !rephrased) {
+      void showtimeAlert('Write your prompt first.', { title: 'INTERVIEW' });
+      rEl?.focus();
       return;
     }
     st.interview.notePick ??= {};
-    st.interview.notePick[noteId] = { q: qIdx, targetId, about: aboutText };
+    st.interview.notePick[noteId] = {
+      ...prev,
+      q: qIdx,
+      targetId,
+      rephrased,
+      rephraseOpen,
+    };
     this.saveState();
     const subjectId = st.interview.subjectId || this._interviewSubject()?.id;
     const target = this._noteTargets(noteId, subjectId).find(t => t.id === targetId);
-    let question = `${card.questions[qIdx].text}${target ? ` — ${target.title}` : ''}`;
-    if (about && aboutText) question = `${question} — About this: ${aboutText}`;
+    const heard = target?.group === 'Script'
+      ? ''
+      : String(target?.spoken || target?.title || '').trim();
+    const custom = rephraseOpen && rephrased;
+    const stock = card.questions[qIdx];
+    let question = custom ? rephrased : stock.text;
+    if (!custom && noteId === 'role') {
+      const lived = {
+        sit: 'Looking back, how did that sit with you?',
+        remember: 'What do you remember about that?',
+        shift: 'Did that change how you see things?',
+      };
+      question = lived[stock.id] || question;
+    }
+    if (heard) {
+      const already = question.toLowerCase().includes(heard.toLowerCase());
+      if (!already) question = `${question} — ${heard}`;
+    }
+    let display = '';
+    if (target?.group === 'Script') {
+      const stamp = String(target.title || '').trim();
+      if (stamp && !question.toLowerCase().includes(stamp.toLowerCase())) {
+        display = `${question} — ${stamp}`;
+      }
+    }
     await this._interviewTurn(question, noteId, {
       questionId: card.questions[qIdx].id,
       target,
-      about: about ? aboutText : '',
+      display,
     });
   }
 
@@ -6465,25 +8551,35 @@ JSON:`;
     return full.find(c => c.id === st.interview.subjectId) || full[0] || null;
   }
 
-  _interviewerInfo() {
+  _interviewerInfo({ dossier = false } = {}) {
     const st = this._db();
     const mode = st.interview.interviewer || 'star';
     if (mode === 'anonymous') {
       return {
         name: 'Anonymous',
         anonymous: true,
-        block: `INTERVIEWER: a faceless, nondescript stranger — no name, no affiliation, no reputation, no prior relationship.
+        block: dossier ? `INTERVIEWER: a faceless, nondescript stranger — no name, no affiliation, no reputation, no prior relationship.
 The subject answers as if speaking to someone they cannot place.
-Do NOT invent a known identity for the interviewer.`,
+Do NOT invent a known identity for the interviewer.` : '',
       };
     }
     if (mode === 'user') {
-      const name = getContext()?.name1 || 'You';
+      const ctx = getContext();
+      const name = ctx?.name1 || 'You';
       const star = getStarMember(this.storage);
+      if (!dossier) return { name, anonymous: false, block: '' };
+      const brief = star
+        ? buildCharacterDossier(this.storage, star, {
+          characters: ctx?.characters ?? [],
+          personas: listPersonas(power_user),
+          maxChars: 1600,
+        })
+        : '';
       return {
         name,
         anonymous: false,
         block: `INTERVIEWER: {{user}} / ${name}${star ? ` (Star cast: ${star.name})` : ''}.
+${brief}
 ${this._repTowardBlock(star?.id || null, name)}`,
       };
     }
@@ -6491,59 +8587,87 @@ ${this._repTowardBlock(star?.id || null, name)}`,
     if (mode === 'star' || !id) id = getStarMember(this.storage)?.id || id;
     const full = this._fullCast().find(c => c.id === id) || getStarMember(this.storage);
     if (!full) {
-      return { name: 'Interviewer', anonymous: false, block: 'INTERVIEWER: (unspecified)' };
+      return { name: 'Interviewer', anonymous: false, block: dossier ? 'INTERVIEWER: (unspecified)' : '' };
     }
+    if (!dossier) return { name: full.name, anonymous: false, block: '' };
     const ctx = getContext();
-    const identity = resolveCastPromptIdentity(full, this.storage, {
+    const brief = buildCharacterDossier(this.storage, full, {
       characters: ctx.characters ?? [],
       personas: listPersonas(power_user),
+      maxChars: 1600,
     });
     return {
       name: full.name,
       anonymous: false,
-      block: `INTERVIEWER:\n${identity.block}\n${this._repTowardBlock(full.id, full.name)}`,
+      block: `INTERVIEWER:\n${brief}\n${this._repTowardBlock(full.id, full.name)}`,
     };
   }
 
-  async _interviewTurn(question, askKind = 'free', meta = {}, { replay = false } = {}) {
+  async _interviewTurn(question, askKind = 'free', meta = {}, { replay = false, replaceIdx = null } = {}) {
     const st = this._db();
     if (this._busy) return;
     const subject = this._interviewSubject();
     if (!subject) return;
-    const interviewer = this._interviewerInfo();
+    const interviewer = this._interviewerInfo({ dossier: true });
+    const replacing = Number.isInteger(replaceIdx) && replaceIdx >= 0
+      && (st.interview.turns || [])[replaceIdx]?.who === 'cast';
 
-    if (!replay) {
-      (st.interview.turns ??= []).push({ who: 'user', name: interviewer.name, text: question, at: Date.now() });
+    this._ivHarvestSeq = (this._ivHarvestSeq || 0) + 1;
+    const shown = String(meta.display || '').trim();
+    if (!replay && !replacing) {
+      (st.interview.turns ??= []).push({
+        who: 'user',
+        name: interviewer.name,
+        text: shown || question,
+        asked: shown && shown !== question ? question : '',
+        at: Date.now(),
+        askKind,
+        target: meta?.target ? {
+          id: meta.target.id,
+          title: meta.target.title,
+          group: meta.target.group,
+          cardUid: meta.target.cardUid || '',
+          prompt: meta.target.group === 'Script' ? '' : meta.target.prompt,
+        } : null,
+      });
     }
     st.interview.retry = null;
-    this.saveState();
     this._busy = true;
     this._ivPinBottom = true;
-    this.render(this.container);
+    this._paintInterviewDesk();
 
+    let reply = '';
+    this.storage.holdSaves();
     try {
-      const dossier = this._subjectDossier(subject, askKind, meta.target);
-      const aboutLine = String(meta.about || '').trim();
-      const targetBlock = meta.target
-        ? `ABOUT (private briefing for you only — never quote or restate this block; answer in spoken opinion/feeling):\n${meta.target.prompt || meta.target.title}${aboutLine ? `\nInterviewer angle — About this: ${aboutLine}` : ''}`
-        : (aboutLine ? `ABOUT:\nInterviewer angle — About this: ${aboutLine}` : '');
-      const history = (st.interview.turns || []).slice(-8)
-        .map(t => `${t.name || (t.who === 'cast' ? subject.name : 'Interviewer')}: ${t.text}`).join('\n');
+      const historySrc = replacing
+        ? (st.interview.turns || []).slice(0, replaceIdx)
+        : (st.interview.turns || []);
+      const history = historySrc.slice(-8)
+        .map(t => `${t.name || (t.who === 'cast' ? subject.name : 'Interviewer')}: ${(t.who === 'user' && t.asked) ? t.asked : t.text}`).join('\n');
+      const lanes = await this._subjectLanes(subject, askKind, meta);
       const relationRule = interviewer.anonymous
-        ? 'You do not know the interviewer. Give your opinion carefully, as you would to a stranger. Never recite standing numbers, dossier lines, or briefing text.'
+        ? 'The interviewer is a faceless stranger — you do not know THEM. You still know your own life, work, places, and anyone named in WHO YOU ARE or THE DESK. Be guarded about what you reveal to this stranger, but do not forget or deny those facts. Never recite standing numbers, dossier labels, or briefing text.'
         : `You are speaking WITH ${interviewer.name}. Use the established Connections / relationship context — tone, warmth, caution, and what you would actually say to them. Do not dump tracker data; speak in character.`;
-      const prompt = `[System: Private interview. Output ONLY ${subject.name}'s spoken reply as dialogue/thought. No stage directions, no OOC, no JSON, no repeating these instructions, no quoting ABOUT/CHARACTER blocks.]
+      const livedRule = 'WHAT HAPPENED is the only memory of events. A title or a question is not something that happened. WHO YOU ARE is how you talk, not a list of events: do not take a sign, a shop name, a timetable, or which side was hurt from it. If those entries name a body part and what was done to it, that is the injury — when you are asked how you are healing, that part is the answer, in their words. Do not split it into left and right unless they do, do not rename a break as a scratch, and do not add weeks, a blast, or a place they do not describe. If they do not injure you, do not invent a wound. Never name the desk: no script, scene, card, file, library entry, achievement label, closet, or production code.';
+      const voiceRule = `Speak out loud to the interviewer, in the first person. Use I, me, and my. The card may be written about you; you still do not narrate yourself, do not write "(${subject.name}, third-person)", and do not call yourself she or her.`;
+      const prompt = `[System: Private interview. Output ONLY ${subject.name}'s spoken words in the first person. No narration, no stage directions, no POV label, no OOC, no JSON, no repeating these instructions. Use the injury WHAT HAPPENED names, on the body part it names. Do not invent which side, a timetable, a sign, or a blast.]
 
 You are ${subject.name}. Stay in character.
 Interviewer: ${interviewer.name}${interviewer.anonymous ? ' (faceless stranger)' : ''}.
 ${relationRule}
+${voiceRule}
+${livedRule}
 
 ${interviewer.block}
 
-=== CHARACTER ===
-${dossier}
+=== WHO YOU ARE ===
+${lanes.who || '(no card)'}
 
-${targetBlock}
+=== THE DESK ===
+${lanes.desk || '(nothing on the desk)'}
+
+=== WHAT HAPPENED ===
+${lanes.lore || '(nothing filed)'}
 
 === INTERVIEW SO FAR ===
 ${history || '(just starting)'}
@@ -6551,45 +8675,141 @@ ${history || '(just starting)'}
 === QUESTION ===
 ${interviewer.name}: ${question}
 
-=== YOUR REPLY (as ${subject.name}, 2–6 sentences of dialogue/thought only — opinion, not a file dump) ===`;
+      === YOUR REPLY (3–6 sentences, then stop. Start with I. Say each thing once. If WHAT HAPPENED names where you were hurt, name that part the way it does. Do not narrate, and do not add a side, a timetable, a sign, or a blast.) ===`;
 
-      let reply = await this._quiet(prompt, { quietName: subject.name, profileSlot: 'interview' });
-      reply = this._cleanInterviewReply(reply, subject.name, prompt, meta.target);
+      const echoTarget = (meta?.target?.group === 'Script' && lanes.lore)
+        ? { ...meta.target, prompt: lanes.lore }
+        : meta.target;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      reply = await this._quiet(prompt, { quietName: subject.name, profileSlot: 'interview', responseLength: 480 });
+      reply = this._cleanInterviewReply(reply, subject.name, prompt, echoTarget);
       if (!reply) {
         const retry = `You are ${subject.name}. ${interviewer.name}${interviewer.anonymous ? ' (a stranger)' : ''} asks: ${question}
 
-Answer in character as spoken words only (2–6 sentences). Do not quote briefing text, standing numbers, or system labels.${meta.target ? ` Topic: ${meta.target.title}.` : ''}
+Answer out loud in the first person (2–6 sentences), then stop. Start with "I". Say each thing once; do not repeat a vow. Do not narrate yourself as she or her. If the memory below names where you were hurt, use its words for that part. Do not split left and right, do not add how many weeks, a shop sign, or a milder injury, and do not add an explosion or a place that is not written there.
+
+${lanes.lore || '(nothing filed)'}
 
 ${subject.name}:`;
-        reply = await this._quiet(retry, { quietName: subject.name, profileSlot: 'interview' });
-        reply = this._cleanInterviewReply(reply, subject.name, retry, meta.target);
+        reply = await this._quiet(retry, { quietName: subject.name, profileSlot: 'interview', responseLength: 480 });
+        reply = this._cleanInterviewReply(reply, subject.name, retry, echoTarget);
       }
       if (!reply) {
-        st.interview.retry = { question, askKind, meta };
-        this.saveState();
+        st.interview.retry = {
+          question,
+          askKind,
+          meta,
+          replaceIdx: replacing ? replaceIdx : null,
+        };
         return;
       }
 
-      st.interview.turns.push({ who: 'cast', name: '', text: reply, at: Date.now() });
-
-      const note = await this._interviewConnHarvest(subject, reply, question, askKind, meta.target);
-      if (note) {
-        st.interview.turns.push({ who: 'user', name: 'Connections', text: note, at: Date.now() });
+      const castTurn = { who: 'cast', name: '', text: reply, at: Date.now() };
+      if (replacing) {
+        st.interview.turns[replaceIdx] = castTurn;
+      } else {
+        st.interview.turns.push(castTurn);
       }
 
       if (st.interview.turns.length > 80) st.interview.turns = st.interview.turns.slice(-80);
-      this.saveState();
-      this.bus?.emit('showtime.stateChanged');
-      this.bus?.emit('reputation.updated', {});
     } catch (err) {
       console.error('[Backstage interview]', err);
-      st.interview.retry = { question, askKind, meta };
-      this.saveState();
+      st.interview.retry = {
+        question,
+        askKind,
+        meta,
+        replaceIdx: replacing ? replaceIdx : null,
+      };
     } finally {
+      this.storage.releaseSaves({ flush: false });
       this._busy = false;
       this._ivPinBottom = true;
-      this.render(this.container);
+      this._paintInterviewDesk();
     }
+
+    this.saveState();
+  }
+
+  /** Connections model runs once, when the interview is filed. */
+  async _fileInterviewConnections() {
+    const st = this._db();
+    const subject = this._interviewSubject();
+    const turns = st?.interview?.turns;
+    if (!subject || !st?.interview?.active || !turns?.length) return;
+    st.interview.pendingConn = [];
+    for (let i = 0; i < turns.length; i++) {
+      const turn = turns[i];
+      if (turn.who !== 'cast' || turn.name === 'Connections') continue;
+      let qIdx = i - 1;
+      while (qIdx >= 0 && (turns[qIdx].who !== 'user' || turns[qIdx].name === 'Connections')) qIdx--;
+      const question = turns[qIdx];
+      if (!question?.text || !turn.text) continue;
+      let harvested = null;
+      try {
+        harvested = await this._interviewConnHarvest(
+          subject,
+          turn.text,
+          question.text,
+          question.askKind || 'free',
+          question.target || null,
+        );
+      } catch (err) {
+        console.warn('[Backstage interview → Connections]', err);
+        continue;
+      }
+      const note = String(harvested?.note || '').replace(/^To file:/i, 'Filed:');
+      const patch = harvested?.patch;
+      if (!note || !patch) continue;
+      st.interview.pendingConn.push({ ...patch, afterTurn: i, at: Date.now() });
+      const next = turns[i + 1];
+      if (next?.name === 'Connections') {
+        turns[i + 1] = { ...next, text: note, at: Date.now() };
+      } else {
+        turns.splice(i + 1, 0, { who: 'user', name: 'Connections', text: note, at: Date.now() });
+        i += 1;
+      }
+    }
+  }
+
+  /**
+   * A short model that locks onto a vow repeats a phrase until the token cap.
+   * Keep the first time it is said, and keep at most six sentences.
+   */
+  _trimSpokenCollapse(text) {
+    const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+    if (words.length < 8) return words.join(' ');
+    const norm = words.map(w => w.toLowerCase().replace(/[^a-z0-9']/g, ''));
+    const seen = new Set();
+    let cut = words.length;
+    const width = 4;
+    for (let i = 0; i + width <= norm.length; i++) {
+      const gram = [];
+      for (let j = 0; j < width; j++) {
+        if (!norm[i + j]) break;
+        gram.push(norm[i + j]);
+      }
+      if (gram.length < width) continue;
+      const key = gram.join(' ');
+      if (seen.has(key)) { cut = i; break; }
+      seen.add(key);
+    }
+    let kept = words.slice(0, cut).join(' ').replace(/[,:;–—-]+\s*$/, '').trim();
+    const sentences = kept.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+    const heard = new Set();
+    const out = [];
+    for (const sentence of sentences) {
+      const key = sentence.toLowerCase().replace(/[^a-z0-9' ]/g, '').replace(/\s+/g, ' ').trim();
+      if (key && heard.has(key)) break;
+      if (key) heard.add(key);
+      out.push(sentence);
+      if (out.length >= 6) break;
+    }
+    kept = out.join(' ').trim();
+    if (kept && !/[.!?]$/.test(kept)) {
+      const last = Math.max(kept.lastIndexOf('.'), kept.lastIndexOf('!'), kept.lastIndexOf('?'));
+      if (last >= 24) kept = kept.slice(0, last + 1).trim();
+    }
+    return kept;
   }
 
   _cleanInterviewReply(raw, name, prompt, target = null) {
@@ -6624,33 +8844,50 @@ ${subject.name}:`;
       const bite = String(target.prompt).replace(/\s+/g, ' ').slice(0, 80);
       if (bite.length > 24 && text.replace(/\s+/g, ' ').includes(bite.slice(0, 48))) return '';
     }
-    // Strip leading Name: / Name —
+    // Strip leading Name: / Name — and a POV label such as "(Mirko, third-person)".
     const nameRe = new RegExp(`^${String(name || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*[:\\—\\-–]\\s*`, 'i');
     text = text.replace(nameRe, '').trim();
-    // Drop wrapping quotes
+    text = text.replace(/^\([^)\n]{0,80}\)\s*/, '').trim();
+    text = text.replace(/^\*{1,2}[^*\n]{0,40}\*{1,2}\s*/, '').trim();
+    // Drop wrapping quotes before the collapse trim, so a quoted vow still splits on sentences.
     if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith('“') && text.endsWith('”'))) {
       text = text.slice(1, -1).trim();
     }
-    return text.slice(0, 2000);
+    text = this._trimSpokenCollapse(text);
+    // A card written in the third person makes the model narrate. Spoken answers use I/me/my.
+    if (!/\b(I|I'm|I’m|I am|I've|I’ve|I'd|I’d|I'll|I’ll|me|my|mine)\b/.test(text)) return '';
+    if (text.length > 1600) {
+      const snapped = text.slice(0, 1600);
+      const last = Math.max(snapped.lastIndexOf('.'), snapped.lastIndexOf('!'), snapped.lastIndexOf('?'));
+      text = (last >= 24 ? snapped.slice(0, last + 1) : snapped).trim();
+    }
+    if (this._interviewReplyTooShort(text)) return '';
+    return text;
+  }
+
+  _interviewReplyTooShort(text) {
+    const t = String(text || '').trim();
+    if (!t) return true;
+    if (t.length < 12) return true;
+    const letters = (t.match(/[A-Za-z\u00C0-\u024F]/g) || []).length;
+    return letters < 3;
   }
 
   /**
-   * After an interview reply, optionally write Connections (Reputation):
-   * - autofill what the subject thinks of a target (reading.take / standing)
-   * - or start a rumor node on the web
+   * After an interview reply, queue a Connections patch. The web is not
+   * written until the interview is filed (End).
    */
   async _interviewConnHarvest(subject, reply, question, askKind, target) {
     const group = String(target?.group || '');
     const connAsk = askKind === 'cast'
       || /Reputation|Affiliation|House|Secret/i.test(group)
       || /standing|think of|heard|rumor|whisper/i.test(String(question || ''));
-    if (!connAsk || !reply) return '';
+    if (!connAsk || !reply) return null;
 
     try {
       const rep = this.storage.getChat('reputation', { personal: [], house: [] });
       if (!Array.isArray(rep.personal)) rep.personal = [];
-      const subjectNode = this._ensureCastConnNode(rep, subject);
-      if (!subjectNode) return '';
+      const subjectNode = this._findCastConnNode(rep, subject);
 
       const roster = (rep.personal || [])
         .filter(n => n.kind !== 'self' || n.id === 'self')
@@ -6664,7 +8901,7 @@ ${subject.name}:`;
       const extractPrompt = `[System: Return ONLY JSON. No markdown.]
 From this interview, decide if Connections should update.
 
-Subject (speaker): ${subject.name} (node ${subjectNode.id})
+Subject (speaker): ${subject.name} (node ${subjectNode?.id || subject.id})
 Question: ${question}
 Reply: ${reply}
 ${hintTarget ? `Notecard target id hint: ${hintTarget} (${group})` : ''}
@@ -6681,9 +8918,9 @@ Rules:
 JSON schema:
 {"action":"reading"|"rumor"|"none","targetId":"","aboutId":"","take":"","standing":0,"rumorTitle":""}`;
 
-      const raw = await this._quiet(extractPrompt, { quietName: 'System', profileSlot: 'audit' });
+      const raw = await this._quiet(extractPrompt, { quietName: 'System' });
       const parsed = parseJsonObject(raw);
-      if (!parsed || parsed.action === 'none') return '';
+      if (!parsed || parsed.action === 'none') return null;
 
       const clampStand = (v) => {
         const n = Number(v);
@@ -6691,41 +8928,30 @@ JSON schema:
         return Math.max(-100, Math.min(100, Math.round(n)));
       };
       const take = String(parsed.take || reply).trim().slice(0, 600);
-      const ensureLink = (a, b) => {
-        const A = rep.personal.find(n => n.id === a);
-        const B = rep.personal.find(n => n.id === b);
-        if (!A || !B) return;
-        A.links ??= [];
-        B.links ??= [];
-        if (!A.links.includes(b)) A.links.push(b);
-        if (!B.links.includes(a)) B.links.push(a);
-      };
+      const skipId = subjectNode?.id || '';
 
       if (parsed.action === 'reading') {
         let targetId = String(parsed.targetId || hintTarget || '').trim();
         if (!rep.personal.some(n => n.id === targetId)) {
-          // Match by name fragment from question/target title
           const needle = String(target?.title || question || '').toLowerCase();
-          const hit = rep.personal.find(n => needle.includes(String(n.name || '').toLowerCase()) && n.id !== subjectNode.id);
+          const hit = rep.personal.find(n => needle.includes(String(n.name || '').toLowerCase()) && n.id !== skipId);
           if (hit) targetId = hit.id;
         }
-        if (!targetId || targetId === subjectNode.id) return '';
-        if (!rep.personal.some(n => n.id === targetId)) return '';
-
-        subjectNode.readings ??= [];
-        let rec = subjectNode.readings.find(r => r.targetId === targetId);
-        if (!rec) {
-          rec = { targetId, aware: 'knows', take: '' };
-          subjectNode.readings.push(rec);
-        }
-        rec.aware = rec.aware === 'unaware' ? 'heard' : (rec.aware || 'knows');
-        rec.take = take;
+        if (!targetId || targetId === skipId) return null;
+        if (!rep.personal.some(n => n.id === targetId)) return null;
         const stand = clampStand(parsed.standing);
-        if (stand != null) rec.standing = stand;
-        ensureLink(subjectNode.id, targetId);
-        this.storage.saveChat();
         const whom = rep.personal.find(n => n.id === targetId)?.name || targetId;
-        return `Filed reading — ${subject.name} on ${whom}${stand != null ? ` (${stand})` : ''}.`;
+        return {
+          patch: {
+            action: 'reading',
+            targetId,
+            take,
+            standing: stand,
+            question: String(question || ''),
+            hintTarget,
+          },
+          note: `To file: reading — ${subject.name} on ${whom}${stand != null ? ` (${stand})` : ''}.`,
+        };
       }
 
       if (parsed.action === 'rumor') {
@@ -6733,45 +8959,122 @@ JSON schema:
         const about = rep.personal.find(n => n.id === aboutId);
         const title = String(parsed.rumorTitle || '').trim().slice(0, 80)
           || `Word on ${about?.name || 'the wire'}`;
-        const id = uid();
-        const orbit = (() => {
-          const i = rep.personal.length;
-          const a = (i * 2.4) % (Math.PI * 2);
-          return { x: 0.5 + Math.cos(a) * 0.28, y: 0.5 + Math.sin(a) * 0.28 };
-        })();
-        const rumor = {
-          id,
-          kind: 'notice',
-          category: 'rumor',
-          characterId: '',
-          houseId: '',
-          originId: subjectNode.id,
-          targetId: about?.id || '',
-          supporters: [{ characterId: subject.id, role: 'Origin' }],
-          name: title,
-          description: take,
-          notes: `From Backstage interview · ${new Date().toLocaleString()}`,
-          standing: 0,
-          x: orbit.x,
-          y: orbit.y,
-          links: [subjectNode.id, 'self'].filter(Boolean),
-          readings: [],
+        return {
+          patch: {
+            action: 'rumor',
+            aboutId,
+            take,
+            rumorTitle: title,
+            question: String(question || ''),
+            hintTarget,
+          },
+          note: `To file: rumor — “${title}”${about ? ` about ${about.name}` : ''}.`,
         };
-        rep.personal.push(rumor);
-        ensureLink(subjectNode.id, id);
-        if (about) ensureLink(id, about.id);
-        const self = rep.personal.find(n => n.kind === 'self' || n.id === 'self');
-        if (self) {
-          self.links ??= [];
-          if (!self.links.includes(id)) self.links.push(id);
-        }
-        this.storage.saveChat();
-        return `Started rumor — “${title}”${about ? ` about ${about.name}` : ''}.`;
       }
     } catch (err) {
       console.warn('[Backstage interview → Connections]', err);
     }
-    return '';
+    return null;
+  }
+
+  _applyInterviewConnPatches(patches, subject) {
+    if (!subject || !patches?.length) return 0;
+    const rep = this.storage.getChat('reputation', { personal: [], house: [] });
+    if (!Array.isArray(rep.personal)) rep.personal = [];
+    const subjectNode = this._ensureCastConnNode(rep, subject);
+    if (!subjectNode) return 0;
+    let n = 0;
+    for (const patch of patches) {
+      if (this._commitInterviewConnPatch(rep, subjectNode, subject, patch)) n += 1;
+    }
+    if (n) this.bus?.emit('reputation.updated', {});
+    return n;
+  }
+
+  _commitInterviewConnPatch(rep, subjectNode, subject, patch) {
+    if (!patch || !subjectNode) return false;
+    const ensureLink = (a, b) => {
+      const A = rep.personal.find(n => n.id === a);
+      const B = rep.personal.find(n => n.id === b);
+      if (!A || !B) return;
+      A.links ??= [];
+      B.links ??= [];
+      if (!A.links.includes(b)) A.links.push(b);
+      if (!B.links.includes(a)) B.links.push(a);
+    };
+    const take = String(patch.take || '').trim().slice(0, 600);
+
+    if (patch.action === 'reading') {
+      let targetId = String(patch.targetId || patch.hintTarget || '').trim();
+      if (!rep.personal.some(n => n.id === targetId)) {
+        const needle = String(patch.question || '').toLowerCase();
+        const hit = rep.personal.find(n => needle.includes(String(n.name || '').toLowerCase()) && n.id !== subjectNode.id);
+        if (hit) targetId = hit.id;
+      }
+      if (!targetId || targetId === subjectNode.id) return false;
+      if (!rep.personal.some(n => n.id === targetId)) return false;
+      subjectNode.readings ??= [];
+      let rec = subjectNode.readings.find(r => r.targetId === targetId);
+      if (!rec) {
+        rec = { targetId, aware: 'knows', take: '' };
+        subjectNode.readings.push(rec);
+      }
+      rec.aware = rec.aware === 'unaware' ? 'heard' : (rec.aware || 'knows');
+      rec.take = take;
+      const stand = Number(patch.standing);
+      if (Number.isFinite(stand)) rec.standing = Math.max(-100, Math.min(100, Math.round(stand)));
+      ensureLink(subjectNode.id, targetId);
+      return true;
+    }
+
+    if (patch.action === 'rumor') {
+      const aboutId = String(patch.aboutId || patch.targetId || patch.hintTarget || '').trim();
+      const about = rep.personal.find(n => n.id === aboutId);
+      const title = String(patch.rumorTitle || '').trim().slice(0, 80)
+        || `Word on ${about?.name || 'the wire'}`;
+      const id = uid();
+      const i = (rep.personal || []).length;
+      const a = (i * 2.4) % (Math.PI * 2);
+      const rumor = {
+        id,
+        kind: 'notice',
+        category: 'rumor',
+        characterId: '',
+        houseId: '',
+        originId: subjectNode.id,
+        targetId: about?.id || '',
+        supporters: [{ characterId: subject.id, role: 'Origin' }],
+        name: title,
+        description: take,
+        notes: `From Backstage interview · ${new Date().toLocaleString()}`,
+        standing: 0,
+        x: 0.5 + Math.cos(a) * 0.28,
+        y: 0.5 + Math.sin(a) * 0.28,
+        links: [subjectNode.id, 'self'].filter(Boolean),
+        readings: [],
+      };
+      rep.personal.push(rumor);
+      ensureLink(subjectNode.id, id);
+      if (about) ensureLink(id, about.id);
+      const self = rep.personal.find(n => n.kind === 'self' || n.id === 'self');
+      if (self) {
+        self.links ??= [];
+        if (!self.links.includes(id)) self.links.push(id);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  _findCastConnNode(rep, subject) {
+    if (!subject?.id) return null;
+    const node = (rep.personal || []).find(n => n.characterId === subject.id);
+    if (node) return node;
+    const star = getStarMember(this.storage);
+    if (star?.id === subject.id) {
+      return (rep.personal || []).find(n => n.kind === 'self' || n.id === 'self') || null;
+    }
+    return null;
   }
 
   _ensureCastConnNode(rep, subject) {
@@ -6814,13 +9117,14 @@ JSON schema:
     return node;
   }
 
-  /** Supporting cast only — never Star or Director. */
+  /** Supporting cast still in play — never Star, Director, or written out. */
   _peanutCastPool() {
     const castFull = this._fullCast().filter(c =>
-      c && c.priority !== 'director' && c.priority !== 'star');
+      c && c.priority !== 'director' && c.priority !== 'star'
+      && normalizeCastPresence(c) !== 'writtenOut');
     if (!castFull.length) return [];
     const ctx = getContext();
-    const scored = castFull.map(c => {
+    return castFull.map(c => {
       let identity = { description: '', personality: '', source: 'cast' };
       try {
         identity = resolveCastPromptIdentity(c, this.storage, {
@@ -6834,16 +9138,22 @@ JSON schema:
         c.description,
         ...(c.wardrobe || []).map(w => w.name),
       ].filter(Boolean).join(' ').trim();
-      const score = Math.max(1, blurb.length + (identity.source !== 'cast' ? 40 : 0));
-      return { c, identity, blurb: blurb || c.name || 'on the balcony', score };
+      return { c, identity, blurb: blurb || c.name || 'on the balcony' };
     });
-    // Prefer richer cards, but never drop the whole pool.
-    scored.sort((a, b) => b.score - a.score);
-    for (let i = scored.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [scored[i], scored[j]] = [scored[j], scored[i]];
-    }
-    return scored;
+  }
+
+  _peanutNameInText(name, source) {
+    const hay = ` ${String(source || '').toLowerCase()} `;
+    const full = String(name || '').trim().toLowerCase();
+    if (!full || hay.trim().length < 2) return false;
+    const bound = (needle) => new RegExp(
+      `(?:^|[^a-z0-9])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^a-z0-9])`,
+      'i',
+    );
+    if (bound(full).test(hay)) return true;
+    const first = full.split(/[\s,]+/)[0];
+    if (!first || first.length < 3 || first === full) return false;
+    return bound(first).test(hay);
   }
 
   _peanutFindNode(rep, castMember) {
@@ -6871,12 +9181,7 @@ JSON schema:
   }
 
   _peanutStampLeaf(entry, leaves) {
-    if (!entry) return null;
-    return leaves.find(l =>
-      (entry.key && l.key === entry.key)
-      || (entry.book && entry.uid != null && l.book === entry.book && String(l.uid) === String(entry.uid))
-      || (entry.book && entry.title && l.book === entry.book && l.title === entry.title))
-      || null;
+    return matchStampLeaf(entry, leaves, getCachedLibraryBooks());
   }
 
   _peanutLoreBrief(speakers, source, scene = null) {
@@ -6983,12 +9288,8 @@ JSON schema:
         }
         const owned = secretsAboutCharacter(secrets, s.c.id);
         const known = secretsKnownToCharacter(secrets, s.c.id, houses);
-        const unaware = secrets.filter(sec => (sec.unawareBy || []).some(k =>
-          (k.type === 'cast' && k.id === s.c.id)
-          || (k.type === 'house' && houses.includes(k.id))));
         if (owned.length) bits.push(`owns ${owned.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
         if (known.length) bits.push(`knows ${known.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
-        if (unaware.length) bits.push(`unaware of ${unaware.slice(0, 3).map(x => `“${x.title}”`).join(', ')}`);
         if (!bits.length) continue;
         lines.push(`- ${s.c.name}: ${bits.join(' · ')}`);
       }
@@ -6998,7 +9299,7 @@ JSON schema:
     }
   }
 
-  _peanutPickSpeakers(preferNames = []) {
+  _peanutPickSpeakers(preferNames = [], source = '') {
     const pool = this._peanutCastPool();
     if (!pool.length) {
       throw new Error('No supporting cast for the gallery — add cast cards that are not Star or Director.');
@@ -7007,50 +9308,59 @@ JSON schema:
     let rep = { personal: [] };
     try { rep = this.storage.getChat('reputation', { personal: [], house: [] }); } catch { /* ignore */ }
 
+    const tied = (a, b) => {
+      const node = this._peanutFindNode(rep, a.c);
+      const other = this._peanutFindNode(rep, b.c);
+      if (!node || !other) return false;
+      return (node.links || []).includes(other.id)
+        || (other.links || []).includes(node.id)
+        || (node.readings || []).some(r => r.targetId === other.id)
+        || (other.readings || []).some(r => r.targetId === node.id);
+    };
     const connScore = (row) => {
       const node = this._peanutFindNode(rep, row.c);
       if (!node) return 0;
-      let n = (node.links || []).length + (node.readings || []).length;
-      if (preferred.has(String(row.c.name || '').toLowerCase())) n += 20;
-      return n;
+      return (node.links || []).length + (node.readings || []).length;
+    };
+    const shuffle = (list) => {
+      const slice = list.slice(0, 6);
+      for (let i = slice.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [slice[i], slice[j]] = [slice[j], slice[i]];
+      }
+      return slice;
     };
 
-    const ranked = [...pool].sort((a, b) => {
-      const pa = preferred.has(String(a.c.name || '').toLowerCase()) ? 1 : 0;
-      const pb = preferred.has(String(b.c.name || '').toLowerCase()) ? 1 : 0;
-      if (pb !== pa) return pb - pa;
-      return connScore(b) - connScore(a);
-    });
-
-    // Prefer a connected clique when possible.
+    const named = pool.filter(row =>
+      preferred.has(String(row.c.name || '').toLowerCase())
+      || this._peanutNameInText(row.c.name, source));
     const picked = [];
-    for (const row of ranked) {
+    for (const row of named) {
       if (picked.length >= 6) break;
-      if (!picked.length) { picked.push(row); continue; }
-      const node = this._peanutFindNode(rep, row.c);
-      const tied = picked.some(p => {
-        const pn = this._peanutFindNode(rep, p.c);
-        if (!node || !pn) return false;
-        return (node.links || []).includes(pn.id)
-          || (pn.links || []).includes(node.id)
-          || (node.readings || []).some(r => r.targetId === pn.id)
-          || (pn.readings || []).some(r => r.targetId === node.id);
-      });
-      if (tied || picked.length < 3 || ranked.length <= 4) picked.push(row);
+      picked.push(row);
+    }
+    if (picked.length) {
+      for (const row of pool) {
+        if (picked.length >= 6) break;
+        if (picked.includes(row)) continue;
+        if (picked.some(p => tied(row, p))) picked.push(row);
+      }
+      return shuffle(picked);
+    }
+
+    const ranked = [...pool].sort((a, b) => connScore(b) - connScore(a));
+    if (ranked[0]) picked.push(ranked[0]);
+    for (const row of ranked) {
+      if (picked.length >= 4) break;
+      if (picked.includes(row)) continue;
+      if (picked.some(p => tied(row, p))) picked.push(row);
     }
     while (picked.length < Math.min(3, ranked.length)) {
       const next = ranked.find(r => !picked.includes(r));
       if (!next) break;
       picked.push(next);
     }
-    if (!picked.length) picked.push(ranked[0]);
-    // Shuffle speaking order so the model isn't led by a fixed cast sequence.
-    const slice = picked.slice(0, Math.min(6, Math.max(1, picked.length)));
-    for (let i = slice.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [slice[i], slice[j]] = [slice[j], slice[i]];
-    }
-    return slice;
+    return shuffle(picked);
   }
 
   /** How many new balcony lines to request. Continue ≈ 2× Listen depth. */
@@ -7185,13 +9495,17 @@ JSON schema:
     return out;
   }
 
-  _peanutPrompt({ names, castBlock, connBrief, loreBrief = '', label, source, want, continueThread = '' }) {
+  _peanutPrompt({ names, castBlock, connBrief, loreBrief = '', label, source, want, continueThread = '', poke = '' }) {
     const shuffled = [...names].sort(() => Math.random() - 0.5);
     const exA = shuffled[0] || 'CastA';
     const exB = shuffled[Math.min(1, shuffled.length - 1)] || exA;
     const banterRule = continueThread
       ? `REQUIRED: At least half the lines must answer, rib, quote, or disagree with a PRIOR balcony line (name-check who you're talking to). Do not ignore the prior chat.`
       : `REQUIRED: Speakers talk to EACH OTHER about the scene — address someone by name, pile on, contradict, or riff. Not ${want} isolated monologues.`;
+    const pokeLine = String(poke || '').trim();
+    const pokeRule = pokeLine
+      ? `Talk about this: ${pokeLine}\nThe scene below is what they watched. Stay on the balcony.\n\n`
+      : '';
     return `You write balcony / stream-chat reactions. You are NOT writing the scene. Speakers are watching, not performing.
 
 Available speakers (use these exact name strings when they speak):
@@ -7206,8 +9520,8 @@ ${connBrief}
 Filed lore, stamps, and tags in play (in-jokes and accurate references — do not recap dump. A speaker may only allude to a secret they own or know; never leak what they are unaware of):
 ${loreBrief || '(none stamped or tagged in play)'}
 
-${continueThread ? `Prior balcony chat (react to THESE lines):\n${continueThread}\n\n` : ''}Scene they are watching (${label}):
-${String(source).slice(0, 2400)}
+${continueThread ? `Prior balcony chat (react to THESE lines):\n${continueThread}\n\n` : ''}${pokeRule}Scene they are watching (${label}):
+${String(source || '')}
 
 ${banterRule}
 
@@ -7293,7 +9607,7 @@ No narration. No markdown fences. No preamble.`;
     this.render(this.container);
     try {
       const { label, source, scene } = this._peanutSource(st);
-      const speakers = this._peanutPickSpeakers();
+      const speakers = this._peanutPickSpeakers([], source);
       const castBlock = speakers.map(s => {
         const tip = String(s.blurb || s.identity?.description || s.c.priority || 'cast')
           .replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -7304,13 +9618,17 @@ No narration. No markdown fences. No preamble.`;
       const loreBrief = this._peanutLoreBrief(speakers, source, scene);
       const want = this._peanutWantCount(names.length, { continueThread: false });
 
-      const prompt = this._peanutPrompt({ names, castBlock, connBrief, loreBrief, label, source, want });
+      const prompt = this._peanutPrompt({
+        names, castBlock, connBrief, loreBrief, label, source, want,
+        poke: st.peanut.poke,
+      });
       let raw = await this._peanutGenerate(prompt);
       let comments = this._parsePeanutComments(raw, names, { maxOut: want + 2 });
       if (!comments.length) {
+        const poke = String(st.peanut.poke || '').trim();
         const retry = `JSON array only. ${want} REACTION lines. Not everyone must speak. Any order.
 Exact names (pool): ${names.join(' | ')}
-Watching: ${String(source).slice(0, 900)}
+${poke ? `Talk about this: ${poke}\n` : ''}Watching: ${String(source).slice(0, 900)}
 Lore/tags: ${String(loreBrief).slice(0, 500)}
 Ties: ${String(connBrief).slice(0, 400)}
 [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[0]}, that stamp? You knew."}${names.length > 1 ? `,{"name":"${names[1]}","text":"Sit down — I knew enough, not that."}` : ''}]`;
@@ -7340,7 +9658,7 @@ Ties: ${String(connBrief).slice(0, 400)}
       this.saveState();
     } catch (err) {
       console.error('[Backstage peanut]', err);
-      alert(`Listen failed: ${err.message || err}`);
+      void showtimeAlert(`Listen failed: ${err.message || err}`, { title: 'PEANUT GALLERY', danger: true });
     } finally {
       this._busy = false;
       this.render(this.container);
@@ -7353,7 +9671,7 @@ Ties: ${String(connBrief).slice(0, 400)}
     const sessions = st.peanut.sessions || [];
     const active = sessions[this._pgActiveIdx(st)];
     if (!active?.comments?.length) {
-      alert('Nothing to continue — Listen… first.');
+      void showtimeAlert('Nothing to continue — Listen… first.', { title: 'PEANUT GALLERY' });
       return;
     }
     const chatToken = this._chatToken();
@@ -7361,19 +9679,6 @@ Ties: ${String(connBrief).slice(0, 400)}
     this.render(this.container);
     try {
       const priorNames = [...new Set(active.comments.map(c => c.name).filter(Boolean))];
-      const speakers = this._peanutPickSpeakers(priorNames);
-      const names = speakers.map(s => s.c.name);
-      const castBlock = speakers.map(s => {
-        const tip = String(s.blurb || s.identity?.description || s.c.priority || 'cast')
-          .replace(/\s+/g, ' ').trim().slice(0, 160);
-        return `- ${s.c.name}: ${tip}`;
-      }).join('\n');
-      const connBrief = this._peanutConnectionsBrief(speakers);
-      // Keep prior thread intact for context (don't strip with reaction filter)
-      const thread = active.comments
-        .slice(-14)
-        .map(c => `${c.name}: ${c.text}`)
-        .join('\n');
       let sourceBit = '';
       let label = active.label || 'balcony';
       let scene = null;
@@ -7382,11 +9687,24 @@ Ties: ${String(connBrief).slice(0, 400)}
         const src = this._peanutSource(st);
         label = src.label;
         scene = src.scene || null;
-        sourceBit = src.source.slice(0, 2200);
-        loreBrief = this._peanutLoreBrief(speakers, src.source, scene);
+        sourceBit = src.source;
       } catch {
         sourceBit = active.label || 'ongoing balcony chat';
       }
+      const speakers = this._peanutPickSpeakers(priorNames, sourceBit);
+      const names = speakers.map(s => s.c.name);
+      const castBlock = speakers.map(s => {
+        const tip = String(s.blurb || s.identity?.description || s.c.priority || 'cast')
+          .replace(/\s+/g, ' ').trim().slice(0, 160);
+        return `- ${s.c.name}: ${tip}`;
+      }).join('\n');
+      const connBrief = this._peanutConnectionsBrief(speakers);
+      loreBrief = this._peanutLoreBrief(speakers, sourceBit, scene);
+      // Keep prior thread intact for context (don't strip with reaction filter)
+      const thread = active.comments
+        .slice(-14)
+        .map(c => `${c.name}: ${c.text}`)
+        .join('\n');
       const want = this._peanutWantCount(names.length, { continueThread: true });
 
       const prompt = this._peanutPrompt({
@@ -7397,16 +9715,18 @@ Ties: ${String(connBrief).slice(0, 400)}
         label,
         source: sourceBit,
         want,
+        poke: st.peanut.poke,
         continueThread: thread || '(none yet)',
       });
       let raw = await this._peanutGenerate(prompt);
       let next = this._parsePeanutComments(raw, names, { maxOut: want + 2 });
       if (!next.length) {
+        const poke = String(st.peanut.poke || '').trim();
         raw = await this._peanutGenerate(
           `Continue the balcony chat. JSON array of ${want} reactions (about twice a Listen pass).
 Not everyone must speak; any order; someone may speak twice.
 At least half must reply to someone in Prior (name them). Use filed lore/tags/ties when they sting.
-Names (pool): ${names.join(' | ')}
+${poke ? `Talk about this: ${poke}\n` : ''}Names (pool): ${names.join(' | ')}
 Lore/tags: ${String(loreBrief).slice(0, 400)}
 Ties: ${String(connBrief).slice(0, 300)}
 Prior:
@@ -7431,7 +9751,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       this.saveState();
     } catch (err) {
       console.error('[Backstage peanut continue]', err);
-      alert(`Continue failed: ${err.message || err}`);
+      void showtimeAlert(`Continue failed: ${err.message || err}`, { title: 'PEANUT GALLERY', danger: true });
     } finally {
       this._busy = false;
       this.render(this.container);
@@ -7448,13 +9768,16 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     }
   }
 
-  async _quiet(prompt, { quietName = 'System', profileSlot = '' } = {}) {
+  async _quiet(prompt, { quietName = 'System', profileSlot = '', responseLength = 0 } = {}) {
     const text = String(prompt || '');
-    const filing = quietName === 'System' || profileSlot === 'audit';
+    const voice = quietName !== 'System' && quietName !== 'Director';
+    const budget = responseLength > 0
+      ? responseLength
+      : (voice || profileSlot === 'event' ? 900 : 3200);
     const go = () => leanQuietGenerate(text, {
-      kind: filing ? 'filing' : 'voice',
-      responseLength: filing ? 3200 : 1600,
-      fallback: filing ? null : { quietPrompt: text, trimToSentence: false, skipWIAN: true, quietName },
+      kind: voice ? 'voice' : 'filing',
+      responseLength: budget,
+      fallback: null,
     });
     if (profileSlot) return withShowtimeProfile(this.storage, profileSlot, go);
     return go();
@@ -7468,9 +9791,17 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     ].join('');
   }
 
+  _interviewProfileLabel() {
+    const id = String(this._g().profiles.interview || '').trim();
+    if (!id) return 'Current';
+    const hit = (this._profiles || []).find(p => p.id === id || p.name === id);
+    return hit?.name || id;
+  }
+
   _saveProfileSlot(slot, value) {
     const g = this._g();
-    g.profiles ??= { audit: '', motivation: '', event: '', interview: '' };
+    g.profiles = hydrateProfileMap(g.profiles);
+    if (!PROFILE_SLOT_IDS.includes(slot)) return;
     g.profiles[slot] = String(value || '');
     this._saveG();
   }
@@ -7750,26 +10081,24 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
 
   _reputationBrief() {
     try {
-      const hay = haystackLower(getContext()?.chat, 12);
-      const conn = normalizeTrackers(this._db().trackers).connection;
+      const playIds = new Set(inPlayCastRecords(this.storage).map(c => c.id));
       const rep = this.storage.getChat('reputation', { personal: [], house: [] });
       const cast = this._fullCast();
       const nameFor = (id) => cast.find(c => c.id === id)?.name || id;
       const lines = [];
       const personal = (rep.personal || []).filter(x => x.intro === 'pre' || x.kind === 'notice');
-      const picked = hay.trim() && !conn.offScreen
-        ? personal.filter(n => textMatchesHay(n.name, hay) || n.intro === 'pre')
-        : personal;
+      const picked = personal.filter(n => n.intro === 'pre' || playIds.has(n.characterId));
       for (const n of picked.slice(0, 8)) {
         const resolved = n.characterId ? standingToward(this.storage, `cast:${n.characterId}`) : null;
         const standing = resolved != null ? resolved : (n.standing ?? '—');
         lines.push(`- ${n.name} [${n.intro === 'pre' ? 'pre-established' : n.category || 'notice'}] standing ${standing}`);
       }
       for (const h of (rep.house || []).slice(0, 6)) {
-        if (hay.trim() && !conn.offScreen && !textMatchesHay(h.alias || h.name, hay)
-          && !(h.connections || []).some(c => textMatchesHay(nameFor(c.characterId), hay))) {
-          continue;
-        }
+        const memberIds = [
+          h.headId,
+          ...(h.connections || []).map(c => c.characterId),
+        ].filter(Boolean);
+        if (memberIds.length && !memberIds.some(id => playIds.has(id))) continue;
         const members = [
           ...(h.headId ? [{ characterId: h.headId, role: 'Apparent head' }] : []),
           ...(h.connections || []),
@@ -7813,11 +10142,114 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     return [...secrets, ...beats.slice(0, 6), ...standings].join('\n') || '(none filed)';
   }
 
+  _scriptPersonName(raw) {
+    return String(raw || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  }
+
+  _scriptWhenLine(card, writtenSpan) {
+    try {
+      const scriptDb = this.storage.getChat('script', {});
+      const cal = normalizeCalendar(scriptDb?.settings?.calendar);
+      const now = currentTimelinePresent(this.storage);
+      const hit = pickParseableTimeKey(card, cal, { fillMissing: false });
+      const family = (scale) => (scale === 'date' ? 'date' : 'calendar');
+      const thenScale = family(hit?.parsed?.scale);
+      const nowScale = family(now?.scale);
+      if (
+        hit && now && hit.parsed?.scale && now?.scale && thenScale === nowScale
+        && Number.isFinite(hit.parsed.sort) && Number.isFinite(Number(now.sort))
+      ) {
+        const phrase = phraseRecallGap(hit.parsed.sort, now.sort, cal, { scale: nowScale });
+        if (phrase) return `When: this was ${phrase}.`;
+      }
+      const then = String(writtenSpan || card?.span || card?.timeKey || '').trim();
+      const nowKey = String(now?.key || '').trim();
+      const bits = [];
+      if (then) bits.push(`Then: ${then}.`);
+      if (nowKey) bits.push(`Now: ${nowKey}.`);
+      return bits.join(' ');
+    } catch {
+      return '';
+    }
+  }
+
+  _scriptPeopleLines(subject, names) {
+    const subjectName = String(subject?.name || '').trim().toLowerCase();
+    const seen = new Set();
+    const lines = [];
+    for (const raw of names) {
+      const name = this._scriptPersonName(raw);
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key) || (subjectName && key === subjectName)) continue;
+      seen.add(key);
+      const hit = connectionReading(this.storage, {
+        id: subject?.id,
+        characterId: subject?.id,
+        name: subject?.name,
+      }, { name });
+      const a = hit?.toward;
+      const b = hit?.reverse;
+      const bits = [];
+      if (a?.history) bits.push(clipText(a.history, 160));
+      else if (b?.history) bits.push(clipText(b.history, 140));
+      if (a?.baseline) bits.push(clipText(a.baseline, 160));
+      else if (a?.take) bits.push(clipText(a.take, 140));
+      const feel = bits.filter(Boolean).join(' ');
+      lines.push(feel ? `- ${name} — ${feel}` : `- ${name}`);
+      if (lines.length >= 8) break;
+    }
+    return lines;
+  }
+
+  _scriptStampEntries(card, subject, leaves) {
+    const stamped = Array.isArray(card?.sourceStamp?.entries) ? card.sourceStamp.entries : [];
+    const blocks = [];
+    const lorePeople = [];
+    let firstSpan = '';
+    for (const entry of stamped) {
+      const leaf = this._peanutStampLeaf(entry, leaves || []);
+      const body = String(leaf?.content || '').trim();
+      if (!body) continue;
+      const title = String(leaf?.title || entry?.title || '').trim();
+      blocks.push([title, body].filter(Boolean).join('\n'));
+      try {
+        const parsed = parseMemoryBookContent(body);
+        for (const name of parsed.credits || []) lorePeople.push(name);
+        if (!firstSpan && parsed.span) firstSpan = parsed.span;
+      } catch { /* the entry text is already kept */ }
+    }
+    if (!blocks.length) {
+      const happened = String(card?.summary || card?.content || '').replace(/\s+/g, ' ').trim();
+      if (happened) blocks.push(happened);
+    }
+    const people = this._scriptPeopleLines(subject, [
+      ...(card?.credits || []).map(cr => cr?.name || cr?.character || ''),
+      ...lorePeople,
+    ]);
+    const when = this._scriptWhenLine(card, firstSpan);
+    const tail = [];
+    if (people.length) tail.push(`Who was there:\n${people.join('\n')}`);
+    if (when) tail.push(when);
+    return { blocks, tail };
+  }
+
   _noteTargets(noteId, subjectId) {
+    const key = `${noteId}|${subjectId || ''}`;
+    const now = Date.now();
+    if (this._noteTargetCache?.key === key && now - this._noteTargetCache.at < 4000) {
+      return this._noteTargetCache.list;
+    }
     const out = [];
     const push = (id, title, prompt, group) => {
       if (!id || !title) return;
-      out.push({ id: `${group}:${id}`, title: `${group} · ${title}`, prompt, group });
+      out.push({
+        id: `${group}:${id}`,
+        title: `${group} · ${title}`,
+        spoken: title,
+        prompt,
+        group,
+      });
     };
     try {
       const inv = this.storage.getChat('inventory', { static: [], mobile: [] });
@@ -7826,46 +10258,101 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
         for (const it of items) {
           const inTrunk = (inv.static || []).some(x => x.id === it.id);
           const loc = inTrunk ? 'Trunk' : 'On Person';
-          push(it.id, it.name, `Item “${it.name}” [${loc}/${it.category || 'item'}]: ${clipText(it.description, 240)}`, 'Item');
+          push(it.id, it.name, `Something in the world — “${it.name}” (${loc}). ${clipText(it.description, 240)}`, 'Item');
         }
         const subj = this._fullCast().find(c => c.id === subjectId);
         for (const w of (subj?.wardrobe || [])) {
-          push(w.id || w.name, w.name, `Wardrobe “${w.name}”: ${clipText(w.description, 240)}`, 'Wardrobe');
+          push(w.id || w.name, w.name, `Clothes they keep — “${w.name}”. ${clipText(w.description, 240)}`, 'Wardrobe');
         }
         for (const p of (subj?.props || [])) {
-          push(p.id || p.name, p.name, `Prop “${p.name}”: ${clipText(p.description, 240)}`, 'Prop');
+          push(p.id || p.name, p.name, `Something they carry — “${p.name}”. ${clipText(p.description, 240)}`, 'Prop');
         }
       }
       if (noteId === 'fashion') {
-        for (const it of items.filter(i => i.category === 'wearable')) {
-          const who = it.equippedTo?.name || (it.equippedTo?.type === 'player' ? 'Star' : 'unequipped');
-          push(it.id, `${it.name} (${who})`, `Wearable “${it.name}” on ${who}: ${String(it.description || '').slice(0, 400)}`, 'Wearable');
-        }
         for (const c of this._fullCast()) {
-          for (const w of (c.wardrobe || [])) {
-            push(`${c.id}:${w.id || w.name}`, `${c.name} · ${w.name}`, `Cast wardrobe — ${c.name} wears “${w.name}”: ${String(w.description || '').slice(0, 300)}`, 'Cast look');
+          if (!c || c.priority === 'director') continue;
+          const name = String(c.name || '').trim() || 'Cast';
+          const kit = this._fashionKit(c);
+          const worn = kit.wardrobe || [];
+          const outfits = normalizeOutfits(c.outfits);
+          if (!worn.length && !outfits.length) continue;
+          const owned = new Map(kitOwnedItems(worn, kit.props || []).map(x => [x.id, x]));
+          if (!worn.length) {
+            out.push({
+              id: `fashion:current:${c.id}`,
+              title: `${name} · Current`,
+              spoken: `what ${name} has on`,
+              bucket: name,
+              group: 'Fashion',
+              prompt: `${name} has nothing on. They are nude. Talk about that, not a closet or a file.`,
+            });
+          }
+          if (worn.length) {
+            const look = formatOutfitLook(pickPrimaryOutfit(c.outfits, worn, [...owned.values()]), { compact: false });
+            const pieces = worn.slice(0, 8).map(w => {
+              const piece = String(w?.name || '').trim();
+              if (!piece) return '';
+              const desc = String(w?.description || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+              return desc ? `${piece}: ${desc}` : piece;
+            }).filter(Boolean);
+            out.push({
+              id: `fashion:current:${c.id}`,
+              title: `${name} · Current`,
+              spoken: `what ${name} has on`,
+              bucket: name,
+              group: 'Fashion',
+              prompt: [
+                `${name} has this on now. Talk about the clothes, not a closet or a file.`,
+                look,
+                pieces.length ? `Pieces:\n${pieces.map(p => `- ${p}`).join('\n')}` : '',
+              ].filter(Boolean).join('\n'),
+            });
+          }
+          for (const o of outfits) {
+            const parts = (o.partIds || []).map(pid => owned.get(pid)?.name || 'Missing piece');
+            const type = outfitTypeMeta(o.type).label;
+            out.push({
+              id: `fashion:outfit:${c.id}:${o.id}`,
+              title: `${name} · Closet · ${o.title}`,
+              spoken: o.title,
+              bucket: name,
+              group: 'Fashion',
+              prompt: [
+                `Clothes ${name} keeps. They may not have them on. Talk about the clothes, not a closet or a file.`,
+                `${o.title} (${type})`,
+                o.description || '',
+                parts.length ? `Pieces: ${parts.join(', ')}` : '',
+              ].filter(Boolean).join('\n'),
+            });
           }
         }
       }
       if (noteId === 'role') {
-        for (const c of this._fullCast().filter(x => x.priority !== 'director')) {
-          push(c.id, c.name, `Cast “${c.name}” (${c.priority}): ${String(c.description || '').slice(0, 500)}`, 'Cast');
-        }
         try {
           const mot = this.storage.getChat('motivation', { perChar: {} });
           const row = mot.perChar?.[subjectId] || {};
           for (const a of (row.achievements || [])) {
-            push(a.id, a.title, `Achievement “${a.title}” [${a.status}]: ${String(a.description || '').slice(0, 400)}`, 'Achievement');
+            push(a.id, a.title, `Something that happened for them — “${a.title}”. ${String(a.description || '').slice(0, 400)}`, 'Achievement');
           }
           for (const s of (row.secrets || [])) {
-            push(s.id, s.title, `Secret “${s.title}”: ${clipText(s.description, 280)}`, 'Secret');
+            push(s.id, s.title, `Something they keep quiet — “${s.title}”. ${clipText(s.description, 280)}`, 'Secret');
           }
         } catch { /* ignore */ }
-        for (const s of getSceneCards(this.storage).slice(0, 30)) {
-          push(s.uid, `${s.code} ${s.title}`, `Script “${s.code} ${s.title}”: ${String(s.card?.summary || s.card?.content || '').slice(0, 500)}`, 'Script');
+        const scenes = getSceneCards(this.storage).slice(0, 80);
+        for (const s of scenes) {
+          out.push({
+            id: `Script:${s.uid}`,
+            title: ['Script', [s.code, s.title].filter(Boolean).join(' ')].filter(Boolean).join(' · '),
+            spoken: '',
+            group: 'Script',
+            cardUid: s.uid,
+            prompt: '',
+          });
         }
-        for (const leaf of listVisibleLibraryLeaves(this.storage).slice(0, 30)) {
-          push(leaf.key || leaf.id, leaf.title, `Library “${leaf.title}”: ${String(leaf.content || '').slice(0, 500)}`, 'Library');
+        for (const leaf of listVisibleLibraryLeaves(this.storage).slice(0, 80)) {
+          const lead = `Something they know — “${leaf.title}”. `;
+          const body = String(leaf.content || '').trim().slice(0, 20000);
+          push(leaf.key || leaf.id, leaf.title, `${lead}${body}`, 'Library');
         }
       }
       if (noteId === 'cast') {
@@ -7879,16 +10366,28 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
           for (const r of (selfNode.readings || [])) {
             if (r.targetId) linkedIds.add(r.targetId);
           }
+          for (const n of (rep.personal || [])) {
+            if ((n.links || []).includes(selfNode.id)) linkedIds.add(n.id);
+            if ((n.readings || []).some(r => r.targetId === selfNode.id)) linkedIds.add(n.id);
+          }
         }
         const personal = selfNode
           ? (rep.personal || []).filter(n => linkedIds.has(n.id) || n.characterId === subjectId)
           : (rep.personal || []).filter(n => n.characterId === subjectId);
         for (const n of personal) {
-          push(n.id, n.name, `Reputation “${n.name}” (${n.category || n.kind}, intro ${n.intro || 'none'}): ${clipText(n.description || n.notes, 240)}`, 'Reputation');
+          const pair = selfNode && n.id !== selfNode.id
+            ? this._pairConnBrief(selfNode, n, { otherName: n.name })
+            : '';
+          const blob = [
+            `Someone in your life — ${n.name}.`,
+            pair,
+            clipText(n.notes, 180),
+          ].filter(Boolean).join('\n');
+          push(n.id, n.name, blob, 'Reputation');
         }
         const houseIds = new Set(characterHouseIds(this.storage, subjectId));
         for (const h of (rep.house || []).filter(x => houseIds.has(x.id))) {
-          push(h.id, h.alias || h.name, `Affiliation “${h.alias || h.name}”: duty ${h.duty || '—'}; ${clipText(h.notes || h.opinion, 240)}`, 'Affiliation');
+          push(h.id, h.alias || h.name, `A house you belong to — ${h.alias || h.name}. ${h.duty ? `Your place there: ${h.duty}. ` : ''}${clipText(h.notes || h.opinion, 240)}`, 'Affiliation');
         }
         const play = listPlaySecrets(this.storage);
         const houses = characterHouseIds(this.storage, subjectId);
@@ -7899,7 +10398,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
           if (seenSecret.has(s.id)) continue;
           seenSecret.add(s.id);
           const angle = s.ownerId === subjectId ? 'own' : 'known';
-          push(s.id, s.title, `Rumor/Secret “${s.title}” (${angle}; owner ${s.ownerName}): ${clipText(s.description, 280)}`, 'Secret');
+          push(s.id, s.title, `${angle === 'own' ? 'Something you keep quiet' : `Something you've heard, from ${s.ownerName || 'someone'}`} — “${s.title}”. ${clipText(s.description, 280)}`, 'Secret');
         }
       }
     } catch (err) {
@@ -7907,56 +10406,250 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     }
     // de-dupe by id
     const seen = new Set();
-    return out.filter(t => (seen.has(t.id) ? false : (seen.add(t.id), true))).slice(0, 80);
+    const list = out.filter(t => (seen.has(t.id) ? false : (seen.add(t.id), true))).slice(0, 80);
+    this._noteTargetCache = { key, at: now, list };
+    return list;
   }
 
-  _subjectDossier(subject, askKind, target) {
+  async _ensureInterviewLeaves() {
+    const cached = await ensureLibraryBooks();
+    if (cached.length) return listVisibleLibraryLeaves(this.storage, cached);
+    try {
+      const script = globalThis.Showtime?.modules?.get?.('script');
+      if (script && typeof script._loadWIBooks === 'function') {
+        if (!script._wiBooks?.length) await script._loadWIBooks();
+        if (script._wiBooks?.length) {
+          return listLibraryLeaves(this.storage, script._wiBooks).filter(leaf => !leaf.disabled);
+        }
+      }
+    } catch (err) {
+      console.warn('[Backstage] interview lorebooks', err);
+    }
+    return this._peanutLibraryLeaves();
+  }
+
+  async _subjectLanes(subject, _askKind, meta = {}) {
     const ctx = getContext();
-    const identity = resolveCastPromptIdentity(subject, this.storage, {
+    const target = meta?.target || null;
+    const raw = String(target?.title || '').trim();
+    const focusName = raw
+      .replace(/^(Reputation|Cast|Affiliation|Achievement|Secret|Script|Library|Item|Wardrobe|Prop|Wearable|Cast look)\s*·\s*/i, '')
+      .split('·')[0]
+      .trim();
+    const card = resolveInterviewCard(this.storage, subject, {
       characters: ctx.characters ?? [],
       personas: listPersonas(power_user),
+      focusName,
     });
-    const bits = [
-      identity.block,
-      `Cast priority: ${subject.priority || 'cast'}`,
-      `Condition: ${String(subject.condition || 'none').slice(0, 300)}`,
-      `DIRECTOR DIALS:\n${formatDirectorPromptBlock(this.storage, { includeHooks: true })}`,
+    const leaves = await this._ensureInterviewLeaves();
+    const aboutRel = this._aboutConnForTarget(subject, target);
+    const aboutLine = String(meta?.about || '').trim();
+    const notecard = target && target.group !== 'Script' && target.group !== 'Library'
+      ? String(target.prompt || '').trim()
+      : '';
+    const desk = fitInterviewDesk([
+      notecard,
+      aboutRel,
+      aboutLine ? `About this: ${aboutLine}` : '',
+      card.desk,
+    ]);
+    return {
+      who: card.text,
+      desk,
+      lore: this._interviewLore(subject, target, leaves),
+    };
+  }
+
+  _interviewLore(subject, target, leaves = null) {
+    const rows = getSceneCards(this.storage);
+    const cards = rows.map(row => row.card).filter(card => card?.uid);
+    const byUid = new Map(rows.map(row => [row.uid, row]));
+    const shelf = shelfOrderedUids(cards);
+    let lead = '';
+    let seedUids = [];
+    if (target?.group === 'Script' && target.cardUid) {
+      seedUids = [target.cardUid];
+    } else if (target?.group === 'Library') {
+      lead = String(target.prompt || '').trim();
+      seedUids = this._latestOnShelf(this._libraryStampSeeds(rows, target), shelf);
+    } else {
+      seedUids = this._creditedSeedUids(subject, shelf);
+    }
+    const expanded = seedUids.length
+      ? expandScriptSeeds(cards, seedUids, { back: 2, forward: 1, cap: 8 })
+      : { seeds: [], extra: [], order: [] };
+    const want = new Set(expanded.order);
+    const seedSet = new Set(expanded.seeds);
+    const seedOrder = shelf.filter(uid => seedSet.has(uid));
+    const extraOrder = shelf.filter(uid => want.has(uid) && !seedSet.has(uid));
+    const offShelf = expanded.order.filter(uid => !shelf.includes(uid));
+    const sequence = [
+      ...seedOrder,
+      ...offShelf.filter(uid => seedSet.has(uid)),
+      ...extraOrder,
+      ...offShelf.filter(uid => !seedSet.has(uid)),
     ];
-    if (subject.wardrobe?.length) {
-      bits.push(`Wardrobe: ${subject.wardrobe.map(w => w.name).join(', ')}`);
+    const loreLeaves = leaves || this._peanutLibraryLeaves();
+    const blocks = [];
+    let room = 6000;
+    const leadBlock = this._fitLoreLead(lead, room);
+    if (leadBlock) {
+      blocks.push(leadBlock);
+      room -= leadBlock.length + 2;
     }
-    if (subject.props?.length) {
-      bits.push(`Props: ${subject.props.map(p => p.name).join(', ')}`);
+    for (const uid of sequence) {
+      if (room < 80) break;
+      const row = byUid.get(uid);
+      if (!row) continue;
+      const block = this._scriptCardBlock(row, subject, loreLeaves, room);
+      if (!block) continue;
+      blocks.push(block);
+      room -= block.length + 2;
     }
+    return blocks.join('\n\n');
+  }
+
+  _creditedSeedUids(subject, shelf) {
+    let credited = [];
     try {
-      const credited = creditedScenes(this.storage, subject.id, subject.name).slice(0, 8);
-      if (credited.length) {
-        bits.push(`Credited Script: ${credited.map(s => `${s.code} · ${s.title}`).join(' · ')}`);
-      }
-    } catch { /* ignore */ }
-    try {
-      const mot = this.storage.getChat('motivation', { perChar: {} });
-      const row = mot.perChar?.[subject.id];
-      if (row?.achievements?.length) bits.push(`Achievements: ${row.achievements.map(a => a.title).join('; ')}`);
-      if (row?.secrets?.length) bits.push(`Own secrets: ${row.secrets.map(s => s.title).join('; ')}`);
-      const prior = (row?.interviews || []).slice(0, 2);
-      if (prior.length) {
-        const peeks = prior.map(iv => {
-          const ans = (iv.turns || []).filter(t => t.who === 'cast' && t.text).slice(-2)
-            .map(t => String(t.text).slice(0, 160)).join(' / ');
-          return `- ${iv.interviewer || 'Interviewer'}: ${ans || '(no replies filed)'}`;
-        });
-        bits.push(`Prior interview notes (stay consistent):\n${peeks.join('\n')}`);
-      }
-    } catch { /* ignore */ }
-    if (askKind && askKind !== 'free') {
-      const related = this._noteTargets(askKind, subject.id).slice(0, 6);
-      if (related.length) {
-        bits.push(`Related ${askKind} files: ${related.map(r => r.title).join(' · ')}`);
-      }
+      credited = creditedScenes(this.storage, subject?.id, subject?.name).map(scene => scene.uid);
+    } catch {
+      return [];
     }
-    if (target?.prompt) bits.push(`Focus file already injected separately.`);
-    return bits.join('\n');
+    const set = new Set(credited);
+    const onShelf = (shelf || []).filter(uid => set.has(uid));
+    const latest = (onShelf.length ? onShelf : credited).slice(-4);
+    return latest;
+  }
+
+  _libraryStampSeeds(rows, target) {
+    const rawId = String(target?.id || '');
+    const key = rawId.includes(':') ? rawId.slice(rawId.indexOf(':') + 1) : rawId;
+    const title = String(target?.spoken || target?.title || '')
+      .replace(/^Library\s*·\s*/i, '')
+      .trim()
+      .toLowerCase();
+    const hits = [];
+    for (const row of rows) {
+      const entries = Array.isArray(row.card?.sourceStamp?.entries) ? row.card.sourceStamp.entries : [];
+      const stamped = entries.some(entry => {
+        const ek = String(entry?.key || '').trim();
+        const eu = String(entry?.uid || '').trim();
+        const et = String(entry?.title || '').trim().toLowerCase();
+        return (key && (ek === key || eu === key)) || (title && et === title);
+      });
+      if (stamped) hits.push(row.uid);
+    }
+    return hits;
+  }
+
+  _latestOnShelf(uids, shelf, n = 4) {
+    const set = new Set(uids || []);
+    const onShelf = (shelf || []).filter(uid => set.has(uid));
+    const list = onShelf.length ? onShelf : [...set];
+    return list.slice(-n);
+  }
+
+  _fitLoreLead(text, room) {
+    const body = String(text || '').trim();
+    if (!body || room < 80) return '';
+    if (body.length <= room) return body;
+    const kept = [];
+    let size = 0;
+    for (const para of body.split(/\n\n/)) {
+      const piece = para.trim();
+      if (!piece) continue;
+      const gap = kept.length ? 2 : 0;
+      if (size + gap + piece.length > room) break;
+      kept.push(piece);
+      size += gap + piece.length;
+    }
+    if (kept.length) return kept.join('\n\n');
+    const slice = body.slice(0, room);
+    const dot = slice.lastIndexOf('. ');
+    return (dot > 200 ? slice.slice(0, dot + 1) : slice).trim();
+  }
+
+  _scriptCardBlock(row, subject, leaves, room) {
+    const { blocks, tail } = this._scriptStampEntries(row.card || {}, subject, leaves);
+    if (!blocks.length || room < 80) return '';
+    // The scene title is a label, not an event. Stamped entries already name themselves.
+    const budget = room;
+    const chosen = [];
+    let size = 0;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const entry = blocks[i];
+      const gap = chosen.length ? 2 : 0;
+      if (size + gap + entry.length > budget) continue;
+      chosen.unshift(entry);
+      size += gap + entry.length;
+    }
+    if (!chosen.length) return '';
+    for (const extra of tail) {
+      const gap = 2;
+      if (size + gap + extra.length > budget) continue;
+      chosen.push(extra);
+      size += gap + extra.length;
+    }
+    return chosen.filter(Boolean).join('\n\n');
+  }
+
+  _pairConnBrief(subjectNode, otherNode, { otherName = '' } = {}) {
+    const hit = connectionReading(this.storage, {
+      id: subjectNode?.id,
+      characterId: subjectNode?.characterId,
+      name: subjectNode?.name,
+    }, {
+      id: otherNode?.id,
+      characterId: otherNode?.characterId,
+      name: otherName || otherNode?.name,
+    });
+    if (!hit) return '';
+    const name = hit.name || otherName || 'them';
+    const linked = hit.linked;
+    const a = hit.toward;
+    const b = hit.reverse;
+    const lines = [];
+    if (linked) lines.push(`You and ${name} are linked on the Connections web.`);
+    if (a.intro === 'pre' || b.intro === 'pre') {
+      lines.push(`Introduction: pre-established (beyond this story).`);
+    } else if (String(a.intro).startsWith('scene:')) {
+      const lab = sceneLabel(this.storage, a.intro.slice(6));
+      if (lab) lines.push(`Introduced in ${lab}.`);
+    }
+    if (a.history) lines.push(`How you met: ${clipText(a.history, 320)}`);
+    else if (b.history) lines.push(`How they met you: ${clipText(b.history, 280)}`);
+    if (a.baseline) lines.push(`Current baseline: ${clipText(a.baseline, 320)}`);
+    if (a.take || a.standing != null) {
+      lines.push(`Your take on ${name}: standing ${a.standing ?? '—'}; ${clipText(a.take, 240) || '—'}`);
+    }
+    if (b.take || b.standing != null) {
+      lines.push(`How ${name} sees you: standing ${b.standing ?? '—'}; ${clipText(b.take, 240) || '—'}`);
+    }
+    return lines.join('\n');
+  }
+
+  _aboutConnForTarget(subject, target) {
+    if (!subject || !target) return '';
+    try {
+      const rep = this.storage.getChat('reputation', { personal: [] });
+      const nodes = Array.isArray(rep.personal) ? rep.personal : [];
+      const subjectNode = nodes.find(n => n.characterId === subject.id)
+        || nodes.find(n => String(n.name || '').toLowerCase() === String(subject.name || '').toLowerCase());
+      const hint = String(target.id || '').includes(':')
+        ? target.id.split(':').slice(1).join(':')
+        : String(target.id || '').trim();
+      const titleName = String(target.title || '').replace(/^(Reputation|Cast|Affiliation)\s*·\s*/i, '').trim();
+      const other = nodes.find(n => n.id === hint)
+        || nodes.find(n => String(n.name || '').toLowerCase() === titleName.toLowerCase())
+        || nodes.find(n => n.characterId && titleName && String(this._fullCast().find(c => c.id === n.characterId)?.name || '').toLowerCase() === titleName.toLowerCase());
+      if (!subjectNode || !other || subjectNode.id === other.id) return '';
+      const brief = this._pairConnBrief(subjectNode, other, { otherName: other.name || titleName });
+      if (!brief) return '';
+      return `YOUR RELATIONSHIP WITH ${other.name || titleName} (private — speak from this, do not recite labels):\n${brief}`;
+    } catch {
+      return '';
+    }
   }
 
   _repTowardBlock(interviewerId, interviewerName) {
@@ -7992,10 +10685,28 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
         const subjOfIv = (subjectNode.readings || []).find(r => r.targetId === interviewerNode.id);
         if (subjOfIv) {
           lines.push(`Your prior take on ${interviewerName}: aware=${subjOfIv.aware || '—'}; standing=${subjOfIv.standing ?? '—'}; ${String(subjOfIv.take || '—').slice(0, 220)}`);
+          const intro = subjOfIv.intro || 'none';
+          const history = String(subjOfIv.history || (intro === 'pre' ? subjOfIv.description : '') || '').trim();
+          const baseline = String(subjOfIv.baseline || (intro !== 'pre' ? subjOfIv.description : '') || '').trim();
+          if (history) lines.push(`How you met: ${history.slice(0, 180)}`);
+          if (baseline) lines.push(`Current baseline: ${baseline.slice(0, 180)}`);
+          if (subjOfIv.stampUid) {
+            const lab = sceneLabel(this.storage, subjOfIv.stampUid);
+            if (lab) lines.push(`Take formed in ${lab}`);
+          }
         }
         const ivOfSubj = (interviewerNode.readings || []).find(r => r.targetId === subjectNode.id);
         if (ivOfSubj) {
           lines.push(`How ${interviewerName} sees you: aware=${ivOfSubj.aware || '—'}; standing=${ivOfSubj.standing ?? '—'}; ${String(ivOfSubj.take || '—').slice(0, 220)}`);
+          const intro = ivOfSubj.intro || 'none';
+          const history = String(ivOfSubj.history || (intro === 'pre' ? ivOfSubj.description : '') || '').trim();
+          const baseline = String(ivOfSubj.baseline || (intro !== 'pre' ? ivOfSubj.description : '') || '').trim();
+          if (history) lines.push(`How they met you: ${history.slice(0, 180)}`);
+          if (baseline) lines.push(`${interviewerName} baseline: ${baseline.slice(0, 180)}`);
+          if (ivOfSubj.stampUid) {
+            const lab = sceneLabel(this.storage, ivOfSubj.stampUid);
+            if (lab) lines.push(`${interviewerName}’s take formed in ${lab}`);
+          }
         }
         if (interviewerNode.notes) {
           lines.push(`Interviewer notice notes: ${String(interviewerNode.notes).slice(0, 180)}`);
@@ -8017,6 +10728,27 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     } catch {
       return 'RELATIONSHIP / CONNECTIONS: (unavailable)';
     }
+  }
+
+  _peanutClipRows(rows, max = 2400) {
+    const list = Array.isArray(rows) ? rows : [];
+    const kept = [];
+    let used = 0;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const row = list[i];
+      const line = `[${row.index}] ${row.name}: ${row.text}`;
+      if (kept.length && used + line.length + 1 > max) break;
+      kept.unshift(row);
+      used += line.length + 1;
+    }
+    return kept;
+  }
+
+  _peanutClipText(text, max = 2400) {
+    const s = String(text || '').trim();
+    if (s.length <= max) return s;
+    const cut = s.lastIndexOf('\n', max);
+    return (cut > Math.floor(max * 0.5) ? s.slice(0, cut) : s.slice(0, max)).trim();
   }
 
   _peanutSource(st) {
@@ -8043,19 +10775,21 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
         card.content || '',
         ...stampBits,
       ].filter(Boolean).join('\n');
-      return { label: `${scene.code} · ${scene.title}`, source: body, scene };
+      return { label: `${scene.code} · ${scene.title}`, source: this._peanutClipText(body), scene };
     }
     if (mode === 'range') {
-      const rows = this._chatSlice(st.peanut.from, st.peanut.to);
+      const rows = this._peanutClipRows(this._chatSlice(st.peanut.from, st.peanut.to));
       if (!rows.length) throw new Error('No messages in that range.');
+      const lo = rows[0].index;
+      const hi = rows[rows.length - 1].index;
       return {
-        label: `#${st.peanut.from}–${st.peanut.to}`,
+        label: `#${lo}–${hi}`,
         source: rows.map(m => `[${m.index}] ${m.name}: ${m.text}`).join('\n'),
         scene: null,
       };
     }
     const n = Math.max(1, Math.min(80, Number(st.peanut.recentN) || 12));
-    const rows = this._chatSlice().slice(-n);
+    const rows = this._peanutClipRows(this._chatSlice().slice(-n));
     if (!rows.length) throw new Error('No chat messages yet.');
     return {
       label: `last ${rows.length}`,
@@ -8064,22 +10798,121 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     };
   }
 
-  _buildSceneInjection() {
+  _buildNowInjection() {
     const root = extension_settings.showtime ?? {};
     if (root.masterOff) return '';
     this._scanChatTrackers({ persist: false });
     const st = this._db();
     const scene = normalizeTrackers(st.trackers).scene;
-    if (!scene.enabled) return '';
+    const { doc } = ensureNow(this.storage, { scene });
     const snap = this._sceneClapSnapshot(st);
-    const loc = snap.location && snap.location !== '—' ? snap.location : (scene.lastLocationKey || '');
-    const time = scene.followTimeline !== false && snap.time ? snap.time : scene.lastTimeLabel;
-    const date = scene.followTimeline !== false && snap.date && snap.date !== '—' ? snap.date : scene.lastDateLabel;
-    return compactSceneInject({
+    const loc = formatOccupancyLabel(doc.occupancy, { lastLocationKey: doc.lastLocationKey })
+      || (snap.location && snap.location !== '—' ? snap.location : '');
+    const time = scene.followTimeline !== false && snap.time ? snap.time : (doc.clock.timeLabel || scene.lastTimeLabel);
+    const date = scene.followTimeline !== false && snap.date && snap.date !== '—' ? snap.date : (doc.clock.dateLabel || scene.lastDateLabel);
+    const sceneLine = renderNowSceneLine(doc, scene.enabled ? {
       ...scene,
       lastTimeLabel: time,
       lastDateLabel: date,
-    }, { location: loc });
+    } : { enabled: false }) || formatNowSceneLine(scene.enabled ? {
+      ...scene,
+      lastTimeLabel: time,
+      lastDateLabel: date,
+    } : { enabled: false }, loc);
+    const people = inPlayCastRecords(this.storage);
+    const kitText = compactKitInject(worldFromStorage(this.storage), {
+      people,
+      lastLocationKey: doc.lastLocationKey,
+      travel: doc.occupancy,
+      wrap: false,
+    });
+    let visitText = '';
+    try {
+      visitText = visitLinesForPeople(this.storage, people, doc.occupancy).join('\n');
+    } catch { visitText = ''; }
+    const ledgerText = renderNowLedgerLines(doc.ledger);
+    return compactNowInject({ sceneLine, kitText, visitText, ledgerText });
+  }
+
+  _buildSlateInstructInjection() {
+    const root = extension_settings.showtime ?? {};
+    if (root.masterOff) return '';
+    const st = this._db();
+    const trackers = normalizeTrackers(st.trackers);
+    const scene = trackers.scene;
+    const clockLive = scene.time !== false && (
+      scene.enabled || Number.isFinite(Number(scene.lastTimeHour))
+    );
+    const printOn = !!(scene.enabled && scene.printChatCard);
+    if (!clockLive && !printOn) return '';
+    if (!printOn) return compactTurnTimeInstruct();
+    return compactChatSlateInstruct({
+      motivation: trackers.motivation?.enabled !== false,
+      connection: trackers.connection?.enabled !== false,
+      files: true,
+    });
+  }
+
+  _applyTurnElapsed(spec) {
+    const minutes = Number(spec?.minutes) || 0;
+    if (minutes <= 0) return;
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const scene = st.trackers.scene;
+    if (!scene || scene.time === false) return;
+    try {
+      const chat = getContext()?.chat || [];
+      const last = [...chat].reverse().find(m => m && !m.is_system);
+      const sceneText = String(last?.mes || '').replace(/<[^>]+>/g, ' ');
+      applyOffscreenNeeds(this.storage, { sceneText, bus: this.bus });
+    } catch { /* ignore */ }
+    const cal = normalizeCalendar(this.storage.getChat('script', {})?.settings?.calendar);
+    const hpd = Math.max(1, Number(cal.hoursPerDay) || 24);
+    const hit = advanceSceneByMinutes(scene, minutes, { hoursPerDay: hpd, sig: spec?.sig || '' });
+    if (!hit.changed) return;
+    try { syncNowFromScene(this.storage, scene, { source: 'turn' }); } catch { /* ignore */ }
+    if (Number.isFinite(Number(scene.lastTimeHour))) {
+      this._syncTimelinePresent({
+        deltaDays: hit.time?.deltaDays,
+        hour: Number(scene.lastTimeHour),
+        minute: scene.lastTimeMinute,
+      });
+    }
+    this.saveState();
+    this._syncFloatingClapper(false, { scan: false });
+  }
+
+  _applySlateScene(tag) {
+    if (!tag) return;
+    const st = this._db();
+    st.trackers = normalizeTrackers(st.trackers);
+    const scene = st.trackers.scene;
+    if (!scene.enabled || !scene.printChatCard) return;
+    const cal = normalizeCalendar(this.storage.getChat('script', {})?.settings?.calendar);
+    const hpd = Math.max(1, Number(cal.hoursPerDay) || 24);
+    let placeId = '';
+    try {
+      const compass = ensureCompass(st);
+      const loc = String(tag.location || '').trim();
+      placeId = findPlaceIdByKey(compass, loc)
+        || findPlaceByExactName(compass, loc)?.id
+        || findPlaceForTag(compass, loc)?.id
+        || '';
+    } catch { /* ignore */ }
+    const hit = applySlateSceneStamp(scene, tag, { hoursPerDay: hpd, placeId });
+    if (!hit.changed) return;
+    try { syncNowFromScene(this.storage, scene, { source: 'slate' }); } catch { /* ignore */ }
+    this._scheduleSuiteBuild();
+    this._armBoardHold(scene);
+    if (scene.time !== false && Number.isFinite(Number(scene.lastTimeHour))) {
+      this._syncTimelinePresent({
+        hour: Number(scene.lastTimeHour),
+        minute: scene.lastTimeMinute,
+      });
+    }
+    this.saveState();
+    this._syncFloatingClapper(false, { scan: false });
+    this._syncWeatherOverlay();
   }
 
   _buildConnectionsInjection() {
@@ -8088,20 +10921,24 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     const st = this._db();
     const conn = normalizeTrackers(st.trackers).connection;
     if (!conn.enabled) return '';
-    const chat = getContext()?.chat || [];
-    return compactConnectionsInject(this.storage, chat, {
-      window: conn.inPlayWindow,
-      offScreen: conn.offScreen,
-    });
+    return compactConnectionsInject(this.storage);
   }
 
   _registerInjection() {
     if (!this.injector) return;
     this.injector.unregister('backstage.director');
+    this.injector.unregister('backstage.scene');
+    this.injector.unregister('backstage.kit');
     this.injector.register({
-      id: 'backstage.scene',
+      id: 'backstage.now',
       always: true,
-      buildText: () => this._buildSceneInjection(),
+      heavy: true,
+      buildText: () => this._buildNowInjection(),
+    });
+    this.injector.register({
+      id: 'backstage.slate',
+      always: true,
+      buildText: () => this._buildSlateInstructInjection(),
     });
     this.injector.register({
       id: 'backstage.connections',
@@ -8109,32 +10946,62 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       buildText: () => this._buildConnectionsInjection(),
     });
     this.injector.register({
+      id: 'backstage.receipt',
+      always: true,
+      buildText: () => {
+        const root = extension_settings.showtime ?? {};
+        if (root.masterOff) return '';
+        if (lastUserHasReceiptWrap(getContext()?.chat)) return '';
+        return compactReceiptInject(loadLastReceipt(this.storage));
+      },
+    });
+    this.injector.register({
       id: 'backstage.compass',
       always: true,
+      heavy: true,
       position: extension_prompt_types.IN_CHAT,
       depth: 2,
       buildText: () => {
         const root = extension_settings.showtime ?? {};
         if (root.masterOff) return '';
-        this._scanChatTrackers({ persist: false });
         const st = this._db();
         const compass = ensureCompass(st);
-        const room = getActiveRoom(compass);
-        if (!room) return '';
+        const { doc } = ensureNow(this.storage, { scene: normalizeTrackers(st.trackers).scene });
         const star = getStarMember(this.storage);
         const ctx = getContext();
-        const speakerName = String(ctx?.name2 || '').trim();
-        const names = pickInjectionNames({
-          starName: star?.name || ctx?.name1 || '',
+        const activeCue = getActiveCastCue();
+        const cuedSpeakerName = String(activeCue?.name || '').trim();
+        const speakerName = String(cuedSpeakerName || ctx?.name2 || '').trim();
+        const starName = star?.name || ctx?.name1 || '';
+        const room = resolveCompassFocusRoom(compass, {
+          storage: this.storage,
+          cuedSpeakerName,
           speakerName,
+          starName,
         });
-        return buildCompassInjection(room, { ...names, compass, storage: this.storage });
+        if (!room) return '';
+        const names = pickInjectionNames({
+          starName,
+          speakerName,
+          cuedSpeakerName,
+        });
+        return buildCompassInjection(room, {
+          ...names,
+          compass,
+          storage: this.storage,
+          travel: doc.occupancy,
+          lastLocationKey: doc.lastLocationKey,
+        });
       },
     });
     registerWorldIndexInjection(this.injector, this.storage, {
       houseRoot: () => extension_settings.showtime ?? {},
       cellId: () => this._compassSelCell || '',
     });
+    setTimeout(() => { this._runHouseSmokes(); }, 0);
+  }
+
+  _runHouseSmokes() {
     const smokeErr = smokeWorldIndexPure();
     if (smokeErr) console.warn('[Showtime/WorldIndex] smoke failed:', smokeErr);
     const auditSmoke = smokeCompassAuditPure();
@@ -8143,22 +11010,62 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     if (alignSmoke) console.warn('[Showtime/SuiteAlign] smoke failed:', alignSmoke);
     const suiteGlyphSmoke = smokeSuiteFloorplanGlyphs();
     if (suiteGlyphSmoke) console.warn('[Showtime/SuiteGlyphs] smoke failed:', suiteGlyphSmoke);
+    const listingSmoke = smokeListingPure();
+    if (listingSmoke) console.warn('[Showtime/Listing] smoke failed:', listingSmoke);
+    const programSmoke = smokeRoomProgramPure();
+    if (programSmoke) console.warn('[Showtime/RoomProgram] smoke failed:', programSmoke);
+    const packSmoke = smokeSuitePackPure();
+    if (packSmoke) console.warn('[Showtime/SuitePack] smoke failed:', packSmoke);
+    const builderSmoke = smokeRoomBuilderPure();
+    if (builderSmoke) console.warn('[Showtime/RoomBuilder] smoke failed:', builderSmoke);
+    const dresserSmoke = smokeRoomDresserPure();
+    if (dresserSmoke) console.warn('[Showtime/RoomDresser] smoke failed:', dresserSmoke);
+    const accessSmoke = smokeOpeningAccessPure();
+    if (accessSmoke) console.warn('[Showtime/OpeningAccess] smoke failed:', accessSmoke);
+    const fixtureBindSmoke = smokeAutoBindFixtureWallPure();
+    if (fixtureBindSmoke) console.warn('[Showtime/FixtureBind] smoke failed:', fixtureBindSmoke);
+    const locDeltaSmoke = smokeLocationDeltaPure();
+    if (locDeltaSmoke) console.warn('[Showtime/LocationDelta] smoke failed:', locDeltaSmoke);
     const restoreSmoke = smokeSuiteWallRestorePure();
     if (restoreSmoke) console.warn('[Showtime/SuiteRestore] smoke failed:', restoreSmoke);
+    const occSmoke = smokeSyncOccupancyRoomPure();
+    if (occSmoke) console.warn('[Showtime/OccupancyRoom] smoke failed:', occSmoke);
     const jsonSmoke = smokeJsonExtractPure();
     if (jsonSmoke) console.warn('[Showtime/JsonExtract] smoke failed:', jsonSmoke);
     const locSmoke = smokeSceneLocationPure();
     if (locSmoke) console.warn('[Showtime/SceneLocation] smoke failed:', locSmoke);
+    const placeOptsSmoke = smokeCompassPlaceOptionsPure();
+    if (placeOptsSmoke) console.warn('[Showtime/PlaceOptions] smoke failed:', placeOptsSmoke);
     const cueSmoke = smokeChatTrackCuePure();
     if (cueSmoke) console.warn('[Showtime/ChatCues] smoke failed:', cueSmoke);
+    const slateSmoke = smokeChatSlatePure();
+    if (slateSmoke) console.warn('[Showtime/ChatSlate] smoke failed:', slateSmoke);
     const bgSmoke = smokeBackgroundPickPure();
     if (bgSmoke) console.warn('[Showtime/BackgroundPick] smoke failed:', bgSmoke);
     const wxSmoke = smokeOverlayWxPure();
     if (wxSmoke) console.warn('[Showtime/WeatherOverlay] smoke failed:', wxSmoke);
     const sonarLocSmoke = smokeSonarLocationPure();
     if (sonarLocSmoke) console.warn('[Showtime/SonarLocation] smoke failed:', sonarLocSmoke);
+    const poseSmoke = smokeRotateCellForPose();
+    if (poseSmoke) console.warn('[Showtime/PoseCells] smoke failed:', poseSmoke);
+    const tagSmoke = smokePlaceKeyCollisionPure();
+    if (tagSmoke) console.warn('[Showtime/PlaceKeyCollision] smoke failed:', tagSmoke);
+    const sonarPresenceSmoke = smokeSonarPresencePure();
+    if (sonarPresenceSmoke) console.warn('[Showtime/SonarPresence] smoke failed:', sonarPresenceSmoke);
     const calSmoke = smokeCalendarShiftPure();
     if (calSmoke) console.warn('[Showtime/CalendarShift] smoke failed:', calSmoke);
+    const reelSmoke = smokeReelSanitizePure() || smokeReelNamePure();
+    if (reelSmoke) console.warn('[Showtime/ReelSanitize] smoke failed:', reelSmoke);
+    const receiptSmoke = smokeItemLocatorPure() || smokeTravelStatePure() || smokeReceiptPure();
+    if (receiptSmoke) console.warn('[Showtime/Receipt] smoke failed:', receiptSmoke);
+    const nowSmoke = smokeNowSidecarPure();
+    if (nowSmoke) console.warn('[Showtime/NowSidecar] smoke failed:', nowSmoke);
+    const visitSmoke = smokeVisitMemoryPure();
+    if (visitSmoke) console.warn('[Showtime/VisitMemory] smoke failed:', visitSmoke);
+    const presenceSmoke = smokeCastPresencePure();
+    if (presenceSmoke) console.warn('[Showtime/CastPresence] smoke failed:', presenceSmoke);
+    const healthSmoke = smokeHouseHealthPure();
+    if (healthSmoke) console.warn('[Showtime/HouseHealth] smoke failed:', healthSmoke);
   }
 
   _reelPackOpts() {
@@ -8169,17 +11076,154 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       relink: !!root.querySelector('[data-reel-relink]')?.checked,
       lorebooks: !!root.querySelector('[data-reel-lore]')?.checked,
       allLorebooks: !!root.querySelector('[data-reel-lore-all]')?.checked,
+      leaveStar: !!root.querySelector('[data-reel-leave-star]')?.checked,
     };
+  }
+
+  _maybeStripStar(payload) {
+    if (!this._reelPackOpts().leaveStar || !payload?.chat) return payload;
+    const star = getStarMember(this.storage);
+    stripStarFromReel(payload.chat, star ? { id: star.id, name: star.name } : null);
+    return payload;
+  }
+
+  _productionTitle() {
+    return clipReelTitle(this._db().production?.title);
+  }
+
+  _reelShelfHtml() {
+    const sort = this._reelSort === 'title' ? 'title' : 'newest';
+    const rows = [...listReelCatalog(extension_settings)].sort((a, b) => (
+      sort === 'title'
+        ? String(a.title || a.file).localeCompare(String(b.title || b.file))
+        : (Number(b.at) || 0) - (Number(a.at) || 0)
+    ));
+    const items = rows.length
+      ? rows.map(r => `<div class="bst-row">
+          <span class="bst-k">${esc(r.title || r.file)} · ${esc(r.at ? new Date(r.at).toLocaleString() : r.file)}</span>
+          <button type="button" class="bst-btn" data-action="reel-open" data-file="${esc(r.file)}">Open</button>
+          <button type="button" class="bst-btn" data-action="reel-download" data-file="${esc(r.file)}">Copy</button>
+          <button type="button" class="bst-btn" data-action="reel-delete" data-file="${esc(r.file)}">Delete</button>
+        </div>`).join('')
+      : '<p class="bst-hint">Exported reels land here, in your user files folder, under names starting with showtime-reel-.</p>';
+    return `<div class="bst-field"><span>Reel shelf</span>
+      <div class="bst-row">
+        <button type="button" class="bst-btn${sort === 'newest' ? ' gold' : ''}" data-action="reel-sort" data-sort="newest">Newest</button>
+        <button type="button" class="bst-btn${sort === 'title' ? ' gold' : ''}" data-action="reel-sort" data-sort="title">Title</button>
+      </div>
+      ${items}
+    </div>`;
+  }
+
+  _shelfReel(file) {
+    return listReelCatalog(extension_settings).find(r => r.file === file) || null;
+  }
+
+  async _readShelfReel(file) {
+    const row = this._shelfReel(file);
+    if (!row?.path) throw new Error('missing reel');
+    const res = await fetch(row.path, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`read ${res.status}`);
+    return { row, text: await res.text() };
+  }
+
+  async _openShelfReel(file) {
+    try {
+      const { text } = await this._readShelfReel(file);
+      const blob = new Blob([text], { type: 'application/json' });
+      await this._importProduction(new File([blob], file || 'reel.json', { type: 'application/json' }));
+    } catch (err) {
+      console.error('[Backstage] reel open', err);
+      void showtimeAlert('Could not open that reel.', { title: 'REEL SHELF', danger: true });
+    }
+  }
+
+  async _downloadShelfReel(file) {
+    try {
+      const { row, text } = await this._readShelfReel(file);
+      downloadJson(row.file, JSON.parse(text));
+    } catch (err) {
+      console.error('[Backstage] reel copy', err);
+      void showtimeAlert('Could not copy that reel.', { title: 'REEL SHELF', danger: true });
+    }
+  }
+
+  async _deleteShelfReel(file) {
+    const row = this._shelfReel(file);
+    if (!row) return;
+    if (!await showtimeConfirm(`Remove ${row.title || row.file} from the shelf?`, { title: 'REMOVE REEL', danger: true, confirmLabel: 'Remove' })) return;
+    try {
+      await deleteReelUserFile(row.path);
+    } catch (err) {
+      console.error('[Backstage] reel delete', err);
+      void showtimeAlert('Could not delete that reel file.', { title: 'REEL SHELF', danger: true });
+      return;
+    }
+    forgetReel(extension_settings, row.file);
+    saveSettingsDebounced();
+    this.render(this.container);
+  }
+
+  _attachAffiliations(payload) {
+    const live = {
+      cast: this.storage.getChat('cast', { characters: [] }),
+      reputation: this.storage.getChat('reputation', { house: [], personal: [] }),
+    };
+    const packed = packReelAffiliations(live);
+    if (packed) payload.affiliations = packed;
+    if (payload?.chat) stampCastAffiliations(payload.chat, packed);
+    return payload;
+  }
+
+  async _handOffReel(payload, { backstage = false } = {}) {
+    const title = clipReelTitle(payload?.title);
+    const hash = reelHash(payload);
+    const last = this._db().production?.lastReel;
+    if (last?.hash && last.hash === hash) {
+      const file = last.file || title || 'this reel';
+      if (!await showtimeConfirm(`Already exported as ${file}. Export another copy?`, { title: 'EXPORT REEL', confirmLabel: 'Export' })) return;
+    }
+    const filename = reelFilename(title, stamp(), { backstage });
+    let saved = null;
+    try {
+      saved = await saveReelToUserFiles(filename, payload);
+    } catch (err) {
+      console.error('[Backstage] reel shelf', err);
+      downloadJson(filename, payload);
+      void showtimeAlert('The reel shelf could not store that file. A copy was downloaded instead.', { title: 'EXPORT REEL' });
+    }
+    const prod = this._db().production;
+    prod.lastReel = { title, file: filename, at: Date.now(), hash };
+    this.saveState();
+    if (saved) {
+      rememberReel(extension_settings, {
+        title: title || filename,
+        file: filename,
+        path: saved.path,
+        at: prod.lastReel.at,
+        hash,
+      });
+      saveSettingsDebounced();
+    }
+    const label = title || filename;
+    this.bus?.emit('showtime.notice', {
+      kind: 'inventory',
+      items: [{ text: saved ? `Reel filed · ${label}` : `Reel downloaded · ${label}`, mark: '!' }],
+    });
+    this.render(this.container);
   }
 
   async _exportProduction() {
     try {
-      const extras = await collectReelExtras(this.storage, this._reelPackOpts());
-      const payload = decorateReel(this.storage.exportProduction(), extras);
-      downloadJson(`showtime-reel-${stamp()}.json`, payload);
+      const opts = this._reelPackOpts();
+      const extras = await collectReelExtras(this.storage, opts);
+      const payload = this._attachAffiliations(decorateReel(this._maybeStripStar(this.storage.exportProduction()), extras, {
+        title: this._productionTitle(),
+      }));
+      this._handOffReel(payload);
     } catch (err) {
       console.error('[Backstage] reel export', err);
-      alert('Reel export failed.');
+      void showtimeAlert('Reel export failed.', { title: 'EXPORT REEL', danger: true });
     }
   }
 
@@ -8189,33 +11233,35 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
         .map(el => el.getAttribute('data-export-mod'));
       const includeGlobal = !!this.container.querySelector('[data-export-global]')?.checked;
       if (!mods.length && !includeGlobal) {
-        alert('Check at least one tab (or global settings).');
+        void showtimeAlert('Check at least one tab (or global settings).', { title: 'EXPORT REEL' });
         return;
       }
-      const extras = await collectReelExtras(this.storage, this._reelPackOpts());
-      const payload = decorateReel(this.storage.exportSlice({
+      const opts = this._reelPackOpts();
+      const extras = await collectReelExtras(this.storage, opts);
+      const payload = this._attachAffiliations(decorateReel(this._maybeStripStar(this.storage.exportSlice({
         chatModules: mods,
         includeGlobal,
-      }), extras);
-      downloadJson(`showtime-reel-${stamp()}.json`, payload);
+      })), extras, { title: this._productionTitle() }));
+      this._handOffReel(payload);
     } catch (err) {
       console.error('[Backstage] reel slice', err);
-      alert('Reel export failed.');
+      void showtimeAlert('Reel export failed.', { title: 'EXPORT REEL', danger: true });
     }
   }
 
   _exportBackstageChat() {
-    downloadJson(`showtime-reel-backstage-${stamp()}.json`, {
+    const payload = this._attachAffiliations(decorateReel(this._maybeStripStar({
       _showtimeBackstage: true,
-      _reel: true,
       chat: structuredClone(this._db()),
-    });
+    }), null, { title: this._productionTitle() }));
+    this._handOffReel(payload, { backstage: true });
   }
 
   async _importProduction(file) {
     try {
+      const keptTitle = clipReelTitle(this._db().production?.title);
       const text = await file.text();
-      const payload = JSON.parse(text);
+      const payload = sanitizeReelPayload(JSON.parse(text));
       const merge = !!this.container.querySelector('[data-import-merge]')?.checked;
       const importGlobal = !!this.container.querySelector('[data-import-global]')?.checked;
       const chatModules = [...this.container.querySelectorAll('[data-import-mod]:checked')]
@@ -8224,7 +11270,7 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       const importLore = !!this.container.querySelector('[data-import-lore]')?.checked;
 
       if (!isReelPayload(payload) && !payload._showtime && !payload._showtimeBackstage) {
-        alert('Not a Showtime Reel.');
+        void showtimeAlert('Not a Showtime Reel.', { title: 'IMPORT REEL', danger: true });
         return;
       }
 
@@ -8245,30 +11291,45 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
           importGlobal,
         });
       } else {
-        alert('Not a Showtime Reel.');
+        void showtimeAlert('Not a Showtime Reel.', { title: 'IMPORT REEL', danger: true });
         return;
       }
 
+      applyReelAffiliations(this.storage._root(), payload);
+      this.storage.saveChat();
       const extraNotes = await importReelExtras(this.storage, payload.extras, { importCards, importLore });
-      const extraBit = extraNotes.length ? `\nAlso: ${extraNotes.join(', ')}.` : '';
-      alert((merge || payload._slice)
-        ? `Reel imported into selected tabs.${extraBit}`
-        : `Reel imported.${extraBit}\nReload the page if tabs look stale.`);
+      const prod = this._db().production;
+      if (prod) {
+        if (keptTitle) prod.title = keptTitle;
+        else if (!clipReelTitle(prod.title)) {
+          const incoming = clipReelTitle(payload.title);
+          if (incoming) prod.title = incoming;
+        }
+        this.saveState();
+      }
+      const extraBit = extraNotes.length ? ` · ${extraNotes.join(', ')}` : '';
+      emitShowtimeNotice(this.bus, {
+        kind: 'house',
+        text: (merge || payload._slice)
+          ? `Reel imported into selected tabs${extraBit}`
+          : `Reel imported${extraBit}`,
+        mark: '+',
+      });
       this.render(this.container);
       this.bus?.emit('showtime.stateChanged');
     } catch (err) {
       console.error('[Backstage] reel import', err);
-      alert('Reel import failed.');
+      void showtimeAlert('Reel import failed.', { title: 'IMPORT REEL', danger: true });
     } finally {
       const input = this.container.querySelector('[data-role="import-file"]');
       if (input) input.value = '';
     }
   }
 
-  _wipe() {
+  async _wipe() {
     const target = this.container.querySelector('[data-role="wipe-target"]')?.value;
-    if (!target) { alert('Pick something to wipe.'); return; }
-    if (!confirm(`Wipe “${target}”? This cannot be undone.`)) return;
+    if (!target) { void showtimeAlert('Pick something to wipe.', { title: 'WIPE DATA' }); return; }
+    if (!await showtimeConfirm(`Wipe “${target}”? This cannot be undone.`, { title: 'WIPE DATA', danger: true, confirmLabel: 'Wipe' })) return;
     if (target === 'backstage-global') {
       this.storage.setGlobal('backstage', this._defaultGlobal());
       this._applyTheme('paper');
@@ -8298,10 +11359,11 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     saveSettingsDebounced();
 
     const g = this._g();
-    g.profiles.audit = this.container.querySelector('[data-g="profile-audit"]')?.value || '';
-    g.profiles.motivation = this.container.querySelector('[data-g="profile-motivation"]')?.value || '';
-    g.profiles.event = this.container.querySelector('[data-g="profile-event"]')?.value || '';
-    g.profiles.interview = this.container.querySelector('[data-g="profile-interview"]')?.value || g.profiles.interview || '';
+    g.profiles = hydrateProfileMap(g.profiles);
+    for (const id of PROFILE_SLOT_IDS) {
+      const el = this.container.querySelector(`[data-g="profile-${id}"]`);
+      if (el) g.profiles[id] = String(el.value || '');
+    }
     this._saveG();
 
     window.Showtime?.applyHousePolicy?.();
@@ -8327,9 +11389,51 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
     applyRoleColorVars(root);
   }
 
+  _normalizeProfileBag(bag) {
+    if (!bag) return null;
+    if (Array.isArray(bag) && bag.length) {
+      return bag.map((p, i) => ({
+        id: String(p.id ?? p.name ?? i),
+        name: String(p.name ?? p.id ?? `Profile ${i + 1}`),
+      }));
+    }
+    if (typeof bag === 'object') {
+      const ents = Object.entries(bag);
+      if (!ents.length) return null;
+      return ents.map(([id, p]) => ({
+        id: String(id),
+        name: String((typeof p === 'object' ? p?.name : p) || id),
+      }));
+    }
+    return null;
+  }
+
+  _listProfilesLocal() {
+    const ctx = getContext?.() || {};
+    const candidates = [
+      extension_settings?.connectionManager?.profiles,
+      ctx.extensionSettings?.connectionManager?.profiles,
+      extension_settings?.connection_profiles,
+      extension_settings?.connectionProfiles,
+      window.connectionManager?.profiles,
+      window.connection_manager?.profiles,
+    ];
+    for (const bag of candidates) {
+      const list = this._normalizeProfileBag(bag);
+      if (list?.length) return list;
+    }
+    const scriptProfiles = window.Showtime?.modules?.get('script')?._profiles;
+    if (Array.isArray(scriptProfiles) && scriptProfiles.length) return scriptProfiles;
+    return [];
+  }
+
   async _findProfiles(rawSettings = null) {
+    const local = this._listProfilesLocal();
+    if (local.length && !rawSettings) return local;
+    if (this._profilesFetching && !rawSettings) return local;
     let raw = rawSettings;
     if (!raw) {
+      this._profilesFetching = true;
       try {
         const res = await fetch('/api/settings/get', {
           method: 'POST',
@@ -8339,34 +11443,12 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
         if (res.ok) raw = await res.json();
       } catch {
         raw = null;
+      } finally {
+        this._profilesFetching = false;
       }
     }
 
-    const normalize = (bag) => {
-      if (!bag) return null;
-      if (Array.isArray(bag) && bag.length) {
-        return bag.map((p, i) => ({
-          id: String(p.id ?? p.name ?? i),
-          name: String(p.name ?? p.id ?? `Profile ${i + 1}`),
-        }));
-      }
-      if (typeof bag === 'object') {
-        const ents = Object.entries(bag);
-        if (!ents.length) return null;
-        return ents.map(([id, p]) => ({
-          id: String(id),
-          name: String((typeof p === 'object' ? p?.name : p) || id),
-        }));
-      }
-      return null;
-    };
-
-    const ctx = getContext?.() || {};
     const candidates = [
-      // Live Connection Manager (where ST actually keeps them)
-      extension_settings?.connectionManager?.profiles,
-      ctx.extensionSettings?.connectionManager?.profiles,
-      // Settings API shapes (version-dependent)
       raw?.connectionManager?.profiles,
       raw?.connection_manager?.profiles,
       raw?.settings?.connectionManager?.profiles,
@@ -8374,23 +11456,14 @@ Example: [{"name":"${names[0]}","text":"${(names[1] || names[0]).split(/[\s,]/)[
       raw?.connection_profiles,
       raw?.connectionProfiles,
       raw?.api_connection_profiles,
-      // Fallbacks
-      extension_settings?.connection_profiles,
-      extension_settings?.connectionProfiles,
-      window.connectionManager?.profiles,
-      window.connection_manager?.profiles,
     ];
 
     for (const bag of candidates) {
-      const list = normalize(bag);
+      const list = this._normalizeProfileBag(bag);
       if (list?.length) return list;
     }
 
-    // Last resort: reuse Script’s already-loaded list if present
-    const scriptProfiles = window.Showtime?.modules?.get('script')?._profiles;
-    if (Array.isArray(scriptProfiles) && scriptProfiles.length) return scriptProfiles;
-
-    return [];
+    return local;
   }
 }
 

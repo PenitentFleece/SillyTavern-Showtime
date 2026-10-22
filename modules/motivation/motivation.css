@@ -220,6 +220,19 @@ button.mot-side-row.on {
   text-transform: uppercase;
   vertical-align: middle;
 }
+.mot-card-row .mot-badge { margin-left: 0; flex-shrink: 0; }
+.mot-badge-rumor {
+  border-color: #6b4a8a;
+  color: #6b4a8a;
+}
+.mot-badge-skull {
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1;
+}
 .mot-head-meta {
   font-family: var(--st-font-mono);
   font-size: 9px;
@@ -647,6 +660,12 @@ select.mot-status.on {
   box-shadow: 0 0 0 1px var(--st-gold), 0 6px 14px rgba(0, 0, 0, 0.22);
 }
 .mot-step.unlocked { border-left-color: var(--st-gold); }
+.mot-step.failed {
+  border-left-color: var(--st-crimson);
+  opacity: 0.88;
+}
+.mot-step.failed .mot-step-title { text-decoration: line-through; }
+.mot-step.failed .mot-step-dot { color: var(--st-crimson); }
 .mot-step.blocked { opacity: 0.72; }
 .mot-step-row {
   display: flex;
@@ -1016,6 +1035,11 @@ button.mot-scene:hover { color: var(--st-ink); border-color: var(--st-ink); }
   font-size: 12px;
   color: var(--st-ink);
 }
+.mot-collect-list{display:flex;flex-direction:column;gap:8px;margin:10px 0}
+.mot-collect-row{display:flex;flex-direction:column;gap:4px;padding:8px;border:1px solid var(--st-sepia);background:var(--st-paper-2)}
+.mot-dest-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.mot-dest{display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;text-transform:none;letter-spacing:0;font-family:var(--st-font-body);color:var(--st-ink)}
+.mot-dest input{margin:0}
 .mot-modal-actions {
   display: flex;
   justify-content: flex-end;

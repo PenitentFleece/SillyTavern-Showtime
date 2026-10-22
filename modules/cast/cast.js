@@ -10,8 +10,17 @@ import {
   normalizeAliases, resolveChatSpeaker, castDisplayName, castNameMatches,
   PRONOUN_APPARENT_OPTIONS, PRONOUN_PREFERRED_OPTIONS,
   normalizePronouns, formatPronounsPromptLine,
-  normalizePlotHook, priorityColor,
+  normalizePlotHook, plotHookKindMeta, PLOT_HOOK_KINDS, priorityColor,
   getCastRecords,
+  inPlayCastRecords,
+  getStarMember,
+  isFoilOrHigher,
+  normalizeKeyring,
+  planCameraFocusChoice,
+  smokeCameraFocusChoicePure,
+  smokeResolveChatSpeakerPure,
+  smokeInterviewCardPure,
+  smokeLupFramePure,
 } from '../../lib/castCatalog.js';
 import {
   isAspectEvolutiaAvailable,
@@ -29,10 +38,37 @@ import {
   getThumbnailUrl,
   updateMessageBlock,
   saveChatDebounced,
+  isGenerating,
+  swipeState,
 } from '../../../../../../script.js';
-import { withShowtimeProfile } from '../../lib/connectionProfile.js';
+import { SWIPE_STATE } from '../../../../../constants.js';
+import { isExecutingCommandsFromChatInput } from '../../../../../slash-commands.js';
+import { beginUserGeneration, endUserGeneration, ensureUserConnection, withShowtimeProfile } from '../../lib/connectionProfile.js';
+import { runIdle } from '../../lib/uiPerf.js';
 import { schemaAllowed, leanQuietGenerate, smokeIsolatedGenPure, FILING_RESPONSE_LENGTH } from '../../lib/isolatedGen.js';
 import { bindStarAbsentPersonaGate } from '../../lib/starAbsent.js';
+import { sanitizeMediaUrl } from '../../lib/reelSanitize.js';
+import { starKitFromInventory } from '../../lib/itemLocator.js';
+import { showtimeAlert, showtimeConfirm, showtimePrompt, showtimeCameraFocusChoice } from '../../lib/dialogs.js';
+import {
+  OUTFIT_TYPES,
+  normalizeOutfits,
+  kitOwnedItems,
+  pickPrimaryOutfit,
+  matchOutfit,
+  outfitWearMark,
+  formatOutfitLook,
+  outfitTypeMeta,
+  outfitFromProfileDraft,
+  isWearingNothing,
+  nudeWearLine,
+  readOutfitWearSentence,
+  outfitPartsToWear,
+  smokeWardrobeOutfitsPure,
+} from '../../lib/wardrobeOutfits.js';
+import { paintReceiptCard, stripReceiptWrap, stripReceiptWrapFromElement, findChatMesRoot, runReceiptFiling, fileOneOutfitWear } from '../../lib/receipt.js';
+import { catchChatFiles, buildChatFileHtml, findFile } from '../../lib/fileCabinet.js';
+import { sanitizeFileHtml } from '../../lib/fileSanitize.js';
 import {
   EVENT_MODES,
   DIRECTOR_TAG_FACETS,
@@ -40,9 +76,34 @@ import {
   listDirectorInjectPools,
   smokeDirectorInjectPure,
 } from '../../lib/directorEvent.js';
-import { applyDifficultyToStat, difficultyAuditHint } from '../../lib/trackersConfig.js';
-import { registerCastCueCommand, buildCastCuePrompt, resolveCueGenerationTarget, clipCueToPov, cueOtherNames, smokeCuePovPure } from '../../lib/castCue.js';
-import { inPlayMemberIds, clipText, compactStatusCueInject, recentPlayMessages, playMessagesSince } from '../../lib/chatTrack.js';
+import { applyDifficultyToStat, difficultyAuditHint, normalizeTrackers } from '../../lib/trackersConfig.js';
+import {
+  STAT_DEFS,
+  ALL_STAT_DEFS,
+  THRESHOLD_NOTIFY_STATS,
+  DEFAULT_STATS,
+  stateLabel,
+  isSevereStat,
+  statBehaviorCue,
+  customBarDefsFromTrackers,
+  statTitleChip,
+} from '../../lib/statBars.js';
+import { appendNowLedger } from '../../lib/nowSidecar.js';
+import { noteHouseHealth } from '../../lib/houseHealth.js';
+import { registerCastCueCommand, buildCastCuePrompt, resolveCueGenerationTarget, forceChidForGroupCue, cueShouldYieldSpeaker, clipCueToPov, cueOtherNames, cueOwnsOpening, setActiveCastCue, smokeCuePovPure } from '../../lib/castCue.js';
+import {
+  defaultCueSheet,
+  normalizeCueSheet,
+  makeCueSheetSlot,
+  clipCueSheetBeat,
+  planCueSheetStep,
+  advanceCueSheetIndex,
+  moveCueSheetSlot,
+  CUE_SHEET_MODE_META,
+  CUE_SHEET_MODES,
+  smokeCueSheetPure,
+} from '../../lib/cueSheet.js';
+import { clipText, compactStatusCueInject, recentPlayMessages, playMessagesSince, parseTurnElapsed, scanTimeCue, scanElapsedTimeCue, TURN_ELAPSED_DEFAULT } from '../../lib/chatTrack.js';
 import { standingToward, standingMeterStyle, characterHouseIds } from '../../lib/motivationCatalog.js';
 import { parseJsonArray, parseJsonObject } from '../../lib/jsonExtract.js';
 import { buildCueTakePrompt, applyCueTake, cueTakeWorthFiling, CUE_TAKE_SCHEMA, smokeCueTakePure } from '../../lib/cueTake.js';
@@ -81,7 +142,9 @@ import {
   pickupItem,
   addToLostAndFound,
 } from '../../lib/compass/state.js';
+import { syncSonarPresence } from '../../lib/compass/sonar.js';
 import { listAllSetPieces } from '../../lib/compass/schema.js';
+import { locationTagEditorHTML, bindLocationTagEditor } from '../../lib/locationTagPicker.js';
 import {
   syncBeatFromHook,
   pullBeatAsHook,
@@ -89,140 +152,95 @@ import {
   listPullableBeats,
   hookSceneLabel,
   hookBoardHint,
+  applySlateEvent,
+  smokePlotHookSlatePure,
 } from '../../lib/plotHookBridge.js';
+import {
+  applySlateAchievement,
+  applySlateSecret,
+  applySlateRumor,
+  smokeIntelBridgePure,
+} from '../../lib/intelBridge.js';
+import {
+  parseSlateTags,
+  stripSlateTags,
+  stripSlateFromElement,
+  buildChatSlateHtml,
+  buildChatIntelHtml,
+  slateHasTags,
+  slateFingerprint,
+  smokeChatSlatePure,
+} from '../../lib/chatSlate.js';
+import {
+  CONDITION_NATURES,
+  CONDITION_DURATIONS,
+  CONDITION_PRESETS,
+  CONDITION_PRESET_GROUPS,
+  normalizeConditions,
+  normalizeConditionItem,
+  natureMeta,
+  durationMeta,
+  formatConditionsBlock,
+  findConditionPreset,
+  conditionStatCap,
+  conditionCapSource,
+  applyConditionCaps,
+  applyConditionRemoveMods,
+  smokeConditionCatalogPure,
+} from '../../lib/conditionCatalog.js';
+// Keep in sync with the inline cap checked in _cueFaceUrl below — this is the
+// line past which a raw base64 portrait stops being safe to inline into a
+// chat message's force_avatar (re-bloats the chat file every cue, can freeze
+// the tab painting a multi-megabyte <img src>).
+const INLINE_PORTRAIT_CAP = 200_000;
+
+/**
+ * A pasted/imported portrait that's a multi-megabyte raw data URL would blow
+ * straight past _cueFaceUrl's inline cap on every cue, silently falling back
+ * to the generic default face instead of ever showing the real one (and
+ * bloating the chat file by the same amount on every save, if anything
+ * upstream ever skipped that guard). Downscale + re-encode it once, right
+ * when it's saved, so the stored portrait is actually small enough to render.
+ * Returns the original string untouched if it's not an oversized data URL,
+ * or if compression fails for any reason (e.g. a corrupt/undecodable image).
+ */
+async function compressOversizedPortrait(dataUrl, { maxDim = 640, quality = 0.82 } = {}) {
+  if (!dataUrl || !dataUrl.startsWith('data:') || dataUrl.length <= INLINE_PORTRAIT_CAP) return dataUrl;
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('portrait failed to decode'));
+      el.src = dataUrl;
+    });
+    const srcW = img.naturalWidth || img.width || maxDim;
+    const srcH = img.naturalHeight || img.height || maxDim;
+    const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+    const w = Math.max(1, Math.round(srcW * scale));
+    const h = Math.max(1, Math.round(srcH * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const out = canvas.toDataURL('image/jpeg', quality);
+    // A very dense/noisy image can still come out large even downscaled —
+    // squeeze harder rather than let it keep ballooning the chat file.
+    if (out.length > INLINE_PORTRAIT_CAP && quality > 0.5) {
+      return canvas.toDataURL('image/jpeg', 0.5);
+    }
+    return out;
+  } catch (err) {
+    console.warn('[Showtime Cast] portrait compression failed, keeping original', err);
+    return dataUrl;
+  }
+}
+
 const STATS_ELIGIBLE = new Set(['star', 'lead', 'major', 'foil']);
 const UNIQUE_ROLES = {
   director: { demoteTo: 'major' },
   star: { demoteTo: 'lead' },
 };
-
-const STAT_DEFS = {
-  base: [
-    {
-      id: 'health', label: 'Health', color: '#7a1f1f', direction: 'up',
-      auditHint: 'injury, blood, pain, illness lower this; treatment raises it',
-      thresholds: [
-        { at: 15,  label: 'Dying' },
-        { at: 30,  label: 'Critical' },
-        { at: 50,  label: 'Wounded' },
-        { at: 70,  label: 'Injured' },
-        { at: 85,  label: 'Hurt' },
-        { at: 95,  label: 'Uncomfortable' },
-        { at: 101, label: 'Healthy' },
-      ],
-    },
-    {
-      id: 'energy', label: 'Energy', color: '#c9a24a', direction: 'up',
-      auditHint: 'exertion and sleeplessness lower this; rest raises it',
-      thresholds: [
-        { at: 20,  label: 'Exhausted' },
-        { at: 50,  label: 'Drained' },
-        { at: 80,  label: 'Tired' },
-        { at: 95,  label: 'Rested' },
-        { at: 101, label: 'Energized' },
-      ],
-    },
-  ],
-  hard: [
-    {
-      id: 'hunger', label: 'Satiety', color: '#a86b2b', direction: 'up', group: 'Satiation',
-      auditHint: 'this is fullness, NOT hunger pangs — eating RAISES it; skipping meals LOWERS it',
-      thresholds: [
-        { at: 25,  label: 'Starving' },
-        { at: 60,  label: 'Hungry' },
-        { at: 80,  label: 'Peckish' },
-        { at: 95,  label: 'Full' },
-        { at: 101, label: 'Sated' },
-      ],
-    },
-    {
-      id: 'thirst', label: 'Hydration', color: '#4a7fa8', direction: 'up', group: 'Satiation',
-      auditHint: 'this is hydration — drinking RAISES it; going thirsty LOWERS it',
-      thresholds: [
-        { at: 25,  label: 'Dehydrated' },
-        { at: 60,  label: 'Parched' },
-        { at: 80,  label: 'Thirsty' },
-        { at: 95,  label: 'Content' },
-        { at: 101, label: 'Slaked' },
-      ],
-    },
-    {
-      id: 'bathroom', label: 'Bladder', direction: 'down', group: 'Needs',
-      auditHint: 'bladder pressure — needing to pee RAISES this; relieving LOWERS it toward 0',
-      thresholds: [
-        { at: 40,  label: 'Empty' },
-        { at: 70,  label: 'Comfortable' },
-        { at: 85,  label: 'Pressing' },
-        { at: 95,  label: 'Urgent' },
-        { at: 101, label: 'Bursting' },
-      ],
-    },
-    {
-      id: 'hygiene', label: 'Odor', direction: 'down', group: 'Needs',
-      auditHint: 'body odor — sweat, dirt, mess RAISE this; washing or clean clothes LOWER it toward 0',
-      thresholds: [
-        { at: 40,  label: 'Fresh' },
-        { at: 65,  label: 'Musty' },
-        { at: 85,  label: 'Rank' },
-        { at: 95,  label: 'Foul' },
-        { at: 101, label: 'Reeking' },
-      ],
-    },
-  ],
-};
-
-const ALL_STAT_DEFS = [...STAT_DEFS.base, ...STAT_DEFS.hard];
-const THRESHOLD_NOTIFY_STATS = new Set(['bathroom', 'hygiene']);
-
-const DEFAULT_STATS = () => ({
-  enabled: false,
-  hardMode: false,
-  health: 100,
-  energy: 100,
-  hunger: 100,
-  thirst: 100,
-  bathroom: 0,
-  hygiene: 0,
-});
-
-function stateLabel(def, val) {
-  if (def.levelMode === 'none') return '';
-  if (def.levelMode === 'amount') return String(val);
-  const t = def.thresholds ?? [];
-  for (let i = 0; i < t.length; i++) {
-    if (val < t[i].at) return t[Math.max(0, i)].label;
-  }
-  return t[t.length - 1]?.label ?? '';
-}
-
-function customBarDefsFromTrackers(storage) {
-  try {
-    const bars = storage.getChat('backstage', {})?.trackers?.status?.customBars;
-    if (!Array.isArray(bars)) return [];
-    return bars.map(b => {
-      try {
-        const levels = Array.isArray(b?.levels) ? b.levels : [];
-        return {
-          id: String(b.id || ''),
-          label: String(b.name || 'Custom'),
-          color: b.color || '#6a8a4a',
-          direction: b.direction === 'down' ? 'down' : 'up',
-          levelMode: ['none', 'label', 'amount'].includes(b.levelMode) ? b.levelMode : 'label',
-          description: String(b.description || ''),
-          thresholds: levels.map(lv => ({
-            at: Number(lv?.at) || 0,
-            label: String(lv?.label || ''),
-          })).concat([{ at: 101, label: levels.slice(-1)[0]?.label || '' }]),
-          custom: true,
-        };
-      } catch {
-        return null;
-      }
-    }).filter(d => d && d.id);
-  } catch {
-    return [];
-  }
-}
 
 function statusTrackingMasterOn(storage) {
   try {
@@ -233,13 +251,16 @@ function statusTrackingMasterOn(storage) {
 }
 
 const PRESENCE = {
-  inPlay: { id: 'inPlay', label: 'In play', title: 'In play — tracked' },
-  absent: { id: 'absent', label: 'Absent', title: 'Absent this scene — not tracked' },
-  writtenOut: { id: 'writtenOut', label: 'Written out', title: 'Written out — hidden, not tracked' },
+  inPlay: { id: 'inPlay', label: 'In play', title: 'In play — physically in scene' },
+  privy: { id: 'privy', label: 'Privy', title: 'Privy (listening in) — not physically in the room, but overhearing / privy to what happens' },
+  absent: { id: 'absent', label: 'Absent', title: 'Absent this scene — parked at last-known' },
+  writtenOut: { id: 'writtenOut', label: 'Written out', title: 'Written out — hidden, parked at last-known' },
 };
-const PRESENCE_ORDER = ['inPlay', 'absent', 'writtenOut'];
+const PRESENCE_ORDER = ['inPlay', 'privy', 'absent', 'writtenOut'];
+const STAR_PRESENCE_ORDER = ['inPlay', 'privy', 'absent'];
 const PRESENCE_FILTERS = [
   { id: 'inPlay', label: 'In play' },
+  { id: 'privy', label: 'Privy' },
   { id: 'absent', label: 'Absent' },
   { id: 'writtenOut', label: 'Written out' },
 ];
@@ -248,7 +269,7 @@ const DEFAULT_HIDDEN_PRESENCE = ['absent', 'writtenOut'];
 function normalizePresence(char) {
   if (!char) return 'inPlay';
   const v = String(char.presence || 'inPlay');
-  if (char.priority === 'star') return v === 'absent' ? 'absent' : 'inPlay';
+  if (char.priority === 'star') return (v === 'absent' || v === 'privy') ? v : 'inPlay';
   return PRESENCE[v] ? v : 'inPlay';
 }
 
@@ -284,6 +305,13 @@ export class CastModule extends Module {
     this._pendingStatAlert = null;
     this._pendingCue = null;
     this._pendingCueText = '';
+    this._cuePaintedIdx = -1;
+    this._cueGenStopped = false;
+    this._lastCueStamped = null;
+    this._cueSheetRun = null;
+    this._cueSheetOpen = false;
+    this._cueSheetHydrated = false;
+    this._cueSheetWaiters = [];
     this._cueTakeBusy = false;
     this._auditBusy = false;
     this._auditLastAt = 0;
@@ -294,23 +322,36 @@ export class CastModule extends Module {
     this._resetStatusTrackCursor();
 
     registerCastCueCommand(this);
+    this._installCueSendHook();
 
-    const auditSmoke = smokeCastDeltaPure() || smokeIsolatedGenPure() || smokeDirectorInjectPure()
-      || smokeCuePovPure() || smokeCueTakePure() || smokeKitNestPure();
-    if (auditSmoke) console.warn('[Showtime/CastAudit] smoke failed:', auditSmoke);
+    setTimeout(() => {
+      const auditSmoke = smokeCastDeltaPure() || smokeIsolatedGenPure() || smokeDirectorInjectPure()
+        || smokeCuePovPure() || smokeCueSheetPure() || smokeResolveChatSpeakerPure() || smokeInterviewCardPure() || smokeLupFramePure() || smokeCueTakePure() || smokeKitNestPure() || smokeConditionCatalogPure()
+        || smokeChatSlatePure() || smokePlotHookSlatePure() || smokeIntelBridgePure() || smokeWardrobeOutfitsPure() || smokeCameraFocusChoicePure();
+      if (auditSmoke) console.warn('[Showtime/CastAudit] smoke failed:', auditSmoke);
+    }, 0);
 
     bindStarAbsentPersonaGate(this.storage);
+    this._ensureStarStats();
+
+    for (const c of this.state.characters || []) {
+      if (!c) continue;
+      if (!Array.isArray(c.shelf)) c.shelf = [];
+      if (c.priority === 'director') continue;
+      c.conditions = normalizeConditions(c.conditions);
+      applyConditionCaps(c);
+    }
 
     this.bus?.on('cast.playDirectorEvent', ({ castId, text } = {}) => {
       const char = (this.state?.characters || []).find(c => c.id === castId)
         || getCastRecords(this.storage).find(c => c.id === castId);
       if (!char) {
-        alert('Pick a cast member to play this event.');
+        void showtimeAlert('Pick a cast member to play this event.', { title: 'DIRECTOR EVENT' });
         return;
       }
       this.cueCast(char, { directorBeat: text }).catch(err => {
         console.warn('[Cast director play]', err);
-        alert(`Play failed: ${err?.message || err}`);
+        void showtimeAlert(`Play failed: ${err?.message || err}`, { title: 'DIRECTOR EVENT', danger: true });
       });
     });
 
@@ -326,33 +367,125 @@ export class CastModule extends Module {
       }
       this._stampCueMessage(messageId);
       this._applyChatDisplayName(messageId);
+      this._applyChatSlate(messageId);
+      this._readOutfitWear(messageId);
     });
     eventSource.on(event_types.MESSAGE_RECEIVED, (messageId) => {
+      if (this._pendingCue) this._paintPendingCue(messageId);
       this._applyChatDisplayName(messageId, { silent: true });
+      this._applyChatSlate(messageId, { silent: true });
     });
+    if (event_types.STREAM_TOKEN_RECEIVED) {
+      eventSource.on(event_types.STREAM_TOKEN_RECEIVED, () => {
+        if (!this._pendingCue) return;
+        if (this._cueTokRaf) return;
+        this._cueTokRaf = requestAnimationFrame(() => {
+          this._cueTokRaf = 0;
+          if (!this._pendingCue) return;
+          const chat = getContext()?.chat || [];
+          const idx = chat.length - 1;
+          if (idx < 0) return;
+          this._paintPendingCue(idx);
+        });
+      });
+    }
     // Commit the last AI reply only when the user keeps it by sending again.
     // Swipes / regenerations fire MESSAGE_RECEIVED without growing the chat,
     // and would otherwise stack tracker movement on discarded drafts.
     eventSource.on(event_types.MESSAGE_SENT, () => {
-      this._scheduleStatusTrack();
+      /* receipt glue lives on Backstage MESSAGE_SENT */
     });
-    eventSource.on(event_types.MESSAGE_SWIPED, () => {
+    if (event_types.USER_MESSAGE_RENDERED) {
+      eventSource.on(event_types.USER_MESSAGE_RENDERED, (messageId) => {
+        this._applyChatSlate(messageId);
+      });
+    }
+    eventSource.on(event_types.MESSAGE_SWIPED, (messageId) => {
       clearTimeout(this._statusTrackTimer);
+      const idx = Number.isFinite(Number(messageId))
+        ? Number(messageId)
+        : ((getContext()?.chat?.length || 1) - 1);
+      this._applyChatSlate(idx, { silent: true });
     });
     eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
       if (type === 'swipe' || type === 'continue' || type === 'append') {
         clearTimeout(this._statusTrackTimer);
       }
-      if (dryRun || type === 'quiet' || type === 'swipe' || type === 'continue' || type === 'append') return;
+      if (dryRun || type === 'quiet' || type === 'impersonate') return;
+      this._cueGenStopped = false;
+      if (type === 'swipe' || type === 'continue' || type === 'append' || type === 'regenerate') return;
       if (this._statAlertArmed && this._pendingStatAlert) this._statAlertClearOnEnd = true;
+      // Send and Call arm before Generate. A guided /trigger already chose
+      // the speaker and is only steering — don't paint the gold-bar slot
+      // over that name, or the sheet will chain and post the draft as the Star.
+      if (this._cueYieldsToCaller(_opts)) return;
+      this._armSheetCue();
     });
+    if (event_types.GENERATION_STOPPED) {
+      eventSource.on(event_types.GENERATION_STOPPED, () => {
+        this._cueGenStopped = true;
+        setActiveCastCue(null);
+        this._pendingCue = null;
+        this._pendingCueText = '';
+        this._sheetAutoCue = false;
+        this._cuePaintedIdx = -1;
+        this._flushCueSheetWaiters('stopped');
+        if (this._cueSheetRun) {
+          this.holdCueSheet();
+        } else if (this.container) {
+          this._renderCueSheet();
+        }
+      });
+    }
+    if (event_types.MESSAGE_DELETED) {
+      eventSource.on(event_types.MESSAGE_DELETED, (messageId) => {
+        if (!this._lastCueStamped) return;
+        const chatLen = getContext()?.chat?.length ?? 0;
+        const deletedIdx = Number(messageId);
+        if (
+          messageId === undefined
+          || deletedIdx === this._lastCueStamped.idx
+          || chatLen <= this._lastCueStamped.idx
+        ) {
+          const sheet = this._cueSheetState();
+          sheet.cursor = this._lastCueStamped.prevCursor;
+          this._lastCueStamped = null;
+          try { this.saveState(); } catch { /* ignore */ }
+          if (this.container) this._renderCueSheet();
+        }
+      });
+    }
 
     this._registerInjections();
     this.bus?.on('trackers.updated', () => {
-      if (this.container) this._renderList();
+      if (!this.container) return;
+      const btn = this.container.querySelector('[data-role="file-receipt"]');
+      if (btn) btn.disabled = !this._receiptTrackingOn();
+      this._renderList();
     });
     this.bus?.on('motivation.updated', () => {
       if (this.container) this._renderList();
+    });
+    this.bus?.on('showtime.receiptFiled', () => {
+      if (this.container) this._renderList();
+    });
+    this.bus?.on('receipt.stamped', (ev) => {
+      if (ev?.idx == null || ev?.idx === '') return;
+      const idx = Number(ev.idx);
+      if (!Number.isFinite(idx)) return;
+      this._applyChatSlate(idx);
+      setTimeout(() => this._applyChatSlate(idx), 80);
+      setTimeout(() => this._applyChatSlate(idx), 400);
+    });
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+      this.holdCueSheet();
+      runIdle(() => {
+        try {
+          const chat = getContext()?.chat || [];
+          const start = Math.max(0, chat.length - 4);
+          for (let i = start; i < chat.length; i++) this._applyChatSlate(i, { silent: true, persist: false });
+        } catch { /* ignore */ }
+      }, 1200);
     });
   }
 
@@ -378,33 +511,354 @@ export class CastModule extends Module {
         });
       if (!speaker) return;
 
-      const wantName = castDisplayName(speaker);
-      if (!wantName || wantName === String(mes.name || '').trim()) return;
-
-      mes.name = wantName;
-      if (speaker.portrait) {
-        mes.force_avatar = speaker.portrait;
-      } else if (speaker.characterCardId && speaker.characterCardId !== avatar) {
-        mes.force_avatar = getThumbnailUrl('avatar', speaker.characterCardId);
+      const display = this._resolveDisplay(speaker);
+      const wantName = display.name || castDisplayName(speaker);
+      mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+      let dirty = false;
+      if (wantName && mes.name !== wantName) {
+        mes.name = wantName;
+        dirty = true;
+      }
+      if (speaker.characterCardId && mes.original_avatar !== speaker.characterCardId) {
         mes.original_avatar = speaker.characterCardId;
+        dirty = true;
+      }
+      if (mes.extra.showtimeCastId !== speaker.id) {
+        mes.extra.showtimeCastId = speaker.id;
+        dirty = true;
+      }
+      if (!silent) {
+        try { updateMessageBlock(idx, mes, { rerenderMessage: false }); } catch { /* ignore */ }
+      }
+      this._paintCueChrome(idx, mes, {
+        id: speaker.id,
+        name: wantName,
+        portrait: display.portrait || speaker.portrait || '',
+        cardId: speaker.characterCardId || '',
+      });
+      if (dirty) saveChatDebounced();
+    } catch (err) {
+      console.warn('[Showtime Cast] chat display name', err);
+    }
+  }
+
+  _printChatCardOn() {
+    try {
+      const scene = normalizeTrackers(this.storage.getChat('backstage', {})?.trackers).scene;
+      return !!(scene.enabled && scene.printChatCard);
+    } catch {
+      return false;
+    }
+  }
+
+  _paintReceipt(idx, mes, { silent = false } = {}) {
+    mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+    const extra = mes.extra.showtimeReceipt;
+    const root = findChatMesRoot(idx)
+      || document.querySelector(`#chat .mes[mesid="${idx}"]`)
+      || document.querySelector(`.mes[mesid="${idx}"]`);
+    const mesText = root?.querySelector('.mes_text');
+    if (mesText) stripReceiptWrapFromElement(mesText);
+    if (silent) return;
+    if (extra) paintReceiptCard(idx, extra);
+    else root?.querySelectorAll('.st-chat-receipt').forEach(el => el.remove());
+  }
+
+  _receiptTrackingOn() {
+    try {
+      return normalizeTrackers(this.storage.getChat('backstage', {})?.trackers).receipt?.enabled !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  async _fileReceiptNow(btn) {
+    if (!this._receiptTrackingOn()) return;
+    if (this._receiptBusy) return;
+    this._receiptBusy = true;
+    const orig = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Filing…';
+    }
+    try {
+      await runReceiptFiling(this.storage, {
+        bus: this.bus,
+        cursor: this,
+        force: true,
+        stampTarget: 'user',
+      });
+    } catch (err) {
+      console.warn('[Showtime/receipt] manual', err);
+    } finally {
+      this._receiptBusy = false;
+      if (btn) {
+        btn.disabled = false;
+        if (orig != null) btn.textContent = orig;
+      }
+    }
+  }
+
+  /** Keep a [TIME|+…] tag on the message before the slate strip removes it. */
+  _rememberTurnTag(mes) {
+    const tag = parseTurnElapsed(mes?.mes);
+    if (!tag) return;
+    mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+    mes.extra.showtimeElapsed = { minutes: tag.minutes, source: 'tag' };
+  }
+
+  /**
+   * Move the clock by the beat's tag, or by two minutes when the turn
+   * named no gap and the prose named no clock. A later pass that finds
+   * the tag adds only the difference.
+   */
+  _commitTurnElapsed(mes, idx) {
+    if (!mes || mes.is_user || mes.is_system) return;
+    this._rememberTurnTag(mes);
+    mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+    const raw = String(mes.mes || '');
+    const proseClock = scanTimeCue(raw);
+    const proseElapsed = scanElapsedTimeCue(raw);
+    const prose = !!(proseClock?.clock || proseElapsed);
+    let source;
+    let minutes;
+    if (prose) {
+      source = 'prose';
+      minutes = 0;
+    } else if (mes.extra.showtimeElapsed?.source === 'tag') {
+      source = 'tag';
+      minutes = Number(mes.extra.showtimeElapsed.minutes) || 0;
+    } else {
+      source = 'default';
+      minutes = TURN_ELAPSED_DEFAULT;
+    }
+    const applied = Number(mes.extra.showtimeElapsedApplied);
+    const haveApplied = Number.isFinite(applied);
+    if (haveApplied && applied === minutes && mes.extra.showtimeElapsed?.source === source) return;
+    const delta = minutes - (haveApplied ? applied : 0);
+    const sig = `turn:${String(mes.send_date || idx)}:${source}:${minutes}`;
+    mes.extra.showtimeElapsed = { minutes, source };
+    mes.extra.showtimeElapsedApplied = minutes;
+    mes.extra.showtimeElapsedSig = sig;
+    if (delta > 0 && source !== 'prose') {
+      this.bus?.emit('scene.turnElapsed', { minutes: delta, sig, source });
+      try { saveChatDebounced(); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Parse [SCENE|…] / [EVENT|…] / ACH / SEC / REP from an assistant bubble,
+   * strip the raw tags, apply them when Print slate is on, and paint intel /
+   * slate / file cards. Receipts paint on any bubble with extra.showtimeReceipt.
+   */
+  _applyChatSlate(messageId, { silent = false, persist = true } = {}) {
+    try {
+      const ctx = getContext();
+      const chat = ctx.chat;
+      const idx = Number(messageId);
+      if (!Number.isFinite(idx) || !chat?.[idx]) return;
+      const mes = chat[idx];
+      if (mes.is_system) return;
+      if (mes.is_user) {
+        this._paintReceipt(idx, mes, { silent });
+        return;
       }
 
       mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
-      mes.extra.showtimeCastId = speaker.id;
-
-      if (!silent) {
-        try {
-          updateMessageBlock(idx, mes, { rerenderMessage: false });
-        } catch { /* ignore */ }
-        const root = document.querySelector(`#chat .mes[mesid="${idx}"]`);
-        const nameEl = root?.querySelector('.name_text');
-        if (nameEl) nameEl.textContent = wantName;
-        const face = root?.querySelector('.avatar img');
-        if (face && mes.force_avatar) face.setAttribute('src', mes.force_avatar);
+      this._rememberTurnTag(mes);
+      if (!silent) this._commitTurnElapsed(mes, idx);
+      const rawMes = String(mes.mes || '');
+      const looksTagged = rawMes.includes('[') || rawMes.includes('st-file');
+      if (!looksTagged && !mes.extra.showtimeSlate && !mes.extra.showtimeFiles && !mes.extra.showtimeReceipt) {
+        return;
       }
-      saveChatDebounced();
+      const printOn = this._printChatCardOn();
+      const parsed = parseSlateTags(mes.mes);
+      const hadTags = slateHasTags(parsed);
+      const stripped = stripSlateTags(mes.mes);
+      let dirty = false;
+      if (stripped !== mes.mes) {
+        mes.mes = stripped;
+        dirty = true;
+      }
+
+      const caught = catchChatFiles(this.storage, mes, { mesId: idx, sanitize: sanitizeFileHtml });
+      if (caught.dirty) {
+        mes.mes = caught.text;
+        mes.extra.showtimeFiles = caught.files.map(f => ({ id: f.id, title: f.title }));
+        dirty = true;
+        if (persist) {
+          try { this.storage.saveChat(); } catch { /* ignore */ }
+        }
+        if (!silent && caught.files?.length) {
+          this.bus?.emit('showtime.notice', {
+            kind: 'library',
+            items: caught.files.map(f => ({
+              text: `File · ${f.title || 'Untitled'}`,
+              mark: '+',
+              fileId: f.id,
+            })),
+          });
+        }
+        this.bus?.emit('showtime.stateChanged');
+        this.bus?.emit('library.cabinetUpdated');
+      }
+
+      if (!printOn) {
+        if (dirty && persist) saveChatDebounced();
+        if (!silent) {
+          const root = document.querySelector(`#chat .mes[mesid="${idx}"]`)
+            || document.querySelector(`.mes[mesid="${idx}"]`);
+          const mesText = root?.querySelector('.mes_text');
+          if (mesText) {
+            mesText.querySelectorAll('.st-chat-slate').forEach(el => el.remove());
+            mesText.querySelectorAll('.st-chat-file, aside.st-file').forEach(el => el.remove());
+            stripSlateFromElement(mesText);
+            for (const row of [...(mes.extra.showtimeFiles || [])].reverse()) {
+              const fileHtml = buildChatFileHtml(findFile(this.storage, row?.id));
+              if (fileHtml) mesText.insertAdjacentHTML('afterbegin', fileHtml);
+            }
+          }
+          this._paintReceipt(idx, mes, { silent });
+        }
+        return;
+      }
+
+      if (hadTags) {
+        mes.extra.showtimeSlate = {
+          scene: parsed.scene,
+          events: parsed.events,
+          achs: parsed.achs,
+          secrets: parsed.secrets,
+          reps: parsed.reps,
+        };
+        mes.extra.showtimeSlateBody = stripped;
+        const sig = slateFingerprint(parsed);
+        if (mes.extra.showtimeSlateSig !== sig) {
+          if (parsed.scene) this.bus?.emit('scene.slateApply', parsed.scene);
+          let hookDirty = false;
+          let motDirty = false;
+          const hookNotices = [];
+          const motNotices = [];
+          for (const event of parsed.events || []) {
+            const result = applySlateEvent(this.storage, event);
+            if (!result?.ok) continue;
+            hookDirty = true;
+            const hookTitle = String(result.hook?.name || event.context || event.summary || 'Plot hook').trim();
+            hookNotices.push({
+              text: `Plot hook · ${hookTitle}`,
+              mark: event.verb === 'FAILED' ? 'X' : (event.verb === 'RESOLVED' ? '✓' : '!'),
+            });
+            if (result.resolveStep) {
+              this.bus?.emit('motivation.slateResolved', result.resolveStep);
+            }
+            if (result.failStep) {
+              this.bus?.emit('motivation.slateFailed', result.failStep);
+            }
+          }
+          const trackers = (() => {
+            try { return normalizeTrackers(this.storage.getChat('backstage', {})?.trackers); }
+            catch { return {}; }
+          })();
+          const motOn = trackers.motivation?.enabled !== false;
+          const connOn = trackers.connection?.enabled !== false;
+          if (motOn) {
+            const extraId = String(mes.extra.showtimeCastId || '').trim();
+            const speaker = (extraId && this._find(extraId))
+              || resolveChatSpeaker(this.storage, {
+                avatar: String(mes.original_avatar || '').trim(),
+                spokenName: mes.name || '',
+              });
+            const ownerId = speaker && isFoilOrHigher(speaker.priority) ? speaker.id : '';
+            const ach = (parsed.achs || []).at(-1);
+            if (ach && ownerId) {
+              const result = applySlateAchievement(this.storage, { ...ach, ownerId });
+              if (result?.ok) {
+                motDirty = true;
+                motNotices.push({
+                  text: `Achievement · ${ach.title || ach.summary || 'Unlocked'}`,
+                  mark: '★',
+                  characterId: ownerId,
+                });
+              }
+            }
+            for (const secret of parsed.secrets || []) {
+              const result = applySlateSecret(this.storage, secret);
+              if (result?.ok) {
+                motDirty = true;
+                motNotices.push({
+                  text: `Secret · ${secret.title || secret.subject || 'Filed'}`,
+                  mark: '?',
+                  characterId: result.ownerId || ownerId || '',
+                });
+              }
+            }
+          }
+          for (const rep of parsed.reps || []) {
+            let payload = {
+              fromName: rep.from,
+              toName: rep.to,
+              direction: rep.direction,
+              take: rep.reading,
+              cause: rep.cause,
+            };
+            if (motOn) {
+              const result = applySlateRumor(this.storage, rep);
+              if (result?.ok) {
+                motDirty = true;
+                payload = result;
+              }
+            }
+            if (connOn) this.bus?.emit('reputation.slateApply', payload);
+          }
+          mes.extra.showtimeSlateSig = sig;
+          dirty = true;
+          if (hookDirty) {
+            this.saveState();
+            this.bus?.emit('cast.updated', {});
+            if (!silent && hookNotices.length) {
+              this.bus?.emit('showtime.notice', { kind: 'hook', items: hookNotices });
+            }
+          }
+          if (motDirty) {
+            this.saveState();
+            this.bus?.emit('motivation.updated', {});
+            if (!silent && motNotices.length) {
+              this.bus?.emit('showtime.notice', { kind: 'motivation', items: motNotices });
+            }
+          }
+        }
+      } else if (mes.extra.showtimeSlate && mes.extra.showtimeSlateBody !== stripped) {
+        delete mes.extra.showtimeSlate;
+        delete mes.extra.showtimeSlateSig;
+        delete mes.extra.showtimeSlateBody;
+        dirty = true;
+      }
+
+      if (dirty && persist) saveChatDebounced();
+      if (silent) return;
+
+      const slate = mes.extra.showtimeSlate;
+      const root = document.querySelector(`#chat .mes[mesid="${idx}"]`)
+        || document.querySelector(`.mes[mesid="${idx}"]`);
+      const mesText = root?.querySelector('.mes_text');
+      if (!mesText) return;
+      mesText.querySelectorAll('.st-chat-slate').forEach(el => el.remove());
+      mesText.querySelectorAll('.st-chat-file, aside.st-file').forEach(el => el.remove());
+      stripSlateFromElement(mesText);
+      const html = buildChatSlateHtml(slate);
+      const intelHtml = buildChatIntelHtml(slate);
+      const fileIds = Array.isArray(mes.extra.showtimeFiles) ? mes.extra.showtimeFiles : [];
+      for (const row of [...fileIds].reverse()) {
+        const file = findFile(this.storage, row?.id);
+        const fileHtml = buildChatFileHtml(file);
+        if (fileHtml) mesText.insertAdjacentHTML('afterbegin', fileHtml);
+      }
+      if (html) mesText.insertAdjacentHTML('afterbegin', html);
+      if (intelHtml) mesText.insertAdjacentHTML('afterbegin', intelHtml);
+      this._paintReceipt(idx, mes, { silent });
     } catch (err) {
-      console.warn('[Showtime Cast] chat display name', err);
+      console.warn('[Showtime Cast] chat slate', err);
     }
   }
 
@@ -417,44 +871,171 @@ export class CastModule extends Module {
     return cueOtherNames(this.storage, char, extra);
   }
 
+  _cueFaceUrl(cue, char) {
+    const portrait = sanitizeMediaUrl(cue?.portrait || char?.portrait);
+    // force_avatar gets written straight into the persisted chat message, not
+    // just rendered once — a raw base64 data URL (vs. a short hosted URL or
+    // thumbnail path) re-bloats the chat file by its full size on every single
+    // turn this character is cued, and can freeze the tab trying to paint a
+    // multi-megabyte <img src>. Fall back to a thumbnail/default instead of
+    // ever inlining something that large into force_avatar.
+    if (portrait && !(portrait.startsWith('data:') && portrait.length > INLINE_PORTRAIT_CAP)) return portrait;
+    const cardId = String(cue?.cardId || char?.characterCardId || '').trim();
+    if (cardId) {
+      try {
+        const thumb = sanitizeMediaUrl(getThumbnailUrl('avatar', cardId));
+        if (thumb) return thumb;
+      } catch { /* ignore */ }
+    }
+    return 'img/ai4.png';
+  }
+
+  _paintCueChrome(idx, mes, cue) {
+    const char = this._find(cue.id);
+    mes.name = cue.name || mes.name;
+    mes.force_avatar = this._cueFaceUrl(cue, char);
+    if (cue.cardId) mes.original_avatar = cue.cardId;
+    mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
+    mes.extra.showtimeCastId = cue.id;
+    const root = document.querySelector(`#chat .mes[mesid="${idx}"]`)
+      || document.querySelector(`.mes[mesid="${idx}"]`);
+    if (!root) return;
+    root.setAttribute('ch_name', mes.name || '');
+    root.setAttribute('force_avatar', 'true');
+    const nameEl = root.querySelector('.name_text');
+    if (nameEl && mes.name) nameEl.textContent = mes.name;
+    const face = root.querySelector('.avatar img');
+    const cueSrc = sanitizeMediaUrl(mes.force_avatar);
+    if (face && cueSrc) face.setAttribute('src', cueSrc);
+  }
+
+  _paintPendingCue(messageId) {
+    const cue = this._pendingCue;
+    if (!cue) return false;
+    try {
+      const idx = Number(messageId);
+      const mes = getContext()?.chat?.[idx];
+      if (!Number.isFinite(idx) || !mes || mes.is_user || mes.is_system) return false;
+      if (this._cuePaintedIdx === idx && mes.extra?.showtimeCastId === cue.id) return true;
+      this._paintCueChrome(idx, mes, cue);
+      this._cuePaintedIdx = idx;
+      return true;
+    } catch (err) {
+      console.warn('[Showtime Cast] cue paint', err);
+      return false;
+    }
+  }
+
   _stampCueMessage(messageId) {
     const cue = this._pendingCue;
     if (!cue) return;
     let scene = '';
+    let painted = false;
     try {
       const ctx = getContext();
       const idx = Number(messageId);
       const mes = ctx.chat?.[idx];
       if (!mes || mes.is_user || mes.is_system) return;
+      const rawBody = String(mes.mes || '').trim();
+      if (this._cueGenStopped || !rawBody) {
+        this._sheetAutoCue = false;
+        this._pendingCue = null;
+        this._pendingCueText = '';
+        this._cuePaintedIdx = -1;
+        setActiveCastCue(null);
+        this._flushCueSheetWaiters('stopped');
+        if (this.container) this._renderCueSheet();
+        return;
+      }
+      painted = true;
       const others = this._cueOthers(this._find(cue.id) || { id: cue.id, name: cue.name });
+      const ownsOpening = cueOwnsOpening(mes.mes, cue.name, others);
+      if (!ownsOpening) {
+        this._sheetAutoCue = false;
+        this._pendingCue = null;
+        this._pendingCueText = '';
+        this._cuePaintedIdx = -1;
+        setActiveCastCue(null);
+        this._flushCueSheetWaiters('stamped');
+        return;
+      }
       const clipped = clipCueToPov(String(mes.mes || ''), { speaker: cue.name, others });
-      if (clipped && clipped !== mes.mes) mes.mes = clipped;
+      if (clipped && clipped !== mes.mes) {
+        mes.mes = clipped;
+        try { updateMessageBlock(idx, mes, { rerenderMessage: true }); } catch { /* ignore */ }
+      } else {
+        try { updateMessageBlock(idx, mes, { rerenderMessage: false }); } catch { /* ignore */ }
+      }
       scene = String(mes.mes || '');
-      mes.name = cue.name || mes.name;
-      if (cue.portrait) mes.force_avatar = cue.portrait;
-      if (cue.cardId) mes.original_avatar = cue.cardId;
-      mes.extra = mes.extra && typeof mes.extra === 'object' ? mes.extra : {};
-      mes.extra.showtimeCastId = cue.id;
-      try { updateMessageBlock(idx, mes, { rerenderMessage: false }); } catch { /* ignore */ }
-      const root = document.querySelector(`#chat .mes[mesid="${idx}"]`);
-      const nameEl = root?.querySelector('.name_text');
-      if (nameEl && cue.name) nameEl.textContent = cue.name;
-      const face = root?.querySelector('.avatar img');
-      if (face && mes.force_avatar) face.setAttribute('src', mes.force_avatar);
+      this._paintCueChrome(idx, mes, cue);
+      try {
+        noteHouseHealth(this.storage, {
+          cue: { status: 'painted', detail: `${cue.name || 'Cast'} #${idx}` },
+        });
+      } catch { /* ignore */ }
       saveChatDebounced();
     } catch (err) {
       console.warn('[Showtime Cast] cue stamp', err);
     } finally {
-      this._pendingCue = null;
-      this._pendingCueText = '';
-      this.bus.emit('showtime.stateChanged');
+      if (painted) {
+        if (this._sheetAutoCue && !this._cueSheetRun) {
+          const sheet = this._cueSheetState();
+          const prevCursor = Number(sheet.cursor) || 0;
+          this._lastCueStamped = { idx: Number(messageId), prevCursor };
+          const nextCursor = advanceCueSheetIndex(sheet.mode, prevCursor, sheet.slots.length);
+          sheet.cursor = nextCursor;
+          this._sheetAutoCue = false;
+          try { this.saveState(); } catch { /* ignore */ }
+          if (this.container) this._renderCueSheet();
+          // The cued line hands off. Keep calling down the sheet without
+          // another user message. A wrap (repeat / until disrupted) stops
+          // here so one Send cannot loop the sheet forever.
+          const follow = planCueSheetStep({
+            slots: sheet.slots,
+            mode: sheet.mode,
+            index: nextCursor,
+            members: this._cueSheetMembers(),
+          });
+          if (follow.kind === 'cue' && nextCursor > prevCursor) {
+            queueMicrotask(() => {
+              this.callCueSheet({ resume: true }).catch(err => {
+                console.warn('[Cast cue sheet]', err);
+              });
+            });
+          }
+        }
+        this._pendingCue = null;
+        this._pendingCueText = '';
+        this._cuePaintedIdx = -1;
+        setActiveCastCue(null);
+        this._flushCueSheetWaiters('stamped');
+        this.bus.emit('showtime.stateChanged');
+      }
     }
-    if (cue.priority !== 'director' && scene.trim().length >= 40) {
+    if (painted && cue.priority !== 'director' && scene.trim().length >= 40) {
       this._fileCueTakes(cue, scene).catch(err => console.warn('[Showtime Cast] cue take file', err));
     }
   }
 
   async _fileCueTakes(cue, scene) {
+    if (!cue?.id) return;
+    if (this._cueSheetRun) {
+      this._deferredCueTakes = this._deferredCueTakes || [];
+      this._deferredCueTakes.push({ cue: { ...cue }, scene });
+      return;
+    }
+    await this._fileCueTakeNow(cue, scene);
+  }
+
+  _flushDeferredCueTakes() {
+    const queued = this._deferredCueTakes || [];
+    this._deferredCueTakes = [];
+    for (const row of queued) {
+      this._fileCueTakeNow(row.cue, row.scene).catch(err => console.warn('[Showtime Cast] cue take file', err));
+    }
+  }
+
+  async _fileCueTakeNow(cue, scene) {
     if (this._cueTakeBusy || !cue?.id) return;
     const char = this._find(cue.id);
     if (!char || char.priority === 'director') return;
@@ -489,19 +1070,7 @@ export class CastModule extends Module {
     }
   }
 
-  /**
-   * Arm a one-shot prompt and generate the next reply as this cast member.
-   * Group chats force the linked ST card (Director’s card if none is linked).
-   */
-  async cueCast(char, { directorBeat = '' } = {}) {
-    if (!char || char.priority === 'star') {
-      alert('Pick a cast member (not the Star).');
-      return;
-    }
-    if (normalizePresence(char) === 'writtenOut') {
-      alert('That cast member is written out. Mark them In play or Absent first.');
-      return;
-    }
+  _prepareCue(char, { directorBeat = '' } = {}) {
     const ctx = getContext();
     const characters = ctx.characters ?? [];
     const target = resolveCueGenerationTarget(this.storage, char, {
@@ -519,6 +1088,7 @@ export class CastModule extends Module {
     else if (!char.characterCardId && !char.personaId) cardDump = 'own';
 
     const display = this._resolveDisplay(char);
+    this._cuePaintedIdx = -1;
     this._pendingCue = {
       id: char.id,
       name: display.name,
@@ -526,6 +1096,7 @@ export class CastModule extends Module {
       cardId: char.characterCardId || '',
       priority: char.priority || '',
     };
+    setActiveCastCue(this._pendingCue);
     const others = this._cueOthers(char);
     this._pendingCueText = buildCastCuePrompt(this.storage, char, {
       characters,
@@ -535,8 +1106,189 @@ export class CastModule extends Module {
       others,
     });
     this.bus.emit('showtime.stateChanged');
+    return { canForce, target };
+  }
+
+  /**
+   * Capture Send and Enter before SillyTavern's own handler.
+   * Group Send then generates as the gold-bar slot's linked card.
+   */
+  _installCueSendHook() {
+    if (this._cueSendHooked) return;
+    this._cueSendHooked = true;
+    document.addEventListener('click', (event) => {
+      const el = event.target;
+      if (!(el instanceof Element) || !el.closest('#send_but')) return;
+      this._takeCueSend(event);
+    }, true);
+    document.addEventListener('keydown', (event) => this._onCueSendKey(event), true);
+  }
+
+  _onCueSendKey(event) {
+    if (event.key !== 'Enter' || event.isComposing || event.shiftKey || event.altKey) return;
+    const box = document.getElementById('send_textarea');
+    if (!box || document.activeElement !== box) return;
+    const ctx = getContext();
+    if (ctx?.Popup?.util?.isPopupOpen?.()) return;
+    const sendOnEnter = typeof ctx?.shouldSendOnEnter === 'function' && ctx.shouldSendOnEnter();
+    if (!sendOnEnter) return;
+    if (event.ctrlKey && !String(box.value || '')) return;
+    this._takeCueSend(event);
+  }
+
+  _takeCueSend(event) {
+    if (this._cueSendBusy || isGenerating()) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    if (swipeState !== SWIPE_STATE.NONE || isExecutingCommandsFromChatInput) return;
+    const chid = this._nextSheetForceChid();
+    if (!Number.isInteger(chid)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    this._cueSendBusy = true;
+    void this._generateCueSend(chid).finally(() => {
+      this._cueSendBusy = false;
+    });
+  }
+
+  /** Linked card for the gold-bar slot, when that card is in the open group. */
+  _nextSheetForceChid() {
+    if (this._pendingCue || this._cueSheetRun) return null;
+    const ctx = getContext();
+    if (!ctx?.groupId) return null;
+    const sheet = this._cueSheetState();
+    if (!sheet.slots.length) return null;
+    const step = planCueSheetStep({
+      slots: sheet.slots,
+      mode: sheet.mode,
+      index: sheet.cursor || 0,
+      members: this._cueSheetMembers(),
+    });
+    if (step.kind !== 'cue') return null;
+    const char = this._find(step.slot.characterId);
+    if (!char || char.priority === 'star') return null;
+    if (normalizePresence(char) === 'writtenOut') return null;
+    const characters = ctx.characters ?? [];
+    const target = resolveCueGenerationTarget(this.storage, char, {
+      characters,
+      characterId: ctx.characterId,
+    });
+    const group = (ctx.groups || []).find(g => g && g.id === ctx.groupId);
+    return forceChidForGroupCue(target, {
+      characters,
+      groupMembers: group?.members || null,
+    });
+  }
+
+  async _generateCueSend(chid) {
+    this._armSheetCue();
+    try { this.injector?.refreshAlwaysOn?.(); } catch { /* cue prompt must land before Generate */ }
+    const ctx = getContext();
+    await beginUserGeneration();
+    try {
+      if (typeof ctx.generate === 'function') await ctx.generate('normal', { force_chid: chid });
+    } catch (err) {
+      this._pendingCue = null;
+      this._pendingCueText = '';
+      this._sheetAutoCue = false;
+      this._cuePaintedIdx = -1;
+      setActiveCastCue(null);
+      this._flushCueSheetWaiters('failed');
+      this.bus.emit('showtime.stateChanged');
+      console.warn('[Cast cue send]', err);
+    } finally {
+      endUserGeneration();
+    }
+  }
+
+  /**
+   * True when this generation already belongs to someone else.
+   * Guided Response leaves an `instruct` inject, then /trigger names a member.
+   */
+  _guidedSteerActive() {
+    try {
+      const inject = getContext()?.chatMetadata?.script_injects?.instruct;
+      return Boolean(inject && String(inject.value || '').trim());
+    } catch {
+      return false;
+    }
+  }
+
+  _cueYieldsToCaller(opts) {
+    return cueShouldYieldSpeaker({
+      forceChid: opts?.force_chid,
+      alreadyArmed: Boolean(this._pendingCue) || Boolean(this._cueSheetRun),
+      guidedSteer: this._guidedSteerActive(),
+    });
+  }
+
+  /**
+   * A sheet pass must not send whatever is sitting in the box. Guided Response
+   * puts the steer back after /trigger, and a follow-up Generate would post
+   * it as the Star.
+   * @returns {() => void}
+   */
+  _holdSendDraft() {
+    const box = document.getElementById('send_textarea');
+    if (!box) return () => {};
+    const saved = String(box.value || '');
+    if (!saved) return () => {};
+    box.value = '';
+    try { box.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* ignore */ }
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      if (String(box.value || '')) return;
+      box.value = saved;
+      try { box.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* ignore */ }
+    };
+  }
+
+  /** Next Cue Sheet slot becomes this generation, following the arrow order. */
+  _armSheetCue({ holdCursor = false } = {}) {
+    if (this._pendingCue || this._cueSheetRun) return;
+    const sheet = this._cueSheetState();
+    if (!sheet.slots.length) return;
+    const step = planCueSheetStep({
+      slots: sheet.slots,
+      mode: sheet.mode,
+      index: sheet.cursor || 0,
+      members: this._cueSheetMembers(),
+    });
+    if (step.kind !== 'cue') return;
+    const char = this._find(step.slot.characterId);
+    if (!char || char.priority === 'star') return;
+    if (normalizePresence(char) === 'writtenOut') return;
+    sheet.cursor = step.index;
+    this._sheetAutoCue = !holdCursor;
+    this._prepareCue(char, { directorBeat: step.slot.beat });
+  }
+
+  /**
+   * Arm a one-shot prompt and generate the next reply as this cast member.
+   * Group chats force the linked ST card (Director’s card if none is linked).
+   */
+  async cueCast(char, { directorBeat = '', fromSheet = false } = {}) {
+    if (!fromSheet && this._cueSheetRun) this.holdCueSheet();
+    if (!char || char.priority === 'star') {
+      void showtimeAlert('Pick a cast member (not the Star).', { title: 'CUE CAST' });
+      return;
+    }
+    if (normalizePresence(char) === 'writtenOut') {
+      void showtimeAlert('That cast member is written out. Mark them In play or Absent first.', { title: 'CUE CAST' });
+      return;
+    }
+    this._sheetAutoCue = false;
+    const { canForce, target } = this._prepareCue(char, { directorBeat });
+    try { this.injector?.refreshAlwaysOn?.(); } catch { /* cue prompt must land before Generate */ }
+    const ctx = getContext();
     const genOpts = {};
     if (canForce) genOpts.force_chid = target.chid;
+    await beginUserGeneration();
+    const releaseDraft = fromSheet ? this._holdSendDraft() : () => {};
     try {
       if (typeof ctx.Generate === 'function') await ctx.Generate('normal', genOpts);
       else if (typeof ctx.generate === 'function') await ctx.generate('normal', genOpts);
@@ -544,9 +1296,203 @@ export class CastModule extends Module {
     } catch (err) {
       this._pendingCue = null;
       this._pendingCueText = '';
+      this._cuePaintedIdx = -1;
+      setActiveCastCue(null);
+      this._flushCueSheetWaiters('failed');
       this.bus.emit('showtime.stateChanged');
       throw err;
+    } finally {
+      releaseDraft();
+      endUserGeneration();
     }
+  }
+
+  _cueSheetState() {
+    const next = normalizeCueSheet(this.state.cueSheet);
+    this.state.cueSheet = next;
+    return next;
+  }
+
+  _cueSheetMembers() {
+    const map = new Map();
+    for (const c of this.state.characters || []) {
+      if (!c?.id) continue;
+      map.set(c.id, {
+        id: c.id,
+        name: c.name,
+        priority: c.priority,
+        presence: normalizePresence(c),
+      });
+    }
+    return map;
+  }
+
+  _flushCueSheetWaiters(why) {
+    const list = this._cueSheetWaiters || [];
+    this._cueSheetWaiters = [];
+    for (const fn of list) {
+      try { fn(why); } catch { /* ignore */ }
+    }
+  }
+
+  _waitCueStamp(token) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      let grace = null;
+      let poll = null;
+      let sawBusy = false;
+      const finish = (why) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (grace) clearTimeout(grace);
+        if (poll) clearInterval(poll);
+        this._cueSheetWaiters = (this._cueSheetWaiters || []).filter(fn => fn !== finish);
+        resolve(why);
+      };
+      this._cueSheetWaiters = this._cueSheetWaiters || [];
+      this._cueSheetWaiters.push(finish);
+      if (this._cueSheetRun?.token !== token) {
+        finish('hold');
+        return;
+      }
+      if (!this._pendingCue) {
+        finish('idle');
+        return;
+      }
+      const tick = () => {
+        if (settled) return;
+        if (this._cueSheetRun?.token !== token) {
+          finish('hold');
+          return;
+        }
+        if (!this._pendingCue) {
+          finish('idle');
+          return;
+        }
+        if (isGenerating()) sawBusy = true;
+        else if (sawBusy) finish('missed');
+      };
+      poll = setInterval(tick, 40);
+      // Generate can return without ever flipping the busy flag (group wrapper
+      // bails on a stale "no connection"). Don't sit on the 2 minute timeout.
+      grace = setTimeout(() => {
+        if (!sawBusy && this._pendingCue && this._cueSheetRun?.token === token) finish('missed');
+      }, 700);
+      timer = setTimeout(() => finish('timeout'), 120000);
+    });
+  }
+
+  async _waitGenerationGap(token, ms = 15000) {
+    const start = Date.now();
+    while (isGenerating() && this._cueSheetRun?.token === token && Date.now() - start < ms) {
+      await new Promise(r => setTimeout(r, 40));
+    }
+  }
+
+  _chatLen() {
+    return getContext()?.chat?.length || 0;
+  }
+
+  async callCueSheet({ resume = false } = {}) {
+    if (this._cueSheetRun) return;
+    const sheet = this._cueSheetState();
+    if (!sheet.slots.length) return;
+    const token = uid();
+    if (!resume) sheet.cursor = 0;
+    const start = Math.max(0, Number(sheet.cursor) || 0);
+    try { this.saveState(); } catch { /* ignore */ }
+    this._cueSheetRun = { token, index: start };
+    this._cueSheetOpen = true;
+    this._renderCueSheet();
+    try {
+      while (this._cueSheetRun?.token === token) {
+        const live = this._cueSheetState();
+        const step = planCueSheetStep({
+          slots: live.slots,
+          mode: live.mode,
+          index: this._cueSheetRun.index,
+          members: this._cueSheetMembers(),
+        });
+        if (step.kind !== 'cue') break;
+        const char = this._find(step.slot.characterId);
+        if (!char) break;
+        this._cueSheetRun.index = step.index;
+        live.cursor = step.index;
+        try { this.saveState(); } catch { /* ignore */ }
+        this._renderCueSheet();
+        await this._waitGenerationGap(token);
+        if (this._cueSheetRun?.token !== token) break;
+        ensureUserConnection();
+        let produced = false;
+        let halted = false;
+        for (let attempt = 0; attempt < 2 && !produced && !halted; attempt++) {
+          if (attempt > 0) {
+            await this._waitGenerationGap(token);
+            if (this._cueSheetRun?.token !== token) { halted = true; break; }
+            ensureUserConnection();
+          }
+          const before = this._chatLen();
+          try {
+            await this.cueCast(char, { directorBeat: step.slot.beat, fromSheet: true });
+          } catch (err) {
+            console.warn('[Cast cue sheet]', err);
+            if (attempt === 0) continue;
+            live.cursor = 0;
+            try { this.saveState(); } catch { /* ignore */ }
+            halted = true;
+            break;
+          }
+          if (this._cueSheetRun?.token !== token) { halted = true; break; }
+          const waited = await this._waitCueStamp(token);
+          if (waited === 'stopped' || waited === 'hold') { halted = true; break; }
+          if (this._chatLen() > before) { produced = true; break; }
+          if (waited === 'failed') { halted = true; break; }
+        }
+        if (halted || this._cueSheetRun?.token !== token) {
+          if (halted && this._cueSheetRun?.token === token && !produced) {
+            const stoppedSheet = this._cueSheetState();
+            stoppedSheet.cursor = 0;
+            try { this.saveState(); } catch { /* ignore */ }
+          }
+          break;
+        }
+        if (!produced) break;
+        const liveSheet = this._cueSheetState();
+        const nextIndex = advanceCueSheetIndex(
+          liveSheet.mode,
+          step.index,
+          liveSheet.slots.length,
+        );
+        // Send chains the rest of this pass. Repeat / until-disrupted keep
+        // looping only when the user pressed Call.
+        if (resume && nextIndex <= step.index) break;
+        this._cueSheetRun.index = nextIndex;
+        liveSheet.cursor = nextIndex >= liveSheet.slots.length ? 0 : nextIndex;
+        try { this.saveState(); } catch { /* ignore */ }
+      }
+    } finally {
+      if (this._cueSheetRun?.token === token) this.holdCueSheet({ resetCursor: false });
+    }
+  }
+
+  holdCueSheet({ resetCursor = true } = {}) {
+    const sheet = this._cueSheetState();
+    const hadRun = Boolean(this._cueSheetRun) || Boolean((this._cueSheetWaiters || []).length);
+    const hadCursor = (Number(sheet.cursor) || 0) > 0;
+    if (!hadRun && !hadCursor && !this._pendingCue) {
+      return;
+    }
+    this._cueSheetRun = null;
+    if (resetCursor) {
+      sheet.cursor = 0;
+      this._lastCueStamped = null;
+      try { this.saveState(); } catch { /* ignore */ }
+    }
+    this._flushCueSheetWaiters('hold');
+    this._flushDeferredCueTakes();
+    if (this.container) this._renderCueSheet();
   }
 
   _resetStatusTrackCursor() {
@@ -609,8 +1555,9 @@ export class CastModule extends Module {
         const mode = d.levelMode || 'label';
         const flipped = !!(d.fromState && d.toState && d.fromState !== d.toState);
         if (!flipped) continue;
+        const why = d.lines?.length ? ` — ${d.lines.join('; ')}` : '';
         if (THRESHOLD_NOTIFY_STATS.has(d.id)) {
-          alerts.push(`[Note: ${name}'s ${d.label} is now ${d.toState}]`);
+          alerts.push(`[Note: ${name}'s ${d.label} is now ${d.toState}${why}]`);
         }
         if (!isStar) continue;
         if (mode === 'none' || mode === 'amount') continue;
@@ -619,12 +1566,19 @@ export class CastModule extends Module {
           label: d.label,
           fromState: d.fromState,
           toState: d.toState,
+          threshold: true,
+          lines: d.lines || [],
         });
       }
       if (!isStar) continue;
       for (const ch of row.kit || []) {
-        if (ch.kind === 'condition') {
-          items.push({ name, label: 'Condition', fromState: '', toState: ch.toCondition || 'updated' });
+        if (ch.kind === 'condition' || ch.kind === 'conditions') {
+          items.push({
+            name,
+            label: ch.name || 'Condition',
+            fromState: ch.fromCondition || '',
+            toState: ch.toCondition || ch.action || 'updated',
+          });
         } else if (ch.action === 'add') {
           items.push({ name, label: ch.name, fromState: '', toState: ch.kind === 'wardrobe' ? 'wearing' : 'carried' });
         } else if (ch.action === 'remove') {
@@ -644,7 +1598,15 @@ export class CastModule extends Module {
   }
 
   getDefaultState() {
-    return { characters: [], sortBy: 'priority', filterQuery: '', hiddenRoles: [], hiddenPresence: [...DEFAULT_HIDDEN_PRESENCE] };
+    return {
+      characters: [],
+      sortBy: 'priority',
+      filterQuery: '',
+      hiddenRoles: [],
+      hiddenPresence: [...DEFAULT_HIDDEN_PRESENCE],
+      autoPresence: true,
+      cueSheet: defaultCueSheet(),
+    };
   }
 
   _hiddenRoles() {
@@ -709,13 +1671,24 @@ export class CastModule extends Module {
   async onChatChanged() {
     this._expandedIds = new Set();
     this._resetStatusTrackCursor();
-    if (this.container) await this.render(this.container);
+  }
+
+  /** A Star with no stats object yet tracks health and energy. An explicit off stays off. */
+  _ensureStarStats() {
+    let changed = false;
+    for (const c of this.state.characters || []) {
+      if (c?.priority !== 'star' || c.stats) continue;
+      c.stats = { ...DEFAULT_STATS(), enabled: true };
+      changed = true;
+    }
+    if (changed) this.saveState();
   }
 
   // ─── render ──────────────────────────────────────────────────────────────────
 
   async render(container) {
     this.container = container;
+    this._ensureStarStats();
     const s = this.state;
     s.hiddenRoles = this._hiddenRoles();
     s.hiddenPresence = this._hiddenPresence();
@@ -724,6 +1697,7 @@ export class CastModule extends Module {
     const hideP = s.hiddenPresence.length;
     const filterOn = hideN > 0 || hideP !== DEFAULT_HIDDEN_PRESENCE.length
       || s.hiddenPresence.some(id => !DEFAULT_HIDDEN_PRESENCE.includes(id));
+    const canShowAll = hideN > 0 || hideP > 0;
     // Detach any previously portaled roles body before wiping the pane
     document.querySelectorAll('.cast-roles-pop-body').forEach(n => {
       if (n.parentElement === document.body) n.remove();
@@ -754,13 +1728,15 @@ export class CastModule extends Module {
                 <input type="checkbox" data-presence-hide="${esc(v.id)}" ${s.hiddenPresence.includes(v.id) ? '' : 'checked'}>
                 <span>${esc(v.label)}</span>
               </label>`).join('')}
-            <button type="button" class="cast-btn" data-role="roles-show-all" ${filterOn ? '' : 'disabled'}>Show all</button>
+            <button type="button" class="cast-btn" data-role="roles-show-all" title="Show every role, including absent and written out" ${canShowAll ? '' : 'disabled'}>Show all</button>
           </div>
         </details>
         <button class="cast-btn" data-role="import" title="Import characters from current chat">+ From Chat</button>
         <button class="cast-btn" data-role="import-personas" title="Import from user personas">+ From Personas</button>
+        <button class="cast-btn" data-role="file-receipt" title="File a turn receipt now" ${this._receiptTrackingOn() ? '' : 'disabled'}>Receipt</button>
         <button class="cast-btn" data-role="add">+ Cast</button>
       </div>
+      <details class="cast-cue-sheet" data-role="cue-sheet"></details>
       <div class="cast-list" data-role="list"></div>
       </div>
     `;
@@ -790,7 +1766,7 @@ export class CastModule extends Module {
         sum.classList.toggle('cast-btn--active', on);
       }
       const showAll = rolesBody?.querySelector('[data-role="roles-show-all"]');
-      if (showAll) showAll.disabled = !on;
+      if (showAll) showAll.disabled = n === 0 && p === 0;
     };
     rolesBody?.addEventListener('change', e => {
       const roleInp = e.target.closest('[data-role-hide]');
@@ -821,10 +1797,154 @@ export class CastModule extends Module {
       this.saveState();
       this.render(this.container);
     });
+    container.querySelector('[data-role="file-receipt"]')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      this._fileReceiptNow(e.currentTarget);
+    });
     container.querySelector('[data-role="add"]').addEventListener('click', () => this._openCastingCall());
     container.querySelector('[data-role="import"]').addEventListener('click', () => this._openImportFromChat());
     container.querySelector('[data-role="import-personas"]').addEventListener('click', () => this._openImportFromPersonas());
     this._renderList();
+    this._renderCueSheet();
+  }
+
+  _renderCueSheet() {
+    const wrap = this.container?.querySelector('[data-role="cue-sheet"]');
+    if (!wrap) return;
+    const sheet = this._cueSheetState();
+    const running = Boolean(this._cueSheetRun);
+    const liveIndex = running ? this._cueSheetRun.index : -1;
+    if (!this._cueSheetHydrated) {
+      this._cueSheetOpen = this._cueSheetOpen || sheet.slots.length > 0;
+      this._cueSheetHydrated = true;
+    }
+    const open = this._cueSheetOpen || running;
+    const members = this.state.characters || [];
+    const addOpts = members
+      .filter(c => c && c.priority !== 'star')
+      .map(c => {
+        const presence = normalizePresence(c);
+        const display = this._resolveDisplay(c);
+        const tag = presence === 'writtenOut' ? ' (written out)'
+          : presence === 'absent' ? ' (absent)' : '';
+        return `<option value="${esc(c.id)}" ${presence === 'writtenOut' ? 'disabled' : ''}>${esc(display.name || c.name || 'Unnamed')}${tag}</option>`;
+      })
+      .join('');
+    const modeOpts = CUE_SHEET_MODES.map(id => {
+      const meta = CUE_SHEET_MODE_META[id];
+      return `<option value="${esc(id)}" ${sheet.mode === id ? 'selected' : ''}>${esc(meta.label)}</option>`;
+    }).join('');
+    const slotsHtml = sheet.slots.length
+      ? sheet.slots.map((slot, i) => {
+        const char = this._find(slot.characterId);
+        const display = char ? this._resolveDisplay(char) : null;
+        const name = display?.name || char?.name || 'Missing';
+        const nextIdx = running ? liveIndex : (Number(sheet.cursor) || 0);
+        const live = i === nextIdx ? (running ? ' is-live' : ' is-next') : '';
+        const dis = running ? 'disabled' : '';
+        return `
+          <div class="cast-cue-slot${live}" data-slot-id="${esc(slot.id)}">
+            <span class="cast-cue-slot-name" title="${esc(name)}">${esc(name)}</span>
+            <input type="text" class="cast-cue-slot-beat" data-slot-beat placeholder="Direction (optional)" value="${esc(slot.beat)}" ${dis}>
+            <button type="button" class="cast-btn small" data-slot-up title="Move up" ${dis || i === 0 ? 'disabled' : ''}>↑</button>
+            <button type="button" class="cast-btn small" data-slot-down title="Move down" ${dis || i === sheet.slots.length - 1 ? 'disabled' : ''}>↓</button>
+            <button type="button" class="cast-btn small danger" data-slot-remove title="Remove" ${dis}>×</button>
+          </div>`;
+      }).join('')
+      : `<div class="cast-cue-sheet-empty">Add who speaks next, in order. Each slot is a Cue.</div>`;
+    const star = (this.state.characters || []).find(c => c?.priority === 'star') || getStarMember(this.storage);
+    const starName = star ? (this._resolveDisplay(star).name || star.name || 'Star') : 'Star';
+    const autoOn = this.state.autoPresence !== false;
+    wrap.innerHTML = `
+      <summary class="cast-cue-sheet-sum">Cue Sheet${running ? ' · live' : ''}${sheet.slots.length ? ` · ${sheet.slots.length}` : ''}</summary>
+      <div class="cast-cue-sheet-body">
+        <div class="cast-cue-sheet-head" title="The Star is the scene lead. Cued turns are credited to the listed cast, not the Director.">
+          Head · ${esc(starName)}
+          <span class="cast-row-badge" style="border-color:var(--st-ink);color:var(--st-ink)">Star</span>
+        </div>
+        <div class="cast-cue-sheet-toolbar">
+          <select data-role="cue-sheet-mode" ${running ? 'disabled' : ''}>${modeOpts}</select>
+          <button type="button" class="cast-btn gold" data-role="cue-sheet-call" ${running || !sheet.slots.length ? 'disabled' : ''}>Call</button>
+          <button type="button" class="cast-btn" data-role="cue-sheet-hold" ${running || (Number(sheet.cursor) || 0) > 0 ? '' : 'disabled'}>Hold</button>
+          <button type="button" class="cast-btn${autoOn ? ' cast-btn--active' : ''}" data-role="auto-presence" title="Auto marks cast In play when named or in the current room, and Absent otherwise. Written out stays. Manual leaves presence where you set it.">In Play: ${autoOn ? 'Auto' : 'Manual'}</button>
+        </div>
+        <div class="cast-cue-sheet-slots">${slotsHtml}</div>
+        <div class="cast-cue-sheet-add">
+          <select data-role="cue-sheet-add" ${running ? 'disabled' : ''}>
+            <option value="">Add to sheet…</option>
+            ${addOpts}
+          </select>
+        </div>
+      </div>`;
+    wrap.open = open;
+    wrap.ontoggle = () => {
+      this._cueSheetOpen = wrap.open;
+    };
+    wrap.querySelector('[data-role="cue-sheet-mode"]')?.addEventListener('change', e => {
+      const next = String(e.target.value || 'once');
+      this.state.cueSheet.mode = CUE_SHEET_MODES.includes(next) ? next : 'once';
+      this.saveState();
+    });
+    wrap.querySelector('[data-role="cue-sheet-call"]')?.addEventListener('click', () => {
+      this.callCueSheet().catch(err => {
+        console.warn('[Cast cue sheet]', err);
+        void showtimeAlert(`Cue Sheet failed: ${err?.message || err}`, { title: 'CUE SHEET', danger: true });
+      });
+    });
+    wrap.querySelector('[data-role="cue-sheet-hold"]')?.addEventListener('click', () => this.holdCueSheet());
+    wrap.querySelector('[data-role="auto-presence"]')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      this.state.autoPresence = this.state.autoPresence === false;
+      this.saveState();
+      this._renderCueSheet();
+    });
+    wrap.querySelector('[data-role="cue-sheet-add"]')?.addEventListener('change', e => {
+      const id = String(e.target.value || '').trim();
+      e.target.value = '';
+      if (!id || running) return;
+      const slot = makeCueSheetSlot(id);
+      if (!slot) return;
+      this._cueSheetState().slots.push(slot);
+      this.saveState();
+      this._renderCueSheet();
+    });
+    wrap.querySelectorAll('[data-slot-beat]').forEach(el => {
+      el.addEventListener('input', () => {
+        const row = el.closest('[data-slot-id]');
+        const slot = this._cueSheetState().slots.find(s => s.id === row?.dataset.slotId);
+        if (!slot) return;
+        slot.beat = clipCueSheetBeat(el.value);
+        this.saveState();
+      });
+    });
+    wrap.querySelectorAll('[data-slot-up]').forEach(el => {
+      el.addEventListener('click', () => {
+        const id = el.closest('[data-slot-id]')?.dataset.slotId;
+        this.state.cueSheet.slots = moveCueSheetSlot(this._cueSheetState().slots, id, -1);
+        this.state.cueSheet.cursor = 0;
+        this.saveState();
+        this._renderCueSheet();
+      });
+    });
+    wrap.querySelectorAll('[data-slot-down]').forEach(el => {
+      el.addEventListener('click', () => {
+        const id = el.closest('[data-slot-id]')?.dataset.slotId;
+        this.state.cueSheet.slots = moveCueSheetSlot(this._cueSheetState().slots, id, 1);
+        this.state.cueSheet.cursor = 0;
+        this.saveState();
+        this._renderCueSheet();
+      });
+    });
+    wrap.querySelectorAll('[data-slot-remove]').forEach(el => {
+      el.addEventListener('click', () => {
+        const id = el.closest('[data-slot-id]')?.dataset.slotId;
+        const live = this._cueSheetState();
+        live.slots = live.slots.filter(s => s.id !== id);
+        live.cursor = 0;
+        this.saveState();
+        this._renderCueSheet();
+      });
+    });
   }
 
   _renderList() {
@@ -845,10 +1965,12 @@ export class CastModule extends Module {
     const p = priorityMeta(c.priority);
     const display = this._resolveDisplay(c);
     const presence = normalizePresence(c);
-    const portrait = display.portrait
-      ? `<img src="${esc(display.portrait)}" alt="">`
+    const portraitUrl = sanitizeMediaUrl(display.portrait);
+    const portrait = portraitUrl
+      ? `<img src="${esc(portraitUrl)}" alt="">`
       : esc((display.name || '?').charAt(0).toUpperCase());
-    const inScene = c.characterCardId && this._getInCurrentChat().has(c.characterCardId);
+    const inPlay = c.priority !== 'director' && presence === 'inPlay';
+    const isPrivy = c.priority !== 'director' && presence === 'privy';
     const isExp = this._expandedIds.has(c.id);
     let standMeter = '';
     if (c.priority !== 'director' && c.priority !== 'star') {
@@ -860,18 +1982,33 @@ export class CastModule extends Module {
     }
     const cls = [
       'cast-row', c.priority, isExp && 'expanded',
-      inScene && 'in-scene',
+      inPlay && 'in-scene',
+      isPrivy && 'cast-privy',
       presence === 'absent' && 'cast-absent',
       presence === 'writtenOut' && 'cast-written-out',
     ].filter(Boolean).join(' ');
-    const presenceMeta = PRESENCE[presence];
+    const presenceMeta = PRESENCE[presence] || PRESENCE.inPlay;
     const presenceTitle = c.priority === 'star'
       ? (presence === 'absent'
-        ? 'Absent — persona, profile, and Star card stay out of generation'
-        : 'In play — persona injects as usual')
+        ? 'Absent — parked at last-known; persona, profile, and Star card stay out of generation'
+        : presence === 'privy'
+          ? 'Privy — listening in remotely from outside the room; privy to what happens without being physically in the room'
+          : 'In play — persona injects as usual')
       : presenceMeta.title;
+    const presenceOrder = c.priority === 'star' ? STAR_PRESENCE_ORDER : PRESENCE_ORDER;
     const presenceBtn = c.priority !== 'director'
-      ? `<button class="cast-btn small" data-action="presence" title="${esc(presenceTitle)}">${esc(presenceMeta.label)}</button>`
+      ? `<select class="cast-presence${isPrivy ? ' cast-btn--privy' : ''}" data-action="presence" title="${esc(presenceTitle)}" aria-label="Presence for ${esc(display.name || 'cast')}">
+          ${presenceOrder.map(id => {
+            const meta = PRESENCE[id];
+            return `<option value="${esc(id)}"${id === presence ? ' selected' : ''}>${esc(meta.label)}</option>`;
+          }).join('')}
+        </select>`
+      : '';
+    const presencePinned = c.presenceAuto === false;
+    const pinBtn = c.priority !== 'director' && c.priority !== 'star'
+      ? `<button class="cast-btn small${presencePinned ? ' cast-btn--active' : ''}" data-action="pin-presence" title="${presencePinned
+        ? 'Presence is pinned — mentions and the room will not move this automatically. Click to let Auto presence manage it again.'
+        : 'Pin presence — stop mentions/room detection from flipping this automatically (for recurring background cast that keeps getting pulled in by name-drops).'}">${presencePinned ? '📌' : '📍'}</button>`
       : '';
     return `
       <div class="${cls}" data-id="${c.id}" style="border-left-color:${p.color}">
@@ -882,7 +2019,8 @@ export class CastModule extends Module {
               ${esc(display.name || 'Unnamed')}
               <span class="cast-row-badge" style="border-color:${p.color};color:${p.color}">${p.label}</span>
               ${c.characterCardId || c.personaId ? `<span class="cast-row-link" title="${c.personaId ? 'Linked to persona' : 'Linked to character card'}">${c.personaId ? '☆' : '⚭'}</span>` : ''}
-              ${inScene ? `<span class="cast-row-scene" title="Present in current chat">●</span>` : ''}
+              ${inPlay ? `<span class="cast-row-scene" title="In play (physically present)">●</span>` : ''}
+              ${isPrivy ? `<span class="cast-row-scene cast-row-scene--privy" title="Privy (listening in remotely — not physically in room)">◉</span>` : ''}
               ${c.replyAsId ? `<span class="cast-row-link" title="Director replies as ${esc(this._find(c.replyAsId)?.name || 'cast')}">→</span>` : ''}
             </div>
             ${normalizeAliases(c.aliases).length
@@ -894,6 +2032,7 @@ export class CastModule extends Module {
           </div>
           <div class="cast-row-actions">
             ${presenceBtn}
+            ${pinBtn}
             ${c.priority !== 'director' && c.priority !== 'star' && presence !== 'writtenOut' ? `<button class="cast-btn small gold" data-action="cue" title="Cue ${esc(display.name || 'them')} to speak">Cue</button>` : ''}
             <button class="cast-btn small" data-action="view">View</button>
             <button class="cast-btn small danger" data-action="delete">×</button>
@@ -905,10 +2044,261 @@ export class CastModule extends Module {
     `;
   }
 
+  _keyringKnown() {
+    const kindMeta = {
+      building: { hint: 'Building', group: 'Buildings' },
+      unit: { hint: 'Unit', group: 'Units' },
+      room: { hint: 'Room', group: 'Rooms' },
+    };
+    const out = [];
+    const seenId = new Set();
+    const seenName = new Set();
+    try {
+      const compass = ensureCompass(this.storage.getChat('backstage', {}) || {});
+      for (const p of Object.values(compass?.rooms || {})) {
+        const meta = kindMeta[p?.kind];
+        if (!meta) continue;
+        const id = String(p.id || '').trim();
+        if (id) {
+          if (seenId.has(id)) continue;
+          seenId.add(id);
+        }
+        const name = String(p.name || '').trim();
+        if (!name) continue;
+        const nk = name.toLowerCase();
+        if (seenName.has(nk)) continue;
+        seenName.add(nk);
+        const keys = [name, ...(p.aliases || [])]
+          .map(s => String(s || '').trim().toLowerCase())
+          .filter(Boolean);
+        out.push({
+          value: name,
+          label: name,
+          hint: meta.hint,
+          group: meta.group,
+          kind: p.kind,
+          keys,
+        });
+      }
+    } catch { /* ignore */ }
+    return out;
+  }
+
+  _keyringSanitize(tags) {
+    const ring = normalizeKeyring(tags);
+    const known = this._keyringKnown();
+    if (!known.length) return ring;
+    const allow = new Set();
+    for (const row of known) {
+      allow.add(String(row.value || '').toLowerCase());
+      for (const k of row.keys || []) allow.add(String(k || '').toLowerCase());
+    }
+    return ring.filter(t => allow.has(String(t).toLowerCase()));
+  }
+
+  _renderKeyringFold(char) {
+    const ring = this._keyringSanitize(char?.keyring);
+    return `
+      <details class="cast-info-fold"${ring.length ? ' open' : ''}>
+        <summary class="cast-info-fold-sum">Keyring${ring.length ? ` · ${ring.length}` : ''}</summary>
+        <div class="cast-info-box-body">
+          <div class="cast-modal-hint">Keys to these buildings, units, and rooms open locked doors into them. A building or unit is a master key for nested rooms; a room opens that room only.</div>
+          ${locationTagEditorHTML({
+            selected: ring,
+            fieldRole: 'keyring',
+            placeholder: 'Find a building or room…',
+            emptyHint: 'No keys yet — pick a building, unit, or room from Set.',
+            showNewBtn: false,
+            noun: 'key',
+          })}
+        </div>
+      </details>
+    `;
+  }
+
+  _bindKeyring(root, char) {
+    const ringWrap = root?.querySelector?.('[data-role="keyring"]');
+    if (!ringWrap || !char) return;
+    const cleaned = this._keyringSanitize(char.keyring);
+    if (cleaned.join('\0') !== normalizeKeyring(char.keyring).join('\0')) {
+      char.keyring = cleaned;
+      char.updatedAt = Date.now();
+      this.saveState();
+    }
+    bindLocationTagEditor(ringWrap, {
+      getKnown: () => this._keyringKnown(),
+      allowCreate: false,
+      noun: 'key',
+      emptyHint: 'No keys yet — pick a building, unit, or room from Set.',
+      onChange: (tags) => {
+        char.keyring = this._keyringSanitize(tags);
+        char.updatedAt = Date.now();
+        this.saveState();
+        this.bus.emit('cast.updated', { character: char });
+      },
+    });
+  }
+
+  _renderClosetFold(char) {
+    const outfits = normalizeOutfits(char.outfits);
+    const label = outfits.length ? `Closet · ${outfits.length}` : 'Closet';
+    return `
+      <details class="cast-info-fold"${outfits.length ? ' open' : ''}>
+        <summary class="cast-info-fold-sum">
+          <span class="cast-info-fold-label">${label}</span>
+          <button type="button" class="cast-audit" data-action="audit-outfit">Audit</button>
+        </summary>
+        <div class="cast-info-box-body" data-role="closet">
+          ${this._closetBodyHTML(char)}
+        </div>
+      </details>
+    `;
+  }
+
+  _closetBodyHTML(char) {
+    return `
+      <div class="cast-modal-hint">Preset looks they try to model with what they own. Missing pieces stay off and read unkempt in play.</div>
+      ${this._renderOutfits(char)}
+      <button type="button" class="cast-item-add" data-action="add-outfit">+ Add outfit</button>
+    `;
+  }
+
+  _bindCloset(root, char) {
+    const wrap = root?.matches?.('[data-role="closet"]')
+      ? root
+      : root?.querySelector?.('[data-role="closet"]');
+    if (!wrap || !char) return;
+    const host = wrap.closest('.cast-info-fold') || root;
+    const auditBtn = host.querySelector('[data-action="audit-outfit"]');
+    if (auditBtn && !auditBtn.dataset.bound) {
+      auditBtn.dataset.bound = '1';
+      const keepFold = (e) => e.stopPropagation();
+      auditBtn.addEventListener('pointerdown', keepFold);
+      auditBtn.addEventListener('mousedown', keepFold);
+      auditBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this._runOutfitAudit(char, e.currentTarget);
+      });
+    }
+    wrap.querySelector('[data-action="add-outfit"]')?.addEventListener('click', () =>
+      this._openOutfitDialog(char));
+    const keepFold = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    wrap.querySelectorAll('[data-action="edit-outfit"]').forEach(btn => {
+      const outfit = normalizeOutfits(char.outfits).find(o => o.id === btn.dataset.outfitId);
+      btn.addEventListener('pointerdown', keepFold);
+      btn.addEventListener('mousedown', keepFold);
+      if (outfit) btn.addEventListener('click', (e) => {
+        keepFold(e);
+        this._openOutfitDialog(char, outfit);
+      });
+    });
+    wrap.querySelectorAll('[data-action="remove-outfit"]').forEach(btn => {
+      btn.addEventListener('pointerdown', keepFold);
+      btn.addEventListener('mousedown', keepFold);
+      btn.addEventListener('click', (e) => {
+        keepFold(e);
+        char.outfits = normalizeOutfits(char.outfits).filter(o => o.id !== btn.dataset.outfitId);
+        char.updatedAt = Date.now();
+        this.saveState();
+        this.bus.emit('cast.updated', { character: char });
+        this._refreshClosetFold(char);
+        this._renderList();
+      });
+    });
+    wrap.querySelectorAll('[data-action="equip-outfit"]').forEach(btn => {
+      btn.addEventListener('pointerdown', keepFold);
+      btn.addEventListener('mousedown', keepFold);
+      btn.addEventListener('click', (e) => {
+        keepFold(e);
+        if (btn.disabled) return;
+        this._equipOutfit(char, btn.dataset.outfitId);
+      });
+    });
+  }
+
+  /**
+   * Put a closet look on: shelf and carried pieces move into the worn wardrobe.
+   * Pieces already worn by name stay. Other worn clothes stay on.
+   */
+  _equipOutfit(char, outfitId) {
+    const live = (char.outfits || []).find(o => o.id === outfitId);
+    const outfit = normalizeOutfits([live])[0];
+    if (!char || !outfit?.partIds?.length) return;
+    if (!Array.isArray(char.shelf)) char.shelf = [];
+    char.wardrobe = Array.isArray(char.wardrobe) ? char.wardrobe : [];
+    char.props = Array.isArray(char.props) ? char.props : [];
+    const isStar = char.priority === 'star';
+    const worn = this._kitLists(char).wardrobe || [];
+    const owned = this._ownedKit(char);
+    const adds = outfitPartsToWear(outfit, worn, new Map(owned.map(x => [x.id, x])));
+    if (!adds.length) return;
+    const fold = (s) => String(s || '').trim().toLowerCase();
+    const takeNamed = (list, name) => {
+      const key = fold(name);
+      const i = (list || []).findIndex(x => fold(x?.name) === key);
+      if (i < 0) return null;
+      return list.splice(i, 1)[0];
+    };
+    let changed = false;
+    for (const add of adds) {
+      const name = String(add.name || '').trim();
+      if (!name) continue;
+      const fromProps = !isStar ? takeNamed(char.props, name) : null;
+      const fromShelf = takeNamed(char.shelf, name);
+      const carried = isStar
+        ? owned.find(x => fold(x?.name) === fold(name) && x?.id !== fromShelf?.id)
+        : null;
+      const source = fromProps || carried || fromShelf;
+      if (!source?.id) continue;
+      const piece = {
+        ...source,
+        name,
+        description: String(add.description || source.description || '').trim(),
+        parentId: null,
+      };
+      if (isStar) {
+        if (source === fromShelf) delete piece.inventoryId;
+        else if (!piece.inventoryId) piece.inventoryId = piece.id;
+        this._mirrorStarItem(char, piece, 'wardrobe');
+      } else if (!char.wardrobe.some(x => fold(x?.name) === fold(name))) {
+        char.wardrobe.push(piece);
+      }
+      const wornId = isStar ? (piece.inventoryId || piece.id) : piece.id;
+      if (live && wornId) {
+        const previous = new Set([fromShelf?.id, fromProps?.id, source.id].filter(Boolean));
+        live.partIds = (live.partIds || []).map(id => previous.has(id) ? wornId : id);
+      }
+      changed = true;
+    }
+    if (!changed) return;
+    char.updatedAt = Date.now();
+    this.saveState();
+    this.bus.emit('cast.updated', { character: char });
+    this._refreshClosetFold(char);
+    this._renderList();
+  }
+
+  _refreshClosetFold(char) {
+    const wrap = document.querySelector('[data-role="closet"]');
+    if (!wrap || !char) return;
+    const fold = wrap.closest('.cast-info-fold');
+    const n = normalizeOutfits(char.outfits).length;
+    wrap.innerHTML = this._closetBodyHTML(char);
+    const label = fold?.querySelector('.cast-info-fold-label');
+    if (label) label.textContent = n ? `Closet · ${n}` : 'Closet';
+    if (fold && n) fold.open = true;
+    this._bindCloset(wrap, char);
+  }
+
   _renderDetails(c) {
     if (c.priority === 'director') return this._renderDirectorDetails(c);
     return `
       <div class="cast-details">
+        <p class="cast-details-pronouns">${esc(this._pronounViewLine(c))}</p>
         ${STATS_ELIGIBLE.has(c.priority) ? this._renderStats(c) : ''}
         <h4>${c.priority === 'star' ? 'Wardrobe <span class="cast-sync-tag">equipped</span>' : 'Wardrobe'} <button class="cast-audit" data-action="audit-wardrobe">Audit</button></h4>
         ${this._renderItems(c, 'wardrobe')}
@@ -917,8 +2307,8 @@ export class CastModule extends Module {
         ${this._renderItems(c, 'props')}
         <button class="cast-item-add" data-action="add-prop">+ Add prop</button>
         <h4>Condition <button class="cast-audit" data-action="audit-condition">Audit</button></h4>
-        <textarea class="cast-condition" data-action="condition"
-          placeholder="Current state, mood, injuries, effects...">${esc(c.condition ?? '')}</textarea>
+        ${this._renderConditions(c)}
+        <button class="cast-item-add" data-action="add-condition">+ Add condition</button>
       </div>
     `;
   }
@@ -1111,6 +2501,15 @@ export class CastModule extends Module {
               Sex isn’t publicly shamed — frank talk / public intimacy is ordinary
             </label>
           </label>
+          <label class="cast-dir-field cast-dir-toggle">
+            <span>Lewd and unusual punishment</span>
+            <label class="cast-dir-check">
+              <input type="checkbox" data-dir="lewdPunishment" ${d.lewdPunishment ? 'checked' : ''}>
+              Sexual discipline is an ordinary penalty — commonplace, not necessarily wanted
+            </label>
+          </label>
+          ${select('lupSeverity')}
+          ${select('lupConsent')}
         </div>
         <h4>Additional notes</h4>
         <textarea class="cast-condition" data-dir="notes"
@@ -1158,7 +2557,7 @@ export class CastModule extends Module {
   }
 
   _renderPlotHooks(hooks) {
-    const list = (hooks ?? []).map(h => normalizePlotHook(h)).filter(Boolean);
+    const list = (hooks ?? []).map(h => normalizePlotHook(h)).filter(h => h && !h.outcome);
     if (!list.length) return `<div class="cast-tag-empty">No plot hooks yet.</div>`;
     return list.map(h => {
       const who = h.assignedTo
@@ -1171,6 +2570,11 @@ export class CastModule extends Module {
       const board = h.stepId
         ? `<span class="cast-item-cond cast-item-cond--board" title="Filed on their Motivation board">Board</span>`
         : '';
+      const kind = plotHookKindMeta(h.kind);
+      const kindBadge = `<span class="cast-item-cond" title="${esc(kind.label)}">${kind.emoji} ${esc(kind.label)}</span>`;
+      const when = h.deadline
+        ? `<span class="cast-item-cond">${esc(h.deadline)}</span>`
+        : '';
       return `
       <div class="cast-item${h.active === false ? ' cast-item--inactive' : ''}" style="border-left-color:${who ? priorityColor(who.priority) : 'var(--st-sepia)'}">
         <div class="cast-item-row">
@@ -1179,6 +2583,8 @@ export class CastModule extends Module {
               ${h.active !== false ? 'checked' : ''}>
           </label>
           <span class="cast-item-name">${esc(h.name)}</span>
+          ${kindBadge}
+          ${when}
           ${badge}
           ${board}
           <div class="cast-item-actions">
@@ -1192,8 +2598,107 @@ export class CastModule extends Module {
     }).join('');
   }
 
+  _kitLists(char) {
+    if (char?.priority === 'star') {
+      try {
+        const inv = this.storage.getChat('inventory', { static: [], mobile: [] });
+        return starKitFromInventory(inv, { ownerId: char.id });
+      } catch { /* fall through */ }
+    }
+    return { wardrobe: char.wardrobe || [], props: char.props || [] };
+  }
+
+  _ownedKit(char) {
+    const kit = this._kitLists(char);
+    const shelf = Array.isArray(char?.shelf) ? char.shelf : [];
+    return kitOwnedItems([...(kit.wardrobe || []), ...(kit.props || []), ...shelf]);
+  }
+
+  /** Seed wardrobe adds when this speaker says they put on one of their own looks. */
+  _readOutfitWear(messageId) {
+    try {
+      const chat = getContext()?.chat || [];
+      const idx = Number(messageId);
+      if (!Number.isFinite(idx) || idx !== chat.length - 1) return;
+      const mes = chat[idx];
+      if (!mes || mes.is_user || mes.is_system) return;
+      const speaker = resolveChatSpeaker(this.storage, mes, getContext());
+      if (!speaker?.id) return;
+      const char = (this.state.characters || []).find(c => c.id === speaker.id);
+      if (!char) return;
+      const outfits = normalizeOutfits(char.outfits);
+      if (!outfits.length) return;
+      const title = readOutfitWearSentence(stripReceiptWrap(String(mes.mes || '')), {
+        speaker: char.name,
+        titles: outfits.map(o => o.title),
+      });
+      if (!title) return;
+      const outfit = outfits.find(o => o.title.toLowerCase() === title.toLowerCase());
+      if (!outfit) return;
+      const prev = this.state.outfitWearSeed;
+      if (prev && prev.mesId === idx && String(prev.title || '').toLowerCase() === title.toLowerCase()) return;
+      const owned = this._ownedKit(char);
+      const adds = outfitPartsToWear(outfit, this._kitLists(char).wardrobe, new Map(owned.map(x => [x.id, x])));
+      if (!adds.length) return;
+      const seed = { charId: char.id, name: char.name, title, adds, mesId: idx, applied: false };
+      if (mes.extra?.showtimeReceipt) {
+        fileOneOutfitWear(this.storage, seed);
+        seed.applied = true;
+      }
+      this.state.outfitWearSeed = seed;
+      this.storage.saveChat();
+    } catch { /* a missed look can still be worn by hand */ }
+  }
+
+  _chipLabel(item) {
+    const name = String(item?.name || '').trim() || 'Missing piece';
+    const desc = String(item?.description || '').trim();
+    return desc ? `${name} | ${desc}` : name;
+  }
+
+  _renderOutfits(char) {
+    const outfits = normalizeOutfits(char.outfits);
+    if (!outfits.length) return `<div class="cast-tag-empty">No looks on file.</div>`;
+    const wornItems = this._kitLists(char).wardrobe || [];
+    const owned = new Map(this._ownedKit(char).map(x => [x.id, x]));
+    return outfits.map(o => {
+      const type = outfitTypeMeta(o.type);
+      const match = matchOutfit(o, wornItems, owned);
+      const pending = outfitPartsToWear(o, wornItems, owned);
+      const equipped = o.partIds.length > 0 && !pending.length;
+      const onIds = new Set((match?.on || []).map(row => row.id));
+      const parts = o.partIds.length
+        ? o.partIds.map(pid => {
+          const item = owned.get(pid);
+          const on = onIds.has(pid);
+          return `
+            <div class="cast-outfit-part${on ? '' : ' off'}">
+              <span class="cast-item-name">${esc(this._chipLabel(item))}</span>
+              <span class="cast-outfit-part-flag">${on ? 'on' : 'off'}</span>
+            </div>`;
+        }).join('')
+        : `<div class="cast-tag-empty">No parts yet</div>`;
+      return `
+        <details class="cast-item cast-item--box cast-outfit">
+          <summary class="cast-item-row">
+            <span class="cast-item-name">${esc(o.title)}</span>
+            <span class="cast-outfit-type">${esc(type.label)}</span>
+            <span class="cast-outfit-mark">${esc(outfitWearMark(match))}</span>
+            ${o.partIds.length ? `<button type="button" class="cast-btn small gold cast-outfit-equip" data-action="equip-outfit" data-outfit-id="${esc(o.id)}"${equipped ? ' disabled' : ''}>${equipped ? 'Equipped' : 'Equip'}</button>` : ''}
+            <div class="cast-item-actions">
+              <button type="button" class="cast-btn small" data-action="edit-outfit" data-outfit-id="${esc(o.id)}">Edit</button>
+              <button type="button" class="cast-btn small danger" data-action="remove-outfit" data-outfit-id="${esc(o.id)}">×</button>
+            </div>
+          </summary>
+          ${o.description ? `<div class="cast-item-desc">${esc(o.description)}</div>` : ''}
+          ${parts}
+        </details>`;
+    }).join('');
+  }
+
   _renderItems(char, kind) {
-    const items = char[kind] ?? [];
+    const items = this._kitLists(char)[kind] ?? [];
+    if (kind === 'wardrobe' && isWearingNothing(items)) return `<div class="cast-tag-empty">Nude</div>`;
     if (!items.length) return `<div class="cast-tag-empty">None</div>`;
     const roots = kind === 'props' ? kitRoots(items) : items.filter(x => !x.parentId);
     const show = roots.length ? roots : items;
@@ -1205,7 +2710,7 @@ export class CastModule extends Module {
   }
 
   _renderKitItem(char, kind, item, nested) {
-    const items = char[kind] ?? [];
+    const items = this._kitLists(char)[kind] ?? [];
     const kids = kind === 'props' ? kitChildren(items, item.id) : [];
     const isBox = inferKitKind(item) === 'container' || kids.length > 0;
     const openKey = this._kitOpenKey(char, item);
@@ -1235,6 +2740,30 @@ export class CastModule extends Module {
     `;
   }
 
+  _renderConditions(char) {
+    const items = normalizeConditions(char.conditions);
+    if (!items.length) return `<div class="cast-tag-empty">None</div>`;
+    return items.map(item => {
+      const dur = durationMeta(item.duration);
+      const nature = natureMeta(item.nature);
+      const stamp = String(item.source || '').trim();
+      return `
+      <div class="cast-item" style="border-left-color:${dur.color}">
+        <div class="cast-item-row">
+          <span class="cast-item-name">${esc(item.name)}</span>
+          <span class="cast-item-cond" style="background:${nature.color}" title="${esc(dur.label)}">${esc(nature.label)}</span>
+          <span class="cast-item-cond" style="background:${dur.color}">${esc(dur.label)}</span>
+          <div class="cast-item-actions">
+            <button class="cast-btn small" data-action="edit-condition" data-item-id="${esc(item.id)}">Edit</button>
+            <button class="cast-btn small danger" data-action="remove-condition" data-item-id="${esc(item.id)}">×</button>
+          </div>
+        </div>
+        ${item.description ? `<div class="cast-item-desc">${esc(item.description)}</div>` : ''}
+        ${stamp ? `<div class="cast-item-stamp">Source: ${esc(stamp)}</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
   _statColor(def) {
     try {
       const colors = this.storage.getChat('backstage', {})?.trackers?.status?.colors;
@@ -1254,9 +2783,12 @@ export class CastModule extends Module {
     const stats = c.stats ?? DEFAULT_STATS();
     const customDefs = customBarDefsFromTrackers(this.storage);
     const bar = (def) => {
-      const val = def.custom
+      const cap = conditionStatCap(c, def.id);
+      const capSrc = cap < 100 ? conditionCapSource(c, def.id) : null;
+      const rawVal = def.custom
         ? this._customStatValue(stats, def.id)
         : clamp(stats[def.id] ?? (def.direction === 'down' ? 0 : 100));
+      const val = Math.min(rawVal, cap);
       const label = stateLabel(def, val);
       const color = this._statColor(def);
       const fillHtml = def.direction === 'up'
@@ -1266,17 +2798,23 @@ export class CastModule extends Module {
         ? String(val)
         : def.levelMode === 'amount'
           ? String(val)
-          : (label ? `${label} · ${val}` : String(val));
+          : (label || String(val));
+      const capHint = capSrc
+        ? `<div class="cast-stat-cap">capped by ${esc(capSrc.name)}</div>`
+        : '';
       return `
+        <div class="cast-stat-block">
         <div class="cast-stat-row"${def.description ? ` title="${esc(def.description)}"` : ''}>
           <span class="cast-stat-label">${esc(def.label)}</span>
           <div class="cast-stat-bar ${def.direction}" data-stat="${esc(def.id)}" ${def.custom ? 'data-custom="1"' : ''}
-            title="Click to set · Right-click for exact value">
+            title="Click to set · Right-click for exact value${capSrc ? ` · max ${cap} (${esc(capSrc.name)})` : ''}">
             ${fillHtml}
             <span class="cast-stat-text">${esc(text)}</span>
           </div>
           <input type="number" class="cast-stat-input" data-stat-input="${esc(def.id)}" ${def.custom ? 'data-custom="1"' : ''}
-            value="${val}" min="0" max="100">
+            value="${val}" min="0" max="${cap}">
+        </div>
+        ${capHint}
         </div>
       `;
     };
@@ -1303,7 +2841,7 @@ export class CastModule extends Module {
         <div class="cast-stats-toggles">
           ${stats.enabled ? '<button class="cast-audit" data-action="audit-stats">Audit</button>' : ''}
           <label><input type="checkbox" data-action="stats-enable" ${stats.enabled ? 'checked' : ''}>Track</label>
-          ${stats.enabled ? `<label><input type="checkbox" data-action="stats-hard" ${stats.hardMode ? 'checked' : ''}>Hard Mode</label>` : ''}
+          ${stats.enabled ? `<label><input type="checkbox" data-action="stats-hard" ${stats.hardMode ? 'checked' : ''}>Needs</label>` : ''}
         </div>
       </h4>
       ${baseBars}
@@ -1323,7 +2861,8 @@ export class CastModule extends Module {
       // Always-visible row actions
       rowEl.querySelector('[data-action="view"]')?.addEventListener('click', () => this._openCastView(char));
       rowEl.querySelector('[data-action="cue"]')?.addEventListener('click', () => this.cueCast(char));
-      rowEl.querySelector('[data-action="presence"]')?.addEventListener('click', () => this._cyclePresence(char));
+      rowEl.querySelector('[data-action="presence"]')?.addEventListener('change', (e) => this._setPresence(char, e.target.value));
+      rowEl.querySelector('[data-action="pin-presence"]')?.addEventListener('click', () => this._togglePresencePin(char));
       rowEl.querySelector('[data-action="delete"]')?.addEventListener('click', () => this._confirmDelete(char));
       rowEl.querySelector('[data-action="toggle"]')?.addEventListener('click', () => {
         this._expandedIds.has(id) ? this._expandedIds.delete(id) : this._expandedIds.add(id);
@@ -1340,7 +2879,7 @@ export class CastModule extends Module {
           const key = el.dataset.dir;
           const handler = () => {
             const d = ensureDirectorDirection(char);
-            if (key === 'casualObscenity') d.casualObscenity = !!el.checked;
+            if (key === 'casualObscenity' || key === 'lewdPunishment') d[key] = !!el.checked;
             else d[key] = el.value;
             this._persistDirectorDirection(char);
             if (key !== 'notes') {
@@ -1417,17 +2956,25 @@ export class CastModule extends Module {
           this._openItemDialog(char, 'props'));
 
         rowEl.querySelectorAll('[data-action="edit-wardrobe"]').forEach(btn => {
-          const item = (char.wardrobe ?? []).find(x => x.id === btn.dataset.itemId);
+          const item = (this._kitLists(char).wardrobe ?? []).find(x => x.id === btn.dataset.itemId);
           if (item) btn.addEventListener('click', () => this._openItemDialog(char, 'wardrobe', item));
         });
         rowEl.querySelectorAll('[data-action="edit-props"]').forEach(btn => {
-          const item = (char.props ?? []).find(x => x.id === btn.dataset.itemId);
+          const item = (this._kitLists(char).props ?? []).find(x => x.id === btn.dataset.itemId);
           if (item) btn.addEventListener('click', () => this._openItemDialog(char, 'props', item));
         });
         rowEl.querySelectorAll('[data-action="remove-wardrobe"]').forEach(btn =>
           btn.addEventListener('click', () => this._removeSubItem(char, 'wardrobe', btn.dataset.itemId)));
         rowEl.querySelectorAll('[data-action="remove-props"]').forEach(btn =>
           btn.addEventListener('click', () => this._removeSubItem(char, 'props', btn.dataset.itemId)));
+        rowEl.querySelector('[data-action="add-condition"]')?.addEventListener('click', () =>
+          this._openConditionDialog(char));
+        rowEl.querySelectorAll('[data-action="edit-condition"]').forEach(btn => {
+          const item = normalizeConditions(char.conditions).find(x => x.id === btn.dataset.itemId);
+          if (item) btn.addEventListener('click', () => this._openConditionDialog(char, item));
+        });
+        rowEl.querySelectorAll('[data-action="remove-condition"]').forEach(btn =>
+          btn.addEventListener('click', () => this._removeCondition(char, btn.dataset.itemId)));
         rowEl.querySelectorAll('[data-action="toggle-kit"]').forEach(btn => {
           btn.addEventListener('click', () => {
             const key = `${char.id}:${btn.dataset.itemId}`;
@@ -1436,13 +2983,6 @@ export class CastModule extends Module {
             else open.add(key);
             this._renderList();
           });
-        });
-
-        rowEl.querySelector('[data-action="condition"]')?.addEventListener('change', e => {
-          char.condition = e.target.value;
-          char.updatedAt = Date.now();
-          this.saveState();
-          this.bus.emit('cast.updated', { character: char });
         });
 
         // Stats toggles
@@ -1469,16 +3009,18 @@ export class CastModule extends Module {
           const isCustom = barEl.dataset.custom === '1';
           barEl.addEventListener('click', e => {
             const r = barEl.getBoundingClientRect();
-            const pct = clamp(Math.round((e.clientX - r.left) / r.width * 100));
+            const cap = conditionStatCap(char, statId);
+            const pct = clamp(Math.round((e.clientX - r.left) / r.width * 100), 0, cap);
             this._setStatValue(char, statId, pct, isCustom);
             this._renderList();
           });
-          barEl.addEventListener('contextmenu', e => {
+          barEl.addEventListener('contextmenu', async e => {
             e.preventDefault();
+            const cap = conditionStatCap(char, statId);
             const cur = isCustom
               ? this._customStatValue(char.stats, statId)
               : (char.stats?.[statId] ?? 0);
-            const val = prompt('Set exact value (0–100):', cur);
+            const val = await showtimePrompt(`Set exact value (0–${cap}):`, { title: 'SET STAT VALUE', defaultValue: String(Math.min(cur, cap)), confirmLabel: 'Set' });
             if (val === null) return;
             this._setStatValue(char, statId, parseInt(val) || 0, isCustom);
             this._renderList();
@@ -1499,26 +3041,41 @@ export class CastModule extends Module {
 
   _setStatValue(char, statId, rawVal, isCustom = false) {
     if (!char.stats) char.stats = DEFAULT_STATS();
+    const cap = conditionStatCap(char, statId);
+    const next = clamp(rawVal, 0, cap);
+    const prev = isCustom
+      ? (char.stats.custom && char.stats.custom[statId])
+      : char.stats[statId];
     if (isCustom) {
       char.stats.custom ??= {};
-      char.stats.custom[statId] = clamp(rawVal);
-      char.updatedAt = Date.now();
-      this.saveState();
-      this.bus.emit('cast.updated', { character: char });
-      return;
+      char.stats.custom[statId] = next;
+    } else {
+      char.stats[statId] = next;
     }
-    const prev = char.stats[statId];
-    char.stats[statId] = clamp(rawVal);
     char.updatedAt = Date.now();
+    const def = isCustom
+      ? customBarDefsFromTrackers(this.storage).find(d => d.id === statId)
+      : ALL_STAT_DEFS.find(d => d.id === statId);
+    const chip = def ? statTitleChip(def, prev, next) : null;
+    if (chip) {
+      const who = this._resolveDisplay(char).name;
+      try {
+        appendNowLedger(this.storage, { kind: 'stat', text: `${who} · ${chip.name}: ${chip.change}` });
+      } catch { /* ignore */ }
+    }
 
-    // One-shot threshold-crossing alert for bladder and hygiene.
-    if (THRESHOLD_NOTIFY_STATS.has(statId) && prev !== undefined) {
-      const def = ALL_STAT_DEFS.find(d => d.id === statId);
-      if (def) {
-        const prevLabel = stateLabel(def, clamp(prev));
-        const curLabel  = stateLabel(def, clamp(char.stats[statId]));
-        if (prevLabel !== curLabel) {
-          const name = this._resolveDisplay(char).name;
+    if (def && prev !== undefined && def.levelMode !== 'none' && def.levelMode !== 'amount') {
+      const prevLabel = stateLabel(def, clamp(prev));
+      const curLabel = stateLabel(def, clamp(next));
+      if (prevLabel && curLabel && prevLabel !== curLabel) {
+        const name = this._resolveDisplay(char).name;
+        if (char.priority === 'star') {
+          this.bus.emit('showtime.notice', {
+            kind: 'status',
+            items: [{ name, toState: curLabel, threshold: true }],
+          });
+        }
+        if (THRESHOLD_NOTIFY_STATS.has(statId)) {
           this._pendingStatAlert = `[Note: ${name}'s ${def.label} is now ${curLabel}]`;
         }
       }
@@ -1530,11 +3087,12 @@ export class CastModule extends Module {
   }
 
   _removeSubItem(char, kind, itemId) {
-    const list = char[kind] ?? [];
-    const item = list.find(x => x.id === itemId);
+    const list = this._kitLists(char)[kind] ?? [];
     const drop = new Set([itemId, ...kitDescendantIds(list, itemId)]);
     const gone = list.filter(x => drop.has(x.id));
-    char[kind] = list.filter(x => !drop.has(x.id));
+    if (char.priority !== 'star') {
+      char[kind] = (char[kind] || []).filter(x => !drop.has(x.id));
+    }
     char.updatedAt = Date.now();
     this.saveState();
     for (const it of gone) this._relinquishKitItem(char, it, kind);
@@ -1542,8 +3100,20 @@ export class CastModule extends Module {
     this._renderList();
   }
 
-  _confirmDelete(char) {
-    if (!confirm(`Remove ${char.name} from the cast?`)) return;
+  _removeCondition(char, itemId) {
+    const list = normalizeConditions(char.conditions);
+    const gone = list.find(x => x.id === itemId);
+    char.conditions = list.filter(x => x.id !== itemId);
+    if (gone) applyConditionRemoveMods(char, gone);
+    applyConditionCaps(char);
+    char.updatedAt = Date.now();
+    this.saveState();
+    this.bus.emit('cast.updated', { character: char });
+    this._renderList();
+  }
+
+  async _confirmDelete(char) {
+    if (!await showtimeConfirm(`Remove ${char.name} from the cast?`, { title: 'REMOVE CAST MEMBER', danger: true, confirmLabel: 'Remove' })) return;
     const idx = this.state.characters.findIndex(c => c.id === char.id);
     if (idx < 0) return;
     const [removed] = this.state.characters.splice(idx, 1);
@@ -1602,7 +3172,7 @@ export class CastModule extends Module {
     this.injector.register({
       id: 'cast.wardrobe',
       triggers: ['wardrobe', 'clothes', 'clothing', 'wearing', 'outfit', 'costume',
-                 'gear', 'equip', 'attire', 'dressed'],
+                 'gear', 'equip', 'attire', 'dressed', 'nude', 'naked', 'undressed'],
       buildText: () => this._buildWardrobeInjection(),
     });
 
@@ -1620,40 +3190,84 @@ export class CastModule extends Module {
     this.bus.on('cast.removed', bump);
   }
 
-  _inSceneChars() {
-    const inScene = this._getInCurrentChat();
-    return this.state.characters.filter(c => {
-      const presence = normalizePresence(c);
-      if (presence === 'absent' || presence === 'writtenOut') return false;
-      return c.priority === 'star' ||
-        (c.characterCardId && inScene.has(c.characterCardId));
-    });
-  }
-
   _inPlayChars() {
-    const chars = this._inSceneChars();
     try {
-      const status = this.storage.getChat('backstage', {})?.trackers?.status || {};
-      if (status.offScreen) return chars;
-      const windowN = Number(status.inPlayWindow) || 10;
-      const ids = inPlayMemberIds(this.storage, getContext()?.chat || [], windowN);
-      return chars.filter(c => c.priority === 'star' || ids.has(c.id));
+      return inPlayCastRecords(this.storage);
     } catch {
-      return chars;
+      return (this.state.characters || []).filter(c => {
+        if (!c || c.priority === 'director') return false;
+        return normalizePresence(c) === 'inPlay';
+      });
     }
   }
 
-  _cyclePresence(char) {
-    if (!char || char.priority === 'director') return;
-    if (char.priority === 'star') {
-      char.presence = normalizePresence(char) === 'absent' ? 'inPlay' : 'absent';
-    } else {
-      const cur = normalizePresence(char);
-      const i = PRESENCE_ORDER.indexOf(cur);
-      char.presence = PRESENCE_ORDER[(i + 1) % PRESENCE_ORDER.length];
-    }
+  _togglePresencePin(char) {
+    if (!char || char.priority === 'director' || char.priority === 'star') return;
+    char.presenceAuto = char.presenceAuto === false ? true : false;
     char.updatedAt = Date.now();
     this.saveState();
+    try {
+      const who = String(char.name || '').trim() || 'Cast';
+      appendNowLedger(this.storage, {
+        kind: 'presence',
+        text: `Presence: ${who} ${char.presenceAuto === false ? 'pinned' : 'unpinned (auto)'}`,
+      });
+    } catch { /* ignore */ }
+    this._renderList();
+  }
+
+  async _setPresence(char, next) {
+    if (!char || char.priority === 'director') return;
+    const order = char.priority === 'star' ? STAR_PRESENCE_ORDER : PRESENCE_ORDER;
+    const from = normalizePresence(char);
+    if (!order.includes(next) || from === next) return;
+
+    const { shouldPrompt, others } = planCameraFocusChoice(this.state.characters, char, from, next);
+    if (shouldPrompt) {
+      const starName = this._resolveDisplay(char).name || char.name || 'The Star';
+      const toLabel = next === 'absent' ? 'Absent' : 'Privy';
+      const otherNames = others.map(c => this._resolveDisplay(c).name || c.name).filter(Boolean).join(', ');
+      const choice = await showtimeCameraFocusChoice(
+        `${starName} is leaving the scene (${toLabel}). Keep following ${otherNames} here, or follow ${starName} instead (they pause too)?`,
+        { castLabel: 'In play cast', starLabel: 'Star' },
+      );
+      if (choice == null) {
+        this._renderList();
+        return;
+      }
+      if (choice === 'followStar') {
+        for (const other of others) await this._setPresence(other, next);
+      }
+    }
+
+    char.presence = next;
+    char.updatedAt = Date.now();
+    this.saveState();
+    if (char.priority !== 'star') {
+      try {
+        const who = String(char.name || '').trim() || 'Cast';
+        if (char.presence === 'inPlay' || char.presence === 'privy' || char.presence === 'absent') {
+          const label = char.presence === 'inPlay'
+            ? 'in play'
+            : char.presence === 'privy'
+              ? 'privy (listening in)'
+              : 'absent';
+          appendNowLedger(this.storage, { kind: 'presence', text: `Presence: ${who} ${label}` });
+        }
+      } catch { /* ignore */ }
+    }
+    try {
+      const { compass } = this._compassBag();
+      syncSonarPresence(compass, [{
+        id: char.id,
+        name: char.name,
+        presence: char.presence,
+        priority: char.priority,
+        manual: true,
+        updatedAt: char.updatedAt,
+      }]);
+      this.storage.saveChat();
+    } catch { /* compass missing */ }
     this.bus.emit('cast.updated', { character: char });
     this._renderList();
   }
@@ -1672,11 +3286,14 @@ export class CastModule extends Module {
       const name = this._resolveDisplay(c).name;
       const defs = [...STAT_DEFS.base, ...(c.stats.hardMode ? STAT_DEFS.hard : [])];
       const bits = defs.map(def => {
-        const val = clamp(c.stats[def.id] ?? (def.direction === 'down' ? 0 : 100));
+        const val = Math.min(
+          clamp(c.stats[def.id] ?? (def.direction === 'down' ? 0 : 100)),
+          conditionStatCap(c, def.id),
+        );
         return `${def.label}: ${stateLabel(def, val)}`;
       });
       for (const def of customDefs) {
-        const val = this._customStatValue(c.stats, def.id);
+        const val = Math.min(this._customStatValue(c.stats, def.id), conditionStatCap(c, def.id));
         const label = stateLabel(def, val);
         const tip = def.description ? ` (${clipText(def.description, 40)})` : '';
         bits.push(def.levelMode === 'none'
@@ -1688,12 +3305,45 @@ export class CastModule extends Module {
       return `- ${name} — ${bits.join(', ')}`;
     });
     const statusBlock = lines.length ? `[Status:\n${lines.join('\n')}]` : '';
-    const condLines = inPlay
-      .filter(c => String(c.condition || '').trim())
-      .slice(0, 4)
-      .map(c => `- ${this._resolveDisplay(c).name} — ${clipText(c.condition, 140)}`);
+    const trackedNames = chars.map(c => this._resolveDisplay(c).name).filter(Boolean);
+    const untrackedNames = inPlay
+      .filter(c => c && !c.stats?.enabled)
+      .map(c => this._resolveDisplay(c).name)
+      .filter(Boolean);
+    const scopeBlock = (trackedNames.length && untrackedNames.length)
+      ? `[Status scope: these bars belong to ${trackedNames.join(', ')} only. ${untrackedNames.join(', ')} ${untrackedNames.length === 1 ? 'has' : 'have'} no status bars. Do not copy Health, Energy, Hydration, or any other tracked state onto them.]`
+      : '';
+    const limits = [];
+    const midCues = [];
+    for (const c of chars) {
+      const name = this._resolveDisplay(c).name;
+      const defs = [...STAT_DEFS.base, ...(c.stats.hardMode ? STAT_DEFS.hard : []), ...customDefs];
+      for (const def of defs) {
+        const rawVal = def.custom
+          ? this._customStatValue(c.stats, def.id)
+          : clamp(c.stats[def.id] ?? (def.direction === 'down' ? 0 : 100));
+        const val = Math.min(rawVal, conditionStatCap(c, def.id));
+        const word = stateLabel(def, val);
+        const cue = statBehaviorCue(def, val);
+        if (isSevereStat(def, val)) {
+          if (word) limits.push(cue ? `${name} is ${word} (${cue})` : `${name} is ${word}`);
+        } else if (cue) {
+          midCues.push(word ? `${name} is ${word} (${cue})` : `${name} — ${cue}`);
+        }
+      }
+    }
+    const limitBlock = limits.length
+      ? `[Body: ${limits.join('; ')} — that limits what the body can do.${midCues.length ? ` Also: ${midCues.join('; ')}.` : ''}]`
+      : (midCues.length
+        ? `[Body: ${midCues.join('; ')} — background physical state only; keep the active conversation and scene focus unless the character's latest turn brings this up.]`
+        : '');
+    const condLines = inPlay.flatMap(c => {
+      const name = this._resolveDisplay(c).name;
+      return formatConditionsBlock(c.conditions, { max: 6 })
+        .map(line => `- ${name} — ${line}`);
+    }).slice(0, 16);
     const condBlock = condLines.length ? `[Condition:\n${condLines.join('\n')}]` : '';
-    return [statusBlock, condBlock, cues].filter(Boolean).join('\n');
+    return [statusBlock, scopeBlock, limitBlock, condBlock, cues].filter(Boolean).join('\n');
   }
 
   _buildPronounsInjection() {
@@ -1717,23 +3367,33 @@ export class CastModule extends Module {
 
   _buildStarAbsentInjection() {
     const star = this.state.characters.find(c => c.priority === 'star');
-    if (normalizePresence(star) !== 'absent') return '';
+    const pres = normalizePresence(star);
+    if (pres !== 'absent' && pres !== 'privy') return '';
     const name = this._resolveDisplay(star).name || '{{user}}';
+    if (pres === 'privy') {
+      return `[Stage: ${name} (the Star / {{user}}) is listening in remotely on this scene (privy to what is said and done here, not physically standing in the room). Do not treat them as physically present in the room unless they enter.]`;
+    }
     return `[Stage: ${name} (the Star / {{user}}) is off-camera this scene. Do not describe them as present, do not use their persona or profile, and do not write their inner thoughts.]`;
   }
 
   _buildWardrobeInjection() {
-    const chars = this._inSceneChars().filter(c => (c.wardrobe ?? []).length);
+    const chars = this._inPlayChars();
     if (!chars.length) return '';
     const lines = chars.map(c => {
       const name = this._resolveDisplay(c).name;
+      const kit = this._kitLists(c);
+      const worn = kit.wardrobe || [];
+      if (isWearingNothing(worn)) return `- ${nudeWearLine(name)}.`;
       const modifier = this._wardrobeModifier(c);
-      const items = c.wardrobe.map(w => {
-        const parts = [w.name];
-        if (w.condition && w.condition !== 'pristine') parts.push(`(${w.condition})`);
-        return parts.join(' ');
-      }).join('; ');
-      return `- ${name} is wearing: ${items}${modifier ? `. ${modifier}` : ''}`;
+      const match = pickPrimaryOutfit(c.outfits, worn, kitOwnedItems(worn, kit.props));
+      const look = match
+        ? formatOutfitLook(match, { compact: false })
+        : worn.map(w => {
+          const parts = [w.name];
+          if (w.condition && w.condition !== 'pristine') parts.push(`(${w.condition})`);
+          return parts.join(' ');
+        }).join('; ');
+      return `- ${name} is wearing: ${look}${modifier ? `. ${modifier}` : ''}`;
     });
     return `[Wardrobe:\n${lines.join('\n')}]`;
   }
@@ -1751,11 +3411,11 @@ export class CastModule extends Module {
   }
 
   _buildPropsInjection() {
-    const chars = this._inSceneChars().filter(c => (c.props ?? []).length);
+    const chars = this._inPlayChars().filter(c => (this._kitLists(c).props ?? []).length);
     if (!chars.length) return '';
     const lines = chars.map(c => {
       const name = this._resolveDisplay(c).name;
-      const items = formatCarryBrief(c.props ?? []);
+      const items = formatCarryBrief(this._kitLists(c).props ?? []);
       return `- ${name} is carrying: ${items}`;
     });
     return `[Items carried:\n${lines.join('\n')}]`;
@@ -1779,8 +3439,9 @@ export class CastModule extends Module {
     const display = this._resolveDisplay(char);
     const p = priorityMeta(char.priority);
     const presence = normalizePresence(char);
-    const portrait = display.portrait
-      ? `<img src="${esc(display.portrait)}" alt="">`
+    const portraitUrl = sanitizeMediaUrl(display.portrait);
+    const portrait = portraitUrl
+      ? `<img src="${esc(portraitUrl)}" alt="">`
       : esc((display.name || '?').charAt(0).toUpperCase());
     const persona = char.personaId ? this._getPersonas().find(x => x.id === char.personaId) : null;
     const card = char.characterCardId ? this._getCharacterCards().find(x => x.id === char.characterCardId) : null;
@@ -1791,6 +3452,40 @@ export class CastModule extends Module {
         : 'Manual';
     const affil = this._houseLabel(char.affiliationHouseId);
     const aliases = normalizeAliases(char.aliases);
+    const isDirector = char.priority === 'director';
+    const bodyHtml = isDirector
+      ? this._renderDirectorProfile(char, { link })
+      : this._renderCastProfile(char, { presence, affil, link });
+
+    const backdrop = this._buildModal(`
+      <div class="cast-modal-title">${isDirector ? 'DIRECTOR' : 'PROFILE'}</div>
+      <div class="cast-modal-subtitle">— ${esc(display.name || 'Unnamed')} —</div>
+      <div class="cast-view-head">
+        <div class="cast-view-portrait">${portrait}</div>
+        <div>
+          <div class="cast-view-name">${esc(display.name || 'Unnamed')}
+            <span class="cast-row-badge" style="border-color:${p.color};color:${p.color}">${esc(p.label)}</span>
+          </div>
+          ${aliases.length ? `<div class="cast-row-aliases">${esc(aliases.join(' · '))}</div>` : ''}
+        </div>
+      </div>
+      ${bodyHtml}
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Close</button>
+        <button class="cast-btn gold" data-action="edit">Edit</button>
+      </div>
+    `);
+    if (!isDirector) {
+      this._bindKeyring(backdrop, char);
+      this._bindCloset(backdrop, char);
+    }
+    backdrop.querySelector('[data-action="edit"]')?.addEventListener('click', () => {
+      backdrop.remove();
+      this._openCastingCall(char);
+    });
+  }
+
+  _renderCastProfile(char, { presence, affil, link }) {
     const bio = this._liveBio(char);
     const manual = !char.personaId && !char.characterCardId;
     const summary = String(char.summary || char.description || '').trim();
@@ -1802,36 +3497,68 @@ export class CastModule extends Module {
         ${summary ? `<div class="cast-view-block"><div class="cast-view-k">Summary</div><div class="cast-view-v">${esc(summary)}</div></div>` : ''}
         ${!appearance && !summary ? `<div class="cast-info-empty">No appearance or summary yet.</div>` : ''}
       `;
-
-    const backdrop = this._buildModal(`
-      <div class="cast-modal-title">PROFILE</div>
-      <div class="cast-modal-subtitle">— ${esc(display.name || 'Unnamed')} —</div>
-      <div class="cast-view-head">
-        <div class="cast-view-portrait">${portrait}</div>
-        <div>
-          <div class="cast-view-name">${esc(display.name || 'Unnamed')}
-            <span class="cast-row-badge" style="border-color:${p.color};color:${p.color}">${esc(p.label)}</span>
-          </div>
-          ${aliases.length ? `<div class="cast-row-aliases">${esc(aliases.join(' · '))}</div>` : ''}
-        </div>
-      </div>
+    return `
       <dl class="cast-view-dl">
         <dt>Link</dt><dd>${esc(link)}</dd>
-        ${char.priority !== 'director' ? `<dt>Presence</dt><dd>${esc(PRESENCE[presence]?.label || presence)}</dd>` : ''}
+        <dt>Presence</dt><dd>${esc(PRESENCE[presence]?.label || presence)}</dd>
         ${bio.alterEgoName ? `<dt>Alter ego</dt><dd>${esc(bio.alterEgoName)}</dd>` : ''}
         ${affil ? `<dt>Affiliation</dt><dd>${esc(affil)}</dd>` : ''}
         <dt>Pronouns</dt><dd>${esc(this._pronounViewLine(char))}</dd>
       </dl>
+      ${this._renderKeyringFold(char)}
+      ${this._renderClosetFold(char)}
       <div class="cast-view-bio">${bioHtml}</div>
-      <div class="cast-modal-actions">
-        <button class="cast-btn" data-action="cancel">Close</button>
-        <button class="cast-btn gold" data-action="edit">Edit</button>
+    `;
+  }
+
+  _directorDialLabel(fieldId, valueId) {
+    const field = DIRECTION_FIELDS[fieldId];
+    return field?.options?.find(o => o.id === valueId)?.label || valueId || '—';
+  }
+
+  _renderDirectorProfile(char, { link }) {
+    const d = ensureDirectorDirection(char);
+    const bio = this._liveBio(char);
+    const desc = String(bio.text || char.description || char.summary || '').trim();
+    const replyAs = char.replyAsId
+      ? this.state.characters.find(x => x.id === char.replyAsId)
+      : null;
+    const hooks = (char.plotHooks ?? []).map(h => normalizePlotHook(h)).filter(h => h && h.active !== false);
+    const dialRows = Object.keys(DIRECTION_FIELDS).map(id => `
+      <div class="cast-view-block">
+        <div class="cast-view-k">${esc(DIRECTION_FIELDS[id].label)}</div>
+        <div class="cast-view-v">${esc(this._directorDialLabel(id, d[id]))}</div>
+      </div>`).join('');
+    const notes = String(d.notes || '').trim();
+    const descBody = desc
+      ? `<div class="cast-view-v">${esc(desc)}</div>`
+      : `<div class="cast-info-empty">${esc(bio.emptyHint || 'No character description on the linked card.')}</div>`;
+    const descHead = bio.mode === 'persona' || bio.mode === 'card'
+      ? `Character description · ${bio.sourceLabel}${bio.alterEgoName ? ` · ${bio.alterEgoName}` : ''}`
+      : 'Character description';
+    return `
+      <dl class="cast-view-dl">
+        <dt>Link</dt><dd>${esc(link)}</dd>
+        <dt>Reply as</dt><dd>${esc(replyAs?.name || 'Director card name')}</dd>
+      </dl>
+      <div class="cast-view-k">Production</div>
+      <div class="cast-view-dials">${dialRows}
+        <div class="cast-view-block">
+          <div class="cast-view-k">Casual obscenity</div>
+          <div class="cast-view-v">${d.casualObscenity ? 'On — frank talk / public intimacy is ordinary' : 'Off'}</div>
+        </div>
+        <div class="cast-view-block">
+          <div class="cast-view-k">Lewd and unusual punishment</div>
+          <div class="cast-view-v">${d.lewdPunishment ? 'On — sexual discipline is an ordinary penalty' : 'Off — punishment stays non-sexual'}</div>
+        </div>
+        ${notes ? `<div class="cast-view-block cast-view-block--wide"><div class="cast-view-k">Additional notes</div><div class="cast-view-v">${esc(notes)}</div></div>` : ''}
+        ${hooks.length ? `<div class="cast-view-block cast-view-block--wide"><div class="cast-view-k">Plot hooks</div><div class="cast-view-v">${esc(hooks.map(h => h.name).join(' · '))}</div></div>` : ''}
       </div>
-    `);
-    backdrop.querySelector('[data-action="edit"]')?.addEventListener('click', () => {
-      backdrop.remove();
-      this._openCastingCall(char);
-    });
+      <details class="cast-info-fold">
+        <summary class="cast-info-fold-sum">${esc(descHead)}</summary>
+        <div class="cast-info-box-body">${descBody}</div>
+      </details>
+    `;
   }
 
   _openCastingCall(existing = null) {
@@ -2148,11 +3875,11 @@ export class CastModule extends Module {
     syncStarHint();
     syncKitMode();
 
-    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', async () => {
       collectEgoDraft();
       const name           = nameEl.value.trim();
       const priority       = priEl.value;
-      const portrait       = portEl.value.trim();
+      const portrait       = await compressOversizedPortrait(portEl.value.trim());
       let aliases          = normalizeAliases(aliasEl.value);
       const characterCardId = source === 'card' ? (cardSel.value || '') : '';
       const personaId      = source === 'persona' ? (personaSel.value || '') : '';
@@ -2193,8 +3920,8 @@ export class CastModule extends Module {
         },
       });
 
-      if (!name) { alert('Name is required.'); return; }
-      if (!this._claimUniqueRole(priority, existing)) return;
+      if (!name) { void showtimeAlert('Name is required.', { title: 'CASTING CALL' }); return; }
+      if (!await this._claimUniqueRole(priority, existing)) return;
 
       if (isEdit) {
         const prev = structuredClone(existing);
@@ -2218,7 +3945,7 @@ export class CastModule extends Module {
           aliases, pronouns: pronounsNext,
           characterCardId, syncFromCard, personaId, syncFromPersona,
           preferEvolutia, alterEgoId, taggedAlterEgos, alterEgoIndex, replyAsId,
-          wardrobe: [], props: [], condition: '', presence: 'inPlay',
+          wardrobe: [], props: [], shelf: [], outfits: [], conditions: [], presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         };
@@ -2239,7 +3966,7 @@ export class CastModule extends Module {
         if (priority !== 'director' && kitMode === 'generate') {
           this._generateStartingKit(newChar).catch(err => {
             console.warn('[Cast dress]', err);
-            alert(`Cast, but kit generate failed: ${err?.message || err}`);
+            void showtimeAlert(`Cast, but kit generate failed: ${err?.message || err}`, { title: 'CASTING CALL', danger: true });
           });
         }
         return;
@@ -2248,7 +3975,7 @@ export class CastModule extends Module {
     setTimeout(() => nameEl.focus(), 0);
   }
 
-  _claimUniqueRole(priority, existing = null) {
+  async _claimUniqueRole(priority, existing = null) {
     const rule = UNIQUE_ROLES[priority];
     if (!rule) return true;
     const current = this.state.characters.find(x =>
@@ -2256,7 +3983,7 @@ export class CastModule extends Module {
     if (!current) return true;
     const label = PRIORITY_MAP[priority]?.label ?? priority;
     const demoteLabel = PRIORITY_MAP[rule.demoteTo]?.label ?? rule.demoteTo;
-    const ok = confirm(`${current.name} is currently the ${label}. Reassigning will demote them to ${demoteLabel}. Continue?`);
+    const ok = await showtimeConfirm(`${current.name} is currently the ${label}. Reassigning will demote them to ${demoteLabel}. Continue?`, { title: 'REASSIGN ROLE', confirmLabel: 'Reassign' });
     if (!ok) return false;
     current.priority = rule.demoteTo;
     current.updatedAt = Date.now();
@@ -2332,7 +4059,7 @@ export class CastModule extends Module {
   async _generateStartingKit(char) {
     if (!char || char.priority === 'director') return;
     if (this._auditBusy) {
-      alert('An audit is already running. Wait for it to finish, then Audit wardrobe/props.');
+      void showtimeAlert('An audit is already running. Wait for it to finish, then Audit wardrobe/props.', { title: 'KIT AUDIT' });
       return;
     }
     this._auditBusy = true;
@@ -2384,7 +4111,7 @@ export class CastModule extends Module {
     const cards = this._getCharacterCards();
     const inChat = this._getInCurrentChat();
     const present = cards.filter(c => inChat.has(c.id));
-    if (!present.length) { alert('No characters found in the current chat.'); return; }
+    if (!present.length) { void showtimeAlert('No characters found in the current chat.', { title: 'CALL SHEET' }); return; }
     const linkedIds = new Set(this.state.characters.map(c => c.characterCardId).filter(Boolean));
 
     const backdrop = this._buildModal(`
@@ -2419,7 +4146,7 @@ export class CastModule extends Module {
       const priority = backdrop.querySelector('[data-field="priority"]').value;
       const selected = Array.from(backdrop.querySelectorAll('input[type="checkbox"]:checked'))
         .map(cb => cb.dataset.cardId);
-      if (!selected.length) { alert('Select at least one character.'); return; }
+      if (!selected.length) { void showtimeAlert('Select at least one character.', { title: 'CALL SHEET' }); return; }
       selected.forEach(cardId => {
         const card = cards.find(c => c.id === cardId);
         if (!card) return;
@@ -2429,8 +4156,8 @@ export class CastModule extends Module {
           id: uid(), name: card.name, priority,
           portrait: card.avatarUrl, characterCardId: card.id,
           syncFromCard: true, personaId: '', syncFromPersona: false,
-          description, aliases: [], preferEvolutia: true,
-          wardrobe: [], props: [], condition: '', presence: 'inPlay',
+          description, aliases: [], pronouns: normalizePronouns(), preferEvolutia: true,
+          wardrobe: [], props: [], shelf: [], outfits: [], conditions: [], presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         });
@@ -2444,7 +4171,7 @@ export class CastModule extends Module {
 
   _openImportFromPersonas() {
     const personas = this._getPersonas();
-    if (!personas.length) { alert('No personas found.'); return; }
+    if (!personas.length) { void showtimeAlert('No personas found.', { title: 'CALL SHEET' }); return; }
     const linkedIds = new Set(this.state.characters.map(c => c.personaId).filter(Boolean));
     const currentId = user_avatar || '';
 
@@ -2476,12 +4203,12 @@ export class CastModule extends Module {
       </div>
     `);
 
-    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', async () => {
       const priority = backdrop.querySelector('[data-field="priority"]').value;
       const selected = Array.from(backdrop.querySelectorAll('input[type="checkbox"]:checked'))
         .map(cb => cb.dataset.personaId);
-      if (!selected.length) { alert('Select at least one persona.'); return; }
-      if (priority === 'star' && !this._claimUniqueRole('star')) return;
+      if (!selected.length) { void showtimeAlert('Select at least one persona.', { title: 'CALL SHEET' }); return; }
+      if (priority === 'star' && !await this._claimUniqueRole('star')) return;
       selected.forEach((pid, i) => {
         const p = personas.find(x => x.id === pid);
         if (!p) return;
@@ -2490,8 +4217,8 @@ export class CastModule extends Module {
           id: uid(), name: p.name, priority: role,
           portrait: p.avatarUrl, personaId: p.id, syncFromPersona: true,
           characterCardId: '', syncFromCard: false,
-          description: p.description || '', aliases: [],
-          wardrobe: [], props: [], condition: '', presence: 'inPlay',
+          description: p.description || '', aliases: [], pronouns: normalizePronouns(),
+          wardrobe: [], props: [], shelf: [], outfits: [], conditions: [], presence: 'inPlay',
           plotHooks: [], genreNotes: '',
           createdAt: Date.now(), updatedAt: Date.now(),
         });
@@ -2499,6 +4226,162 @@ export class CastModule extends Module {
       });
       this.saveState();
       backdrop.remove();
+      this._renderList();
+    });
+  }
+
+  _openOutfitDialog(char, existing = null) {
+    const isEdit = !!existing;
+    const rec = existing
+      ? { ...existing, partIds: [...(existing.partIds || [])] }
+      : { title: '', description: '', type: 'casual', partIds: [] };
+    let partIds = [...(rec.partIds || [])];
+    if (!Array.isArray(char.shelf)) char.shelf = [];
+    const byId = new Map();
+    const poolIds = new Set();
+    const refreshOwned = () => {
+      byId.clear();
+      poolIds.clear();
+      for (const item of this._ownedKit(char)) if (item?.id) byId.set(item.id, item);
+      const worn = this._kitLists(char).wardrobe || [];
+      for (const item of [...worn, ...(char.shelf || [])]) {
+        if (item?.id) poolIds.add(item.id);
+      }
+    };
+    refreshOwned();
+    let backdrop;
+
+    const renderParts = () => {
+      const wrap = backdrop.querySelector('[data-role="outfit-parts"]');
+      const pool = backdrop.querySelector('[data-role="outfit-pool"]');
+      if (!wrap || !pool) return;
+      wrap.innerHTML = partIds.length
+        ? partIds.map((pid, i) => {
+          const item = byId.get(pid);
+          return `<div class="cast-outfit-pick-row" data-part-id="${esc(pid)}">
+            <span class="cast-item-name">${esc(this._chipLabel(item))}</span>
+            <button type="button" class="cast-btn small" data-action="part-up" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button type="button" class="cast-btn small" data-action="part-down" ${i === partIds.length - 1 ? 'disabled' : ''}>↓</button>
+            <button type="button" class="cast-btn small danger" data-action="part-drop">×</button>
+          </div>`;
+        }).join('')
+        : `<div class="cast-tag-empty">Pick pieces below — order is how the look is put together.</div>`;
+      const taken = new Set(partIds);
+      const rest = [...byId.values()].filter(x => poolIds.has(x.id) && !taken.has(x.id));
+      const chips = rest.map(x =>
+        `<button type="button" class="cast-btn small" data-action="part-add" data-id="${esc(x.id)}">${esc(this._chipLabel(x))}</button>`,
+      ).join('');
+      pool.innerHTML = `${chips}<button type="button" class="cast-btn small" data-action="part-new">Add</button>`;
+      wrap.querySelectorAll('[data-action="part-drop"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.closest('[data-part-id]')?.dataset.partId;
+          partIds = partIds.filter(p => p !== id);
+          renderParts();
+        });
+      });
+      wrap.querySelectorAll('[data-action="part-up"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.closest('[data-part-id]')?.dataset.partId;
+          const i = partIds.indexOf(id);
+          if (i <= 0) return;
+          [partIds[i - 1], partIds[i]] = [partIds[i], partIds[i - 1]];
+          renderParts();
+        });
+      });
+      wrap.querySelectorAll('[data-action="part-down"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.closest('[data-part-id]')?.dataset.partId;
+          const i = partIds.indexOf(id);
+          if (i < 0 || i >= partIds.length - 1) return;
+          [partIds[i], partIds[i + 1]] = [partIds[i + 1], partIds[i]];
+          renderParts();
+        });
+      });
+      pool.querySelectorAll('[data-action="part-add"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.id;
+          if (!id || partIds.includes(id)) return;
+          partIds.push(id);
+          renderParts();
+        });
+      });
+      pool.querySelector('[data-action="part-new"]')?.addEventListener('click', () => {
+        const form = backdrop.querySelector('[data-role="shelf-form"]');
+        if (!form) return;
+        form.hidden = false;
+        form.querySelector('[data-field="part-name"]')?.focus();
+      });
+    };
+
+    backdrop = this._buildModal(`
+      <div class="cast-modal-title">OUTFIT</div>
+      <div class="cast-modal-subtitle">— ${isEdit ? 'Refit' : 'New'} look for ${esc(char.name)} —</div>
+      <div class="cast-modal-field"><label>Title</label>
+        <input type="text" data-field="title" value="${esc(rec.title)}"></div>
+      <div class="cast-modal-field"><label>Description (optional)</label>
+        <textarea data-field="description" style="min-height:40px">${esc(rec.description || '')}</textarea></div>
+      <div class="cast-modal-field"><label>Type</label>
+        <select data-field="type">
+          ${OUTFIT_TYPES.map(t =>
+            `<option value="${t.id}" ${rec.type === t.id ? 'selected' : ''}>${esc(t.label)}</option>`,
+          ).join('')}
+        </select></div>
+      <div class="cast-modal-field">
+        <label>Parts</label>
+        <div class="cast-outfit-pick" data-role="outfit-parts"></div>
+        <div class="cast-outfit-pool" data-role="outfit-pool"></div>
+        <div class="cast-shelf-form" data-role="shelf-form" hidden>
+          <label>Name</label>
+          <input type="text" data-field="part-name" maxlength="80">
+          <label>Description</label>
+          <textarea data-field="part-desc" maxlength="240"></textarea>
+          <button type="button" class="cast-btn small" data-action="part-save">Add chip</button>
+        </div>
+      </div>
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Cancel</button>
+        <button class="cast-btn" data-action="save">${isEdit ? 'Save' : 'Add'}</button>
+      </div>
+    `, { ticket: true });
+    renderParts();
+    backdrop.querySelector('[data-action="part-save"]')?.addEventListener('click', () => {
+      const name = backdrop.querySelector('[data-field="part-name"]')?.value.trim() || '';
+      if (!name) return;
+      const description = backdrop.querySelector('[data-field="part-desc"]')?.value.trim() || '';
+      const chip = { id: uid(), name: name.slice(0, 80), description: description.slice(0, 240) };
+      char.shelf.push(chip);
+      char.updatedAt = Date.now();
+      this.saveState();
+      refreshOwned();
+      if (!partIds.includes(chip.id)) partIds.push(chip.id);
+      const form = backdrop.querySelector('[data-role="shelf-form"]');
+      if (form) {
+        form.hidden = true;
+        form.querySelector('[data-field="part-name"]').value = '';
+        form.querySelector('[data-field="part-desc"]').value = '';
+      }
+      renderParts();
+    });
+
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+      const title = backdrop.querySelector('[data-field="title"]').value.trim();
+      if (!title) return;
+      const next = {
+        id: rec.id || uid(),
+        title: title.slice(0, 80),
+        description: backdrop.querySelector('[data-field="description"]').value.trim().slice(0, 240),
+        type: backdrop.querySelector('[data-field="type"]').value,
+        partIds: [...partIds],
+      };
+      char.outfits = normalizeOutfits(char.outfits);
+      const i = char.outfits.findIndex(o => o.id === next.id);
+      if (i >= 0) char.outfits[i] = next;
+      else char.outfits.push(next);
+      char.updatedAt = Date.now();
+      this.saveState();
+      this.bus.emit('cast.updated', { character: char });
+      backdrop.remove();
+      this._refreshClosetFold(char);
       this._renderList();
     });
   }
@@ -2571,7 +4454,7 @@ export class CastModule extends Module {
 
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const name = backdrop.querySelector('[data-field="name"]').value.trim();
-      if (!name) { alert('Name is required.'); return; }
+      if (!name) { void showtimeAlert('Name is required.', { title: 'KIT ITEM' }); return; }
       const description = backdrop.querySelector('[data-field="description"]').value.trim();
       const condition   = backdrop.querySelector('[data-field="condition"]').value;
       const itemKind = kind === 'props'
@@ -2591,6 +4474,132 @@ export class CastModule extends Module {
       this._renderList();
     });
     setTimeout(() => backdrop.querySelector('[data-field="name"]').focus(), 0);
+  }
+
+  _conditionKitOptions(char) {
+    const rows = [];
+    for (const it of char?.wardrobe || []) {
+      if (it?.id && it?.name) rows.push({ kind: 'wardrobe', id: it.id, name: it.name, label: `Wardrobe · ${it.name}` });
+    }
+    for (const it of char?.props || []) {
+      if (it?.id && it?.name) rows.push({ kind: 'props', id: it.id, name: it.name, label: `Props · ${it.name}` });
+    }
+    try {
+      const { inventory } = this._knownKitPools();
+      for (const it of inventory || []) {
+        if (!it?.id || !it?.name) continue;
+        rows.push({ kind: 'inventory', id: it.id, name: it.name, label: `Inventory · ${it.name}` });
+      }
+    } catch { /* ignore */ }
+    return rows;
+  }
+
+  _openConditionDialog(char, existing = null) {
+    const isEdit = !!existing;
+    const item = existing
+      ? normalizeConditionItem(existing)
+      : { name: '', description: '', nature: 'status', duration: 'temporary', source: '', sourceKind: '', sourceId: '' };
+    const kit = this._conditionKitOptions(char);
+    const kitVal = item.sourceKind && item.sourceId ? `${item.sourceKind}:${item.sourceId}` : '';
+    const presetOpts = [
+      `<option value="">Custom</option>`,
+      ...CONDITION_PRESET_GROUPS.map(g => {
+        const rows = CONDITION_PRESETS.filter(p => (p.group || 'other') === g.id);
+        if (!rows.length) return '';
+        return `<optgroup label="${esc(g.label)}">${rows.map(p => {
+          const match = item.name && p.name.toLowerCase() === String(item.name).toLowerCase();
+          return `<option value="${esc(p.id)}"${match ? ' selected' : ''}>${esc(p.name)} · ${esc(natureMeta(p.nature).label)} · ${esc(durationMeta(p.duration).label)}</option>`;
+        }).join('')}</optgroup>`;
+      }),
+    ].join('');
+    const natureOpts = CONDITION_NATURES.map(n =>
+      `<option value="${n.id}"${n.id === item.nature ? ' selected' : ''}>${esc(n.label)}</option>`).join('');
+    const durationOpts = CONDITION_DURATIONS.map(d =>
+      `<option value="${d.id}"${d.id === item.duration ? ' selected' : ''}>${esc(d.label)}</option>`).join('');
+    const kitOpts = [
+      `<option value="">— None —</option>`,
+      ...kit.map(k => `<option value="${esc(`${k.kind}:${k.id}`)}"${`${k.kind}:${k.id}` === kitVal ? ' selected' : ''}>${esc(k.label)}</option>`),
+    ].join('');
+    const backdrop = this._buildModal(`
+      <div class="cast-modal-title">CONDITION</div>
+      <div class="cast-modal-subtitle">— ${isEdit ? 'Refit effect' : 'New effect'} for ${esc(char.name)} —</div>
+      <div class="cast-modal-field"><label>From the pool</label>
+        <select data-field="preset">${presetOpts}</select>
+        <div class="cast-modal-hint">Picks fill title, description, nature, and duration. Source stays yours.</div>
+      </div>
+      <div class="cast-modal-field"><label>Title</label>
+        <input type="text" data-field="name" value="${esc(item.name)}" placeholder="Drunk, Wounded, Hexed…"></div>
+      <div class="cast-modal-field"><label>Description</label>
+        <textarea data-field="description" style="min-height:48px" placeholder="What it does or how it reads…">${esc(item.description)}</textarea></div>
+      <div class="cast-modal-field"><label>Nature</label>
+        <select data-field="nature">${natureOpts}</select></div>
+      <div class="cast-modal-field"><label>Duration</label>
+        <select data-field="duration">${durationOpts}</select></div>
+      <div class="cast-modal-field"><label>Source stamp</label>
+        <input type="text" data-field="source" value="${esc(item.source)}" placeholder="leftover wine, the alley fight…"></div>
+      <div class="cast-modal-field"><label>From kit (optional)</label>
+        <select data-field="kit">${kitOpts}</select>
+        <div class="cast-modal-hint">Link a wardrobe, prop, or inventory item. Fills Source if it's empty.</div>
+      </div>
+      <div class="cast-modal-actions">
+        <button class="cast-btn" data-action="cancel">Cancel</button>
+        <button class="cast-btn" data-action="save">${isEdit ? 'Save' : 'Add'}</button>
+      </div>
+    `);
+    const nameEl = backdrop.querySelector('[data-field="name"]');
+    const descEl = backdrop.querySelector('[data-field="description"]');
+    const natureEl = backdrop.querySelector('[data-field="nature"]');
+    const durationEl = backdrop.querySelector('[data-field="duration"]');
+    const sourceEl = backdrop.querySelector('[data-field="source"]');
+    const kitEl = backdrop.querySelector('[data-field="kit"]');
+    backdrop.querySelector('[data-field="preset"]').addEventListener('change', e => {
+      const p = findConditionPreset(e.target.value);
+      if (!p) return;
+      const cur = nameEl.value.trim();
+      const known = findConditionPreset(cur);
+      if (!cur || known) nameEl.value = p.name;
+      if (!descEl.value.trim() || known) descEl.value = p.description;
+      natureEl.value = p.nature;
+      durationEl.value = p.duration;
+    });
+    kitEl.addEventListener('change', () => {
+      const [kind, ...rest] = String(kitEl.value || '').split(':');
+      const id = rest.join(':');
+      const hit = kit.find(k => k.kind === kind && k.id === id);
+      if (hit && !sourceEl.value.trim()) sourceEl.value = hit.name;
+    });
+    backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
+      const name = nameEl.value.trim();
+      if (!name) { void showtimeAlert('Title is required.', { title: 'CONDITION' }); return; }
+      const [kind, ...rest] = String(kitEl.value || '').split(':');
+      const sourceId = rest.join(':');
+      const row = normalizeConditionItem({
+        id: item.id,
+        name,
+        description: descEl.value.trim(),
+        nature: natureEl.value,
+        duration: durationEl.value,
+        source: sourceEl.value.trim(),
+        sourceKind: kind,
+        sourceId,
+      });
+      if (!row) return;
+      char.conditions = normalizeConditions(char.conditions);
+      if (isEdit) {
+        const i = char.conditions.findIndex(x => x.id === existing.id);
+        if (i >= 0) char.conditions[i] = row;
+        else char.conditions.push(row);
+      } else {
+        char.conditions.push(row);
+      }
+      applyConditionCaps(char);
+      char.updatedAt = Date.now();
+      this.saveState();
+      this.bus.emit('cast.updated', { character: char });
+      backdrop.remove();
+      this._renderList();
+    });
+    setTimeout(() => nameEl.focus(), 0);
   }
 
   _invState() {
@@ -2860,6 +4869,17 @@ export class CastModule extends Module {
     this.bus.emit('cast.updated', { character: char });
     if (result.landed) {
       this.bus.emit('motivation.updated', { characterId: result.characterId });
+      if (hook.sceneUid) {
+        this.bus.emit('motivation.sceneResolved', {
+          characterId: result.characterId,
+          stepId: result.step.id,
+        });
+      } else {
+        this.bus.emit('motivation.sceneCleared', {
+          characterId: result.characterId,
+          stepId: result.step.id,
+        });
+      }
     }
     return result;
   }
@@ -3031,14 +5051,24 @@ export class CastModule extends Module {
 
   _openPlotHookDialog(char, existing = null) {
     const isEdit = !!existing;
-    const hook = normalizePlotHook(existing) || { name: '', description: '', assignedTo: '', sceneUid: '', active: true };
-    const hint = isEdit ? hookBoardHint(this.storage, hook) : 'Assign a Star, Lead, Major, or Foil and link a Script scene to file this on their Motivation board.';
+    const hook = normalizePlotHook(existing) || {
+      name: '', description: '', assignedTo: '', sceneUid: '', kind: 'TASK', deadline: '', outcome: '', active: true,
+    };
+    const hint = isEdit ? hookBoardHint(this.storage, hook) : 'Assign a Star, Lead, Major, or Foil and link a Script scene to file this as a beat on their Motivation board.';
 
     const backdrop = this._buildModal(`
       <div class="cast-modal-title">PLOT HOOK</div>
       <div class="cast-modal-subtitle">— ${isEdit ? 'Refit hook' : 'New hook'} —</div>
       <div class="cast-modal-field"><label>Name</label>
         <input type="text" data-field="name" value="${esc(hook.name)}"></div>
+      <div class="cast-modal-field"><label>Kind</label>
+        <select data-field="kind">
+          ${PLOT_HOOK_KINDS.map(k =>
+            `<option value="${k.id}" ${hook.kind === k.id ? 'selected' : ''}>${k.emoji} ${esc(k.label)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="cast-modal-field"><label>Deadline (optional)</label>
+        <input type="text" data-field="deadline" value="${esc(hook.deadline)}" placeholder="soon, Friday, dusk…"></div>
       <div class="cast-modal-field"><label>Description (optional)</label>
         <textarea data-field="description" style="min-height:40px">${esc(hook.description)}</textarea></div>
       <div class="cast-modal-field"><label>Assigned to</label>
@@ -3067,9 +5097,15 @@ export class CastModule extends Module {
       const description = backdrop.querySelector('[data-field="description"]').value.trim();
       const assignedTo = backdrop.querySelector('[data-field="assignedTo"]').value.trim();
       const sceneUid = backdrop.querySelector('[data-field="sceneUid"]').value.trim();
+      const kind = backdrop.querySelector('[data-field="kind"]').value.trim();
+      const deadline = backdrop.querySelector('[data-field="deadline"]').value.trim();
       const active = backdrop.querySelector('[data-field="active"]').checked;
-      if (!name) { alert('Name is required.'); return; }
-      const next = { name, description, assignedTo, sceneUid, active, text: name };
+      if (!name) { void showtimeAlert('Name is required.', { title: 'PLOT HOOK' }); return; }
+      const next = {
+        name, description, assignedTo, sceneUid, kind, deadline,
+        outcome: hook.outcome || '',
+        active, text: name,
+      };
       let row = existing;
       if (isEdit) {
         Object.assign(existing, next);
@@ -3081,7 +5117,7 @@ export class CastModule extends Module {
       backdrop.remove();
       this._renderList();
       if (result.reason === 'billing' && assignedTo && sceneUid) {
-        alert('Motivation boards are for Star, Lead, Major, or Foil. The hook is saved here until you reassign it.');
+        void showtimeAlert('Motivation boards are for Star, Lead, Major, or Foil. The hook is saved here until you reassign it.', { title: 'PLOT HOOK' });
       }
     });
     setTimeout(() => backdrop.querySelector('[data-field="name"]').focus(), 0);
@@ -3090,7 +5126,7 @@ export class CastModule extends Module {
   _openPullHooksDialog(char) {
     const rows = listPullableBeats(this.storage);
     if (!rows.length) {
-      alert('No unlinked Motivation beats to pull. Add beats on a Star, Lead, Major, or Foil first.');
+      void showtimeAlert('No unlinked Motivation beats to pull. Add beats on a Star, Lead, Major, or Foil first.', { title: 'FROM MOTIVATION' });
       return;
     }
     const groups = [];
@@ -3126,7 +5162,7 @@ export class CastModule extends Module {
     `);
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const picks = [...backdrop.querySelectorAll('input[type="checkbox"]:checked')];
-      if (!picks.length) { alert('Select at least one beat.'); return; }
+      if (!picks.length) { void showtimeAlert('Select at least one beat.', { title: 'FROM MOTIVATION' }); return; }
       let n = 0;
       const touched = new Set();
       for (const el of picks) {
@@ -3142,14 +5178,15 @@ export class CastModule extends Module {
       for (const id of touched) this.bus.emit('motivation.updated', { characterId: id });
       backdrop.remove();
       this._renderList();
-      if (!n) alert('Those beats were already plot hooks.');
+      if (!n) void showtimeAlert('Those beats were already plot hooks.', { title: 'FROM MOTIVATION' });
     });
   }
 
-  _buildModal(innerHtml) {
+  _buildModal(innerHtml, { ticket = false } = {}) {
     const backdrop = document.createElement('div');
     backdrop.className = 'cast-modal-backdrop';
-    backdrop.innerHTML = `<div class="cast-modal" role="dialog" aria-modal="true">${innerHtml}</div>`;
+    const shell = ticket ? 'cast-modal cast-ticket' : 'cast-modal';
+    backdrop.innerHTML = `<div class="${shell}" role="dialog" aria-modal="true">${innerHtml}</div>`;
     document.body.appendChild(backdrop);
     const close = () => backdrop.remove();
     backdrop.addEventListener('click', e => { if (e.target === backdrop) close(); });
@@ -3365,15 +5402,152 @@ export class CastModule extends Module {
 
   // ─── audit ───────────────────────────────────────────────────────────────────
 
+  /** Own the piece already, or add the garment so the look has a real part. */
+  _ensureOutfitPart(char, name) {
+    const key = String(name || '').trim().toLowerCase();
+    if (!key) return '';
+    const owned = this._ownedKit(char).find(x => String(x.name || '').trim().toLowerCase() === key);
+    if (owned?.id) return owned.id;
+    const piece = {
+      id: uid(),
+      name: String(name).trim().slice(0, 80),
+      description: '',
+      condition: 'pristine',
+      kind: 'item',
+      parentId: null,
+    };
+    if (char.priority === 'star') {
+      this._mirrorStarItem(char, piece, 'wardrobe');
+      return piece.inventoryId || '';
+    }
+    (char.wardrobe ??= []).push(piece);
+    return piece.id;
+  }
+
+  /** One closet look from the character profile. Manual only. */
+  async _runOutfitAudit(char, btn) {
+    if (this._auditBusy) {
+      void showtimeAlert('An audit is already running. Wait for it to finish.', { title: 'OUTFIT AUDIT' });
+      return;
+    }
+    const now = Date.now();
+    if (this._auditLastAt && now - this._auditLastAt < 1600) {
+      void showtimeAlert('Too soon — wait a moment before another Audit (avoids rate limits).', { title: 'OUTFIT AUDIT' });
+      return;
+    }
+    const bio = this._liveBio(char);
+    const profile = String(bio?.text || '').trim();
+    if (!profile) {
+      void showtimeAlert(bio?.emptyHint || 'No character profile to read.', { title: 'OUTFIT AUDIT' });
+      return;
+    }
+    this._auditLastAt = now;
+    this._auditBusy = true;
+    if (btn) btn.disabled = true;
+    const origText = btn?.textContent;
+    if (btn) btn.textContent = '...';
+    try {
+      const ctx = getContext();
+      const identity = resolveCastPromptIdentity(char, this.storage, {
+        characters: ctx.characters ?? [],
+        personas: this._getPersonas(),
+      });
+      const who = this._auditIdentityLine(char, identity, { full: true });
+      const owned = this._ownedKit(char)
+        .map(x => `- ${x.name}`)
+        .join('\n') || 'None';
+      const filed = normalizeOutfits(char.outfits).map(o => o.title).filter(Boolean).join(', ') || 'None';
+      const prompt = `JSON object only. One outfit ${who} is described as wearing in the profile below. Use only clothes and carried pieces the profile actually names. Do not invent a costume, a job uniform, or sleepwear the profile does not describe.
+Type is one of uniform, formal, casual, athletic, swim, underwear, pajama, costume. uniform = work, hero, or school clothes. formal = a suit, gown, or dress clothes. athletic = training or sport. swim = a swimsuit. underwear = underclothes only. pajama = sleepwear. costume = a described disguise or stage costume. Otherwise casual.
+Parts are short garment names for that one look, at most 8. When a piece they already own is the same garment, use that name exactly.
+Already owned:
+${owned}
+Looks already filed:
+${filed}
+Profile:
+${profile.slice(0, 4000)}
+{"title":"","type":"casual","description":"one sentence from the profile","parts":[{"name":""}]}`;
+      const jsonSchema = {
+        name: 'cast_profile_outfit',
+        description: 'One outfit taken from the character profile',
+        strict: false,
+        returnInvalid: true,
+        value: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            type: { type: 'string' },
+            description: { type: 'string' },
+            parts: {
+              type: 'array',
+              maxItems: 8,
+              items: {
+                type: 'object',
+                properties: { name: { type: 'string' } },
+                required: ['name'],
+              },
+            },
+          },
+          required: ['title', 'parts'],
+        },
+      };
+      const response = await this._quietAudit(prompt, { jsonSchema, responseLength: 1200 });
+      const draft = outfitFromProfileDraft(parseJsonObject(response));
+      if (!draft) throw new Error('The profile audit did not return an outfit.');
+      const partIds = [];
+      for (const name of draft.partNames) {
+        const id = this._ensureOutfitPart(char, name);
+        if (id && !partIds.includes(id)) partIds.push(id);
+      }
+      if (!partIds.length) throw new Error('The profile audit did not name any pieces.');
+      const next = {
+        id: uid(),
+        title: draft.title,
+        description: draft.description,
+        type: draft.type,
+        partIds,
+      };
+      char.outfits = normalizeOutfits(char.outfits);
+      const same = char.outfits.findIndex(o => o.title.toLowerCase() === next.title.toLowerCase());
+      if (same >= 0) {
+        next.id = char.outfits[same].id;
+        char.outfits[same] = next;
+      } else {
+        char.outfits.push(next);
+      }
+      char.updatedAt = Date.now();
+      this.saveState();
+      this.bus.emit('cast.updated', { character: char });
+      this.bus.emit('showtime.notice', {
+        kind: 'inventory',
+        items: [{ text: `Outfit · ${next.title}`, mark: '!' }],
+      });
+      this._refreshClosetFold(char);
+      this._renderList();
+    } catch (err) {
+      console.error('[Cast outfit audit]', err);
+      const msg = String(err?.message || err);
+      void showtimeAlert(this._isAuditRateLimit(msg)
+        ? 'Too many requests — wait a few seconds and press Audit again.'
+        : `Audit failed: ${msg}`, { title: 'OUTFIT AUDIT', danger: true });
+    } finally {
+      this._auditBusy = false;
+      if (btn) {
+        btn.disabled = false;
+        if (origText != null) btn.textContent = origText;
+      }
+    }
+  }
+
   async _runAudit(char, kind, btn, opts = {}) {
     if (this._auditBusy) {
-      if (!btn?.dataset?.quiet) alert('An audit is already running. Wait for it to finish.');
+      if (!btn?.dataset?.quiet) void showtimeAlert('An audit is already running. Wait for it to finish.', { title: 'CAST AUDIT' });
       return;
     }
     const now = Date.now();
     const quiet = !!btn?.dataset?.quiet;
     if (!quiet && this._auditLastAt && now - this._auditLastAt < 1600) {
-      alert('Too soon — wait a moment before another Audit (avoids rate limits).');
+      void showtimeAlert('Too soon — wait a moment before another Audit (avoids rate limits).', { title: 'CAST AUDIT' });
       return;
     }
     this._auditLastAt = now;
@@ -3435,10 +5609,12 @@ ${recentChat}
           .map(h => String(normalizePlotHook(h)?.name || '').toLowerCase())
           .filter(Boolean));
         (char.plotHooks ??= []);
+        const added = [];
         items.forEach(it => {
           const name = String(it?.name || it?.text || it?.title || '').trim().slice(0, 80);
           if (!name || have.has(name.toLowerCase())) return;
           have.add(name.toLowerCase());
+          added.push(name);
           char.plotHooks.push({
             id: uid(),
             name,
@@ -3451,6 +5627,13 @@ ${recentChat}
         char.updatedAt = Date.now();
         this.saveState();
         this.bus.emit('cast.updated', { character: char });
+        if (added.length) {
+          const lead = added[0];
+          const text = added.length === 1
+            ? `Plot hook · ${lead}`
+            : `Plot hook · ${lead} +${added.length - 1}`;
+          this.bus.emit('showtime.notice', { kind: 'hook', items: [{ text, mark: '!' }] });
+        }
         this._renderList();
         return;
       }
@@ -3472,7 +5655,8 @@ ${recentChat}
         ...char,
         name: identity.displayName || identity.name || char.name,
       };
-      const kitOn = include.includes('stats') || include.includes('wardrobe') || include.includes('props');
+      const kitOn = include.includes('stats') || include.includes('wardrobe')
+        || include.includes('props') || include.includes('condition');
       const excerptOpts = {
         char: excerptChar,
         sinceCount: opts.sinceCount,
@@ -3531,13 +5715,14 @@ ${recentChat}
       });
 
       let statsOut = { diffs: [], condition: '' };
-      if (include.includes('stats') && delta.stats) {
-        statsOut = this._applyStatsAudit(char, { stats: delta.stats });
-      } else if (kind === 'stats' && !delta.stats) {
+      if (include.includes('stats') && (delta.statEvents || delta.stats)) {
+        statsOut = this._applyStatsAudit(char, { statEvents: delta.statEvents, stats: delta.stats });
+      } else if (kind === 'stats' && !delta.statEvents && !delta.stats) {
         throw new Error('Audit returned no tracker values. Try Audit again.');
       }
       const kitOut = applyCastDelta(char, delta, {
         include,
+        storage: this.storage,
         onStarAdd: (c, item, k) => this._mirrorStarItem(c, item, k),
         onStarUpdate: (c, item, k) => this._mirrorStarItem(c, item, k),
         onStarRemove: (c, item, k) => this._relinquishKitItem(c, item, k),
@@ -3560,9 +5745,9 @@ ${recentChat}
       console.error('[Cast audit]', err);
       const msg = String(err?.message || err);
       if (!quiet) {
-        alert(this._isAuditRateLimit(msg)
+        void showtimeAlert(this._isAuditRateLimit(msg)
           ? 'Too many requests — wait a few seconds and press Audit again.'
-          : `Audit failed: ${msg}`);
+          : `Audit failed: ${msg}`, { title: 'CAST AUDIT', danger: true });
       }
     } finally {
       this._auditBusy = false;
@@ -3583,9 +5768,10 @@ ${recentChat}
       ...customDefs,
     ];
     const trackers = defs.map(def => {
-      const val = def.custom
+      const raw = def.custom
         ? this._customStatValue(stats, def.id)
         : clamp(stats[def.id] ?? (def.direction === 'down' ? 0 : 100));
+      const val = Math.min(raw, conditionStatCap(char, def.id));
       const label = stateLabel(def, val);
       return {
         id: def.id,
@@ -3604,48 +5790,83 @@ ${recentChat}
     return { trackers, lines };
   }
 
+  /**
+   * @param {object} parsed `{ statEvents?: {id: {delta, lines}}, stats?: {rawId: number} }`.
+   *   statEvents (summed per-action deltas) takes priority per tracker id; the legacy
+   *   absolute-value `stats` bag is only used as a fallback for ids events didn't touch.
+   */
   _applyStatsAudit(char, parsed) {
     if (!char.stats) char.stats = DEFAULT_STATS();
-    const bag = parsed?.stats && typeof parsed.stats === 'object' ? parsed.stats : parsed;
-    if (!bag || typeof bag !== 'object') throw new Error('Missing stats object in AI response.');
+    const events = parsed?.statEvents && typeof parsed.statEvents === 'object' ? parsed.statEvents : null;
+    const legacyBag = parsed?.stats && typeof parsed.stats === 'object' ? parsed.stats : null;
+    if (!events && !legacyBag) throw new Error('Missing stats object in AI response.');
     const customDefs = customBarDefsFromTrackers(this.storage);
     const customIds = new Set(customDefs.map(d => d.id));
     const baseIds = new Set(STAT_DEFS.base.map(d => d.id));
     const hardIds = new Set(STAT_DEFS.hard.map(d => d.id));
     const defs = [...STAT_DEFS.base, ...STAT_DEFS.hard, ...customDefs];
-    const defById = Object.fromEntries(defs.map(d => [d.id, d]));
     const dirById = Object.fromEntries(defs.map(d => [d.id, d.direction === 'down' ? 'down' : 'up']));
     let difficulty = 'normal';
     try { difficulty = this.storage.getChat('backstage', {})?.trackers?.status?.difficulty || 'normal'; } catch { /* ignore */ }
     if (!char.stats.custom || typeof char.stats.custom !== 'object') char.stats.custom = {};
+
+    const legacyById = {};
+    if (legacyBag) {
+      for (const [rawId, raw] of Object.entries(legacyBag)) {
+        if (rawId === 'condition' || rawId === 'enabled' || rawId === 'hardMode' || rawId === 'custom') continue;
+        const id = resolveTrackerId(rawId, defs) || String(rawId || '').trim();
+        const n = Number(raw);
+        if (!id || !Number.isFinite(n)) continue;
+        legacyById[id] = clamp(Math.round(n));
+      }
+    }
+
     const diffs = [];
-    for (const [rawId, raw] of Object.entries(bag)) {
-      if (rawId === 'condition' || rawId === 'enabled' || rawId === 'hardMode' || rawId === 'custom') continue;
-      const id = resolveTrackerId(rawId, defs) || String(rawId || '').trim();
-      const n = Number(raw);
-      if (!id || !Number.isFinite(n)) continue;
-      const proposed = clamp(Math.round(n));
-      const def = defById[id];
+    for (const def of defs) {
+      const id = def.id;
       const current = customIds.has(id)
         ? this._customStatValue(char.stats, id)
         : clamp(char.stats[id] ?? (dirById[id] === 'down' ? 0 : 100));
-      const val = applyDifficultyToStat(current, proposed, {
+      const evInfo = events?.[id];
+      let proposed;
+      let lines = [];
+      if (evInfo && Number.isFinite(Number(evInfo.delta)) && Number(evInfo.delta) !== 0) {
+        proposed = clamp(current + Number(evInfo.delta));
+        lines = Array.isArray(evInfo.lines) ? evInfo.lines : [];
+      } else if (Object.prototype.hasOwnProperty.call(legacyById, id)) {
+        proposed = legacyById[id];
+      } else {
+        continue;
+      }
+      const val = Math.min(applyDifficultyToStat(current, proposed, {
         difficulty,
         direction: dirById[id] || 'up',
-      });
+      }), conditionStatCap(char, id));
       if (customIds.has(id)) char.stats.custom[id] = val;
       else if (baseIds.has(id) || (char.stats.hardMode && hardIds.has(id))) char.stats[id] = val;
       else continue;
       if (val === current) continue;
       diffs.push({
         id,
-        label: def?.label || id,
+        label: def.label || id,
         from: current,
         to: val,
-        fromState: def ? stateLabel(def, current) : '',
-        toState: def ? stateLabel(def, val) : '',
-        levelMode: def?.levelMode || 'label',
+        fromState: stateLabel(def, current),
+        toState: stateLabel(def, val),
+        levelMode: def.levelMode || 'label',
+        lines,
       });
+    }
+    const who = this._resolveDisplay(char).name;
+    for (const d of diffs) {
+      if (!d.fromState || !d.toState || d.fromState === d.toState) continue;
+      const detail = d.lines?.length ? ` (${d.lines.join('; ')})` : '';
+      try {
+        appendNowLedger(this.storage, {
+          kind: 'stat',
+          text: `${who} · ${d.label}: ${d.fromState} → ${d.toState}${detail}`,
+        });
+      } catch { /* ignore */ }
     }
     return { diffs, condition: '' };
   }

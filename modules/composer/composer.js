@@ -19,6 +19,7 @@ import { locationTagEditorHTML, readLocationTags } from '../../lib/locationTagPi
 import { bindLocationCatalogPicker } from '../../lib/locationCatalog.js';
 import { getCastMembers } from '../../lib/castCatalog.js';
 import { rafMove } from '../../lib/uiPerf.js';
+import { showtimeAlert, showtimeConfirm, showtimePrompt } from '../../lib/dialogs.js';
 
 const FACETS = COMPOSER_FACETS;
 const TAG_ROLES = [
@@ -606,10 +607,11 @@ export class ComposerModule extends Module {
     this.render(this.container);
   }
 
-  _saveQueueHistoryAsAlbum(id) {
+  async _saveQueueHistoryAsAlbum(id) {
     const row = this._queueHistory().find(h => h.id === id);
     if (!row?.ids?.length) return;
-    const title = prompt('Album title', row.label || 'Scene queue')?.trim();
+    const rawTitle = await showtimePrompt('Album title', { title: 'SAVE AS ALBUM', defaultValue: row.label || 'Scene queue', confirmLabel: 'Save' });
+    const title = rawTitle?.trim();
     if (!title) return;
     const fresh = {
       id: uid(),
@@ -1564,7 +1566,7 @@ export class ComposerModule extends Module {
     if (!t) return;
     if (!String(t.title || '').trim() || !Number(t.durationMs)) {
       this._openEditor(t);
-      alert('Name and duration are required to commit a cue.');
+      void showtimeAlert('Name and duration are required to commit a cue.', { title: 'COMMIT CUE' });
       return;
     }
     t.committed = true;
@@ -1572,10 +1574,10 @@ export class ComposerModule extends Module {
     this.render(this.container);
   }
 
-  _removeTrack(id) {
+  async _removeTrack(id) {
     const t = this._track(id);
     if (!t) return;
-    if (!confirm(`File away “${t.title}”?`)) return;
+    if (!await showtimeConfirm(`File away “${t.title}”?`, { title: 'FILE AWAY CUE', danger: true, confirmLabel: 'File away' })) return;
     if (this._nowPlayingId === id) {
       this._stopEngines();
       this._stopTick();
@@ -1625,7 +1627,7 @@ export class ComposerModule extends Module {
     });
     backdrop.querySelector('[data-action="connect"]').addEventListener('click', () => {
       const id = backdrop.querySelector('[data-field="clientId"]').value.trim();
-      if (!id) { alert('Client ID is required.'); return; }
+      if (!id) { void showtimeAlert('Client ID is required.', { title: 'SPOTIFY' }); return; }
       sp.clientId = id;
       Object.assign(sp, { accessToken: '', refreshToken: '', expiresAt: 0, displayName: '', grantedScope: '' });
       this.saveState();
@@ -1684,11 +1686,11 @@ export class ComposerModule extends Module {
     if (!code || !raw) return;
     let saved;
     try { saved = JSON.parse(raw); } catch {
-      alert('Spotify connect failed — could not read the saved login challenge. Try Connect again.');
+      void showtimeAlert('Spotify connect failed — could not read the saved login challenge. Try Connect again.', { title: 'SPOTIFY', danger: true });
       return;
     }
     if (!saved?.verifier || saved.state !== state) {
-      alert('Spotify connect failed — login state mismatch (stale or interrupted). Try Connect again.');
+      void showtimeAlert('Spotify connect failed — login state mismatch (stale or interrupted). Try Connect again.', { title: 'SPOTIFY', danger: true });
       sessionStorage.removeItem(SP_PKCE_KEY);
       return;
     }
@@ -1717,7 +1719,7 @@ export class ComposerModule extends Module {
       this.saveState();
     } catch (err) {
       console.error('[Composer Spotify]', err);
-      alert(`Spotify connect failed: ${err.message || err}`);
+      void showtimeAlert(`Spotify connect failed: ${err.message || err}`, { title: 'SPOTIFY', danger: true });
     }
   }
 
@@ -1850,8 +1852,8 @@ export class ComposerModule extends Module {
     });
     backdrop.querySelector('[data-action="cancel"]').addEventListener('click', () => backdrop.remove());
     backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
-    backdrop.querySelector('[data-action="remove"]')?.addEventListener('click', () => {
-      if (!confirm('File away this album? Tracks become Singles.')) return;
+    backdrop.querySelector('[data-action="remove"]')?.addEventListener('click', async () => {
+      if (!await showtimeConfirm('File away this album? Tracks become Singles.', { title: 'FILE AWAY ALBUM', danger: true, confirmLabel: 'File away' })) return;
       const albumId = existing.id;
       // Unlink tracks so they reappear under Singles instead of vanishing.
       for (const t of this._tracks()) {
@@ -1865,7 +1867,7 @@ export class ComposerModule extends Module {
     });
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
       const title = backdrop.querySelector('[data-field="title"]').value.trim();
-      if (!title) { alert('Title is required.'); return; }
+      if (!title) { void showtimeAlert('Title is required.', { title: 'ALBUM' }); return; }
       const badge = backdrop.querySelector('[data-field="badge"]').value.trim();
       const scriptUid = backdrop.querySelector('[data-field="scriptUid"]').value;
       const artist = backdrop.querySelector('[data-field="artist"]')?.value.trim() || '';
@@ -1898,7 +1900,7 @@ export class ComposerModule extends Module {
     backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
     backdrop.querySelector('[data-action="read"]').addEventListener('click', async () => {
       const url = backdrop.querySelector('[data-field="url"]').value.trim();
-      if (!url) { alert('Paste a link.'); return; }
+      if (!url) { void showtimeAlert('Paste a link.', { title: 'IMPORT ALBUM' }); return; }
       const btn = backdrop.querySelector('[data-action="read"]');
       btn.disabled = true;
       btn.textContent = '...';
@@ -1907,7 +1909,7 @@ export class ComposerModule extends Module {
         backdrop.remove();
         this.render(this.container);
       } catch (err) {
-        alert(err.message || String(err));
+        void showtimeAlert(err.message || String(err), { title: 'IMPORT ALBUM', danger: true });
         btn.disabled = false;
         btn.textContent = 'Read link';
       }
@@ -2204,7 +2206,7 @@ export class ComposerModule extends Module {
       const url = urlInp.value.trim();
       const backupUrl = backdrop.querySelector('[data-field="backupUrl"]')?.value.trim() || '';
       const title = titleInp.value.trim() || hostTitle(url) || 'Untitled cue';
-      if (!url) { alert('A source link is required.'); return; }
+      if (!url) { void showtimeAlert('A source link is required.', { title: 'CUE EDITOR' }); return; }
       const keywordFacets = this._readFacets(backdrop);
       const durationMs = parseDuration(durInp.value) || (existing?.durationMs ?? 0);
       const source = detectSource(url).kind;
@@ -2798,7 +2800,7 @@ export class ComposerModule extends Module {
   async _suggestSpotifyFromTags() {
     const token = await this._spotifyToken();
     if (!token) {
-      alert('Connect Spotify Premium first.');
+      void showtimeAlert('Connect Spotify Premium first.', { title: 'SPOTIFY' });
       return;
     }
     const called = this._calledFacets();
@@ -2848,7 +2850,7 @@ export class ComposerModule extends Module {
       this.render(this.container);
       this._hint(`Suggested “${row.title}” from Spotify.`);
     } catch (err) {
-      alert(err.message || String(err));
+      void showtimeAlert(err.message || String(err), { title: 'SPOTIFY', danger: true });
     }
   }
 

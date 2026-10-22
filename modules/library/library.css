@@ -865,6 +865,40 @@ button.lib-book-toggle {
   color: var(--st-ink);
   font-family: var(--st-font-body);
 }
+.lib-modal-backdrop:has(.lib-modal--page) {
+  background: rgba(0, 0, 0, 0.85);
+}
+.lib-modal--page {
+  width: min(760px, 94vw);
+  max-height: 92vh;
+  padding: 16px 18px 18px;
+  border: 3px double var(--st-gold);
+  box-shadow: 0 0 40px rgba(201, 162, 74, 0.3);
+  background: var(--st-paper);
+}
+.lib-modal--page .lib-modal-title {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  text-align: center;
+  color: var(--st-ink);
+}
+.lib-modal--page .lib-modal-sub {
+  font-size: 10px;
+  text-align: center;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+.lib-modal--page .lib-modal-actions {
+  border-top: 1px solid var(--st-gold-dim);
+  padding-top: 12px;
+}
+.lib-modal--page .st-file-page {
+  margin: 0 0 12px;
+  max-height: calc(92vh - 128px);
+  overflow: auto;
+}
 .lib-modal-title {
   font-family: var(--st-font-title);
   font-size: 13px;
@@ -1087,3 +1121,106 @@ button.lib-book-toggle {
 }
 .lib-bulk-where { color: var(--st-gold-dim); }
 .lib-bulk-src { color: var(--st-sepia); }
+
+.lib-body > .lib-cabinet {
+  flex: 1;
+}
+.lib-cabinet {
+  display: grid;
+  grid-template-columns: minmax(140px, 38%) 1fr;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.lib-cabinet-list {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px dashed rgba(60, 70, 75, 0.3);
+}
+.lib-cabinet-read {
+  min-width: 0;
+  overflow: auto;
+  padding: 10px;
+}
+.lib-cab-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  font-family: var(--st-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--st-gold-dim);
+  border-bottom: 1px solid rgba(122, 98, 63, 0.28);
+}
+.lib-file-row {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  gap: 2px;
+  padding: 6px 10px;
+  border: none;
+  border-bottom: 1px dotted rgba(60, 70, 75, 0.28);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 0;
+  box-shadow: none;
+}
+.lib-file-row:hover { background: rgba(196, 160, 88, 0.12); }
+.lib-file-row.on { background: rgba(196, 160, 88, 0.22); }
+.lib-file-title {
+  font-family: var(--st-font-mono);
+  font-size: 12px;
+}
+.lib-file-meta {
+  font-family: var(--st-font-mono);
+  font-size: 9px;
+  color: var(--st-sepia);
+}
+.lib-file-read-head { margin-bottom: 8px; }
+.lib-file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+}
+.lib-file-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 0 0 8px;
+  font-family: var(--st-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.lib-file-bulk,
+.lib-file-tools {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+.st-file-draft {
+  min-height: 180px;
+  outline: none;
+}
+.st-file-draft:empty::before {
+  content: 'Write the document…';
+  opacity: 0.45;
+}
+.lib-file-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.lib-file-chip {
+  font-family: var(--st-font-mono);
+  font-size: 9px;
+  border: 1px dashed var(--st-sepia);
+  padding: 1px 6px;
+}
+.lib-file-chip.knows { border-color: #3d7a68; color: #1a3d34; }
+.lib-file-chip.unaware { border-color: #7a1f1f; color: #7a1f1f; }

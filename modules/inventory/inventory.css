@@ -181,6 +181,18 @@ button.inv-audit:disabled {
   overflow: auto;
   padding: 8px;
 }
+.inv-col-body--here {
+  flex: 0 1 auto;
+  max-height: 42%;
+}
+.inv-surface-label {
+  font-family: var(--st-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #6a757c;
+  padding: 4px 2px 2px;
+}
 .inv-empty {
   font-style: italic;
   color: #6a757c;
@@ -272,6 +284,29 @@ button.inv-audit:disabled {
   background: rgba(36, 48, 56, 0.16);
   color: #243038;
   outline: none;
+}
+.inv-row-act {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  border: 1px solid rgba(36, 48, 56, 0.22);
+  background: transparent;
+  color: #3a4a44;
+  font-family: var(--st-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.inv-row-act:hover { background: rgba(36, 48, 56, 0.08); }
+.inv-more { margin: 4px 0 8px; }
+.inv-more summary {
+  cursor: pointer;
+  font-family: var(--st-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 .inv-menu-pop {
   position: fixed;

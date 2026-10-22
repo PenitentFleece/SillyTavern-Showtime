@@ -12,13 +12,34 @@ import { parseJsonObject, parseJsonArray } from '../../lib/jsonExtract.js';
 import { withShowtimeProfile } from '../../lib/connectionProfile.js';
 import { leanQuietGenerate } from '../../lib/isolatedGen.js';
 import { applyDifficultyToStat } from '../../lib/trackersConfig.js';
+import { stateLabel, STAT_DEFS } from '../../lib/statBars.js';
 import {
   FILL_BANDS, FILL_MAP, AMOUNT_UNITS,
   readAmount, writeAmount, applyAmountOp, spendAmount, deriveFill,
-  formatAmountLine, hasAmount, careKind,
+  formatAmountLine, hasAmount, careKind, amountAllowed, clearAmount,
   smokeInvAmountPure,
 } from '../../lib/invAmount.js';
 import { inferKitKind, smokeKitNestPure, kitChildren, kitDescendantIds } from '../../lib/kitNest.js';
+import {
+  deriveLocator,
+  formatItemPlace,
+  moveItem,
+  stampInventoryLocators,
+  worldFromStorage,
+  smokeItemLocatorPure,
+} from '../../lib/itemLocator.js';
+import { exposeLinkedItem } from '../../lib/fileCabinet.js';
+import {
+  readHandoffSentence,
+  handoffItemOp,
+  fileOneHandoff,
+  rewindOneHandoff,
+} from '../../lib/receipt.js';
+import {
+  buildShowtimeModal,
+  showtimeAlert,
+  showtimeConfirm,
+} from '../../lib/dialogs.js';
 
 const CONDITIONS = [
   { id: 'pristine', label: 'Pristine', color: '#6b8f4a' },
@@ -58,7 +79,7 @@ const USE_VERB_MAP = Object.fromEntries(USE_VERBS.map(v => [v.id, v]));
 
 // Cheap pre-filter so we only pay for a quiet-prompt classification call on
 // messages that plausibly involve handing/forcing/offering something over.
-const OFFER_CUE_RE = /\b(offers?|hands?(?:\s+(?:you|over|across))?|holds?\s+out|thrusts?|forces?|shoves?|presses?(?:\s+(?:into|in))?|gives?\s+you|passes?\s+you|slides?\s+(?:you|across|it)|produces?|pulls?\s+out|draws?|unsheathes?|tosses?\s+you|hurls?(?:\s+at\s+you)?|presents?)\b/i;
+const OFFER_CUE_RE = /\b(offers?(?:\s+you)?|hands?\s+(?:you|over|across)|holds?\s+out|gives?\s+you|passes?\s+you|slides?\s+(?:you|across)|pulls?\s+out|draws?\s+out|unsheathes?|tosses?\s+you|hurls?\s+at\s+you)\b/i;
 
 export class InventoryModule extends Module {
   static id = 'inventory';
@@ -76,26 +97,23 @@ export class InventoryModule extends Module {
     }
     if (!this._starSyncBound) {
       this._starSyncBound = true;
-      this.bus.on('inventory.updated', () => this._syncStarLoadout());
+      this.bus.on('inventory.updated', () => {
+        this._syncStarLoadout();
+        if (this.container && this.state.handoffSeed?.applied) this.render(this.container);
+      });
+      // The turn receipt already files item moves. A second inventory
+      // audit here was another model call on the same lines.
     }
     this._pendingUseId = null;
-    const amountSmoke = smokeInvAmountPure() || smokeKitNestPure();
+    const amountSmoke = smokeInvAmountPure() || smokeKitNestPure() || smokeItemLocatorPure();
     if (amountSmoke) console.warn('[Showtime/Inventory] smoke failed:', amountSmoke);
     this._registerInjections();
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => {
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => {
       if (this._pendingUseId) {
         this._pendingUseId = null;
         this.bus.emit('showtime.stateChanged');
       }
-      // A cast reply just landed while an Offer/Use/Force is awaiting a
-      // verdict — read it and classify accept/reject/damage.
-      const pending = this.state.pending;
-      if (pending && !pending.classifying && !pending.resolved) {
-        pending.classifying = true;
-        this.saveState();
-        this._classifyPendingUse(pending.id);
-        if (this.container) this.render(this.container);
-      }
+      this._readPendingHandoff(messageId);
       // Cast-initiated: scan the message that just rendered for an NPC
       // offering/using/forcing/giving an item onto {{user}}. Dedupe by chat
       // length so re-renders of the same message don't rescan it.
@@ -105,12 +123,12 @@ export class InventoryModule extends Module {
         this._scanIncomingOffer();
       }
     });
-    eventSource.on(event_types.MESSAGE_SENT, () => this._scheduleInvCadence());
+    eventSource.on(event_types.MESSAGE_SENT, () => { /* receipt cadence owns filing */ });
     eventSource.on(event_types.MESSAGE_SWIPED, () => clearTimeout(this._invTrackTimer));
   }
 
   getDefaultState() {
-    return { static: [], mobile: [], currency: {}, openBoxes: [], pending: null, incoming: null };
+    return { static: [], mobile: [], currency: {}, openBoxes: [], pending: null, incoming: null, lastExchange: null, handoffSeed: null };
   }
 
   _migrate() {
@@ -132,19 +150,26 @@ export class InventoryModule extends Module {
     if (!s.currency) { s.currency = {}; changed = true; }
     if (s.pending === undefined) { s.pending = null; changed = true; }
     if (s.incoming === undefined) { s.incoming = null; changed = true; }
+    if (s.lastExchange === undefined) { s.lastExchange = null; changed = true; }
+    if (s.handoffSeed === undefined) { s.handoffSeed = null; changed = true; }
     for (const loc of ['static', 'mobile']) {
       for (const x of this._list(loc)) {
         const before = JSON.stringify({ amount: x.amount ?? null, fill: x.fill || '' });
-        const a = readAmount(x);
-        if (a) writeAmount(x, a);
-        else if (x.amount || x.fill) {
-          delete x.amount;
-          delete x.fill;
+        if (!amountAllowed(x)) {
+          if (x.amount || x.fill) clearAmount(x);
+        } else {
+          const a = readAmount(x);
+          if (a) writeAmount(x, a);
+          else if (x.amount || x.fill) {
+            delete x.amount;
+            delete x.fill;
+          }
         }
         const after = JSON.stringify({ amount: x.amount ?? null, fill: x.fill || '' });
         if (before !== after) changed = true;
       }
     }
+    stampInventoryLocators(s, { ownerId: this._starChar()?.id });
     if (changed) this.saveState();
   }
 
@@ -159,7 +184,6 @@ export class InventoryModule extends Module {
   async onChatChanged() {
     this._lastIncomingScanLen = -1;
     this._resetInvTrackCursor();
-    if (this.container) await this.render(this.container);
   }
 
   _starChar() {
@@ -190,6 +214,20 @@ export class InventoryModule extends Module {
     return this._list(location).filter(x => (x.parentId ?? null) === parentId);
   }
 
+  _itemLoc(item) {
+    const list = this.state.static.includes(item) ? 'static' : 'mobile';
+    return deriveLocator(item, { list, ownerId: this._starChar()?.id || 'star' });
+  }
+
+  _placePhrase(item) {
+    const hint = {
+      list: this.state.static.includes(item) ? 'static' : 'mobile',
+      ownerId: this._starChar()?.id || 'star',
+    };
+    const world = { inventory: this.state, characters: [], compass: {} };
+    return formatItemPlace(item, hint, world);
+  }
+
   _descendants(location, containerId) {
     const list = this._list(location);
     const ids = new Set([containerId]);
@@ -215,10 +253,9 @@ export class InventoryModule extends Module {
     const player = this._playerName();
     const star = this._starChar();
     const wornInv = [...this.state.static, ...this.state.mobile].filter(x =>
-      x.kind === 'item' && x.category === 'wearable' && x.equippedTo?.type === 'player',
+      this._itemLoc(x).where === 'worn',
     );
-    const wornCast = (star?.wardrobe ?? []).filter(w => !wornInv.some(i => i.id === w.inventoryId));
-    const worn = [...wornInv, ...wornCast];
+    const worn = wornInv;
 
     container.innerHTML = `
       <div class="inv-root">
@@ -241,6 +278,7 @@ export class InventoryModule extends Module {
         </div>
         ${this._renderPendingBanner()}
         ${this._renderIncomingBanner()}
+        ${this._renderUndoBanner()}
         <div class="inv-cols">
           ${this._renderColumn('static')}
           ${this._renderColumn('mobile')}
@@ -255,15 +293,24 @@ export class InventoryModule extends Module {
     container.querySelector('[data-action="pending-cancel"]')?.addEventListener('click', () => {
       this._cancelPending();
     });
-    container.querySelector('[data-action="pending-apply"]')?.addEventListener('click', () => {
-      const outcome = container.querySelector('[data-pending-field="outcome"]')?.value || 'reject';
-      const damage = container.querySelector('[data-pending-field="damage"]')?.value || 'none';
-      this._applyPendingResolution(outcome, damage);
+    container.querySelector('[data-action="pending-accept"]')?.addEventListener('click', () => {
+      this._commitHandoff('take', this.state.pending?.mesId);
     });
-    container.querySelector('[data-action="incoming-apply"]')?.addEventListener('click', () => {
-      const outcome = container.querySelector('[data-incoming-field="outcome"]')?.value || 'reject';
+    container.querySelector('[data-action="pending-consume"]')?.addEventListener('click', () => {
+      this._commitHandoff('use', this.state.pending?.mesId);
+    });
+    container.querySelector('[data-action="pending-leave"]')?.addEventListener('click', () => {
+      this._commitHandoff('refuse', this.state.pending?.mesId);
+    });
+    container.querySelector('[data-action="incoming-accept"]')?.addEventListener('click', () => {
       const damage = container.querySelector('[data-incoming-field="damage"]')?.value || 'none';
-      this._applyIncomingResolution(outcome, damage);
+      this._applyIncomingResolution('accept_transfer', damage);
+    });
+    container.querySelector('[data-action="incoming-leave"]')?.addEventListener('click', () => {
+      this._applyIncomingResolution('reject', 'none');
+    });
+    container.querySelector('[data-action="undo-exchange"]')?.addEventListener('click', () => {
+      this._undoExchange();
     });
     container.querySelector('[data-action="incoming-dismiss"]')?.addEventListener('click', () => {
       const name = this.state.incoming?.itemName;
@@ -274,6 +321,20 @@ export class InventoryModule extends Module {
     });
     container.querySelectorAll('[data-action="add"]').forEach(btn => {
       btn.addEventListener('click', () => this._openAddDialog(btn.dataset.location));
+    });
+    container.querySelectorAll('[data-action="use-item"]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const found = this._find(btn.dataset.id);
+        if (found) this._runItemAction('use', found.item.id, found.location);
+      });
+    });
+    container.querySelectorAll('[data-action="move-item"]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const found = this._find(btn.dataset.id);
+        if (found) this._runItemAction('move', found.item.id, found.location);
+      });
     });
     container.querySelectorAll('[data-action="item-menu"]').forEach(btn => {
       btn.addEventListener('click', e => {
@@ -292,6 +353,31 @@ export class InventoryModule extends Module {
 
   _renderColumn(location) {
     const loc = LOCS[location];
+    if (location === 'static') {
+      const roots = this._children('static', null);
+      const here = roots.filter(x => this._itemLoc(x).where === 'room');
+      const trunk = roots.filter(x => this._itemLoc(x).where !== 'room');
+      const trunkBody = trunk.length
+        ? trunk.map(x => this._renderEntry('static', x)).join('')
+        : `<div class="inv-empty">Empty</div>`;
+      return `
+      <div class="inv-col" data-location="static">
+        ${here.length ? `
+        <div class="inv-col-head">
+          <div class="inv-col-title">Here</div>
+          <div class="inv-col-sub">Left in the scene</div>
+        </div>
+        <div class="inv-col-body inv-col-body--here">${this._renderHereGroups(here)}</div>` : ''}
+        <div class="inv-col-head">
+          <div class="inv-col-title">${esc(loc.title)}</div>
+          <div class="inv-col-sub">${esc(loc.sub)}</div>
+        </div>
+        <div class="inv-col-body">
+          ${trunkBody}
+          <button class="inv-add" data-action="add" data-location="static">+ Add</button>
+        </div>
+      </div>`;
+    }
     const roots = this._children(location, null);
     const body = roots.length
       ? roots.map(x => this._renderEntry(location, x)).join('')
@@ -308,6 +394,19 @@ export class InventoryModule extends Module {
         </div>
       </div>
     `;
+  }
+
+  _renderHereGroups(roots) {
+    const groups = new Map();
+    for (const x of roots) {
+      const surface = this._itemLoc(x).surface || 'in the room';
+      if (!groups.has(surface)) groups.set(surface, []);
+      groups.get(surface).push(x);
+    }
+    return [...groups.entries()].map(([surface, items]) => `
+      <div class="inv-surface-label">${esc(surface)}</div>
+      ${items.map(x => this._renderEntry('static', x)).join('')}
+    `).join('');
   }
 
   _renderEntry(location, item, nested = false) {
@@ -339,6 +438,10 @@ export class InventoryModule extends Module {
     const catBadge = isContainer
       ? ''
       : `<span class="inv-item-cat" style="background:${cat?.color ?? '#8a8474'}">${esc(cat?.label ?? 'Item')}</span>`;
+    const canUse = !isContainer || hasAmount(item);
+    const actions = `
+      ${canUse ? `<button type="button" class="inv-row-act" data-action="use-item" data-id="${item.id}">Use</button>` : ''}
+      <button type="button" class="inv-row-act" data-action="move-item" data-id="${item.id}">Move</button>`;
 
     return `
       <div class="inv-item${nested ? ' inv-item--in' : ''}${isContainer ? ' inv-item--box' : ''}" style="border-left-color:${border}">
@@ -349,6 +452,7 @@ export class InventoryModule extends Module {
           ${catBadge}
           ${condBadge}
           ${fillBadge}
+          ${actions}
           <button type="button" class="inv-kebab" data-action="item-menu" data-id="${item.id}" title="Actions" aria-label="Item actions">···</button>
         </div>
         ${item.description ? `<div class="inv-item-desc">${esc(item.description)}</div>` : ''}
@@ -362,39 +466,27 @@ export class InventoryModule extends Module {
     const p = this.state.pending;
     if (!p) return '';
     const verbInfo = USE_VERB_MAP[p.verb] || USE_VERB_MAP.use;
-    if (p.resolved) {
-      const r = p.resolved;
+    if (!p.ready && !p.resolved) {
       return `
         <div class="inv-pending">
-          <div class="inv-pending-head">${p.classifyFailed
-            ? `Couldn't auto-read the reply — resolve “${esc(p.itemName)}” manually:`
-            : `${esc(p.targetName)} responded to your ${esc(verbInfo.label.toLowerCase())} of “${esc(p.itemName)}”${r.note ? ` — <em>${esc(r.note)}</em>` : ''}`}</div>
+          <div class="inv-pending-head">Awaiting ${esc(p.targetName)}'s response — you're ${esc(verbInfo.phrase)} “${esc(p.itemName)}” on them</div>
           <div class="inv-pending-row">
-            <select data-pending-field="outcome">
-              <option value="accept_transfer" ${r.outcome === 'accept_transfer' ? 'selected' : ''}>Accepted — moves to ${esc(p.targetName)}</option>
-              <option value="accept_consume" ${r.outcome === 'accept_consume' ? 'selected' : ''}>Accepted — used up / applied</option>
-              <option value="reject" ${r.outcome === 'reject' ? 'selected' : ''}>Rejected — stays with you</option>
-            </select>
-            <select data-pending-field="damage">
-              <option value="none" ${r.damage === 'none' ? 'selected' : ''}>No damage</option>
-              <option value="damaged" ${r.damage === 'damaged' ? 'selected' : ''}>Damaged</option>
-              <option value="destroyed" ${r.damage === 'destroyed' ? 'selected' : ''}>Destroyed</option>
-            </select>
-            <button type="button" class="inv-btn" data-action="pending-apply">Apply</button>
+            <button type="button" class="inv-btn" data-action="pending-cancel">Cancel</button>
           </div>
-        </div>`;
-    }
-    if (p.classifying) {
-      return `
-        <div class="inv-pending">
-          <div class="inv-pending-head">Reading ${esc(p.targetName)}'s response to your ${esc(verbInfo.label.toLowerCase())} of “${esc(p.itemName)}”…</div>
         </div>`;
     }
     return `
       <div class="inv-pending">
-        <div class="inv-pending-head">Awaiting ${esc(p.targetName)}'s response — you're ${esc(verbInfo.phrase)} “${esc(p.itemName)}” on them</div>
+        <div class="inv-pending-head">${esc(p.targetName)} has answered. Take “${esc(p.itemName)}”, mark it used up, or leave it.</div>
         <div class="inv-pending-row">
-          <button type="button" class="inv-btn" data-action="pending-cancel">Cancel</button>
+          <button type="button" class="inv-btn" data-action="pending-accept">Accept</button>
+          <button type="button" class="inv-btn" data-action="pending-consume">Used up</button>
+          <button type="button" class="inv-btn" data-action="pending-leave">Leave it</button>
+          <select data-pending-field="damage" title="Only if the reply broke it">
+            <option value="none" selected>No damage</option>
+            <option value="damaged">Damaged</option>
+            <option value="destroyed">Destroyed</option>
+          </select>
         </div>
       </div>`;
   }
@@ -405,20 +497,30 @@ export class InventoryModule extends Module {
     const verbInfo = USE_VERB_MAP[inc.verb] || USE_VERB_MAP.offer;
     return `
       <div class="inv-pending inv-pending--incoming">
-        <div class="inv-pending-head">${esc(inc.npcName)} is ${esc(verbInfo.phrase)} “${esc(inc.itemName)}”${inc.itemDesc ? ` — <em>${esc(inc.itemDesc)}</em>` : ''} on you</div>
+        <div class="inv-pending-head">${esc(inc.npcName)} is ${esc(verbInfo.phrase)} “${esc(inc.itemName)}”${inc.itemDesc ? ` — <em>${esc(inc.itemDesc)}</em>` : ''}</div>
         <div class="inv-pending-row">
-          <select data-incoming-field="outcome">
-            <option value="accept_transfer">Accept — add to On Person</option>
-            <option value="accept_consume">Accept — used on you (no item kept)</option>
-            <option value="reject" selected>Reject / ignore</option>
-          </select>
-          <select data-incoming-field="damage">
+          <button type="button" class="inv-btn" data-action="incoming-accept">Accept</button>
+          <button type="button" class="inv-btn" data-action="incoming-leave">Leave it</button>
+          <select data-incoming-field="damage" title="Only if it broke">
             <option value="none" selected>No damage</option>
             <option value="damaged">Damaged</option>
             <option value="destroyed">Destroyed</option>
           </select>
-          <button type="button" class="inv-btn" data-action="incoming-apply">Apply</button>
-          <button type="button" class="inv-btn" data-action="incoming-dismiss">Dismiss</button>
+        </div>
+      </div>`;
+  }
+
+  _renderUndoBanner() {
+    const seed = this.state.handoffSeed;
+    const ex = seed?.applied && seed.note
+      ? { note: seed.note }
+      : this.state.lastExchange;
+    if (!ex?.note) return '';
+    return `
+      <div class="inv-pending">
+        <div class="inv-pending-head">${esc(ex.note)}</div>
+        <div class="inv-pending-row">
+          <button type="button" class="inv-btn" data-action="undo-exchange">Undo</button>
         </div>
       </div>`;
   }
@@ -487,17 +589,17 @@ export class InventoryModule extends Module {
   _runItemAction(act, id, location) {
     const pol = this._itemPolicy();
     if (pol.enabled === false && (act === 'use' || act === 'remove' || act === 'equip' || act === 'unequip' || act === 'move')) {
-      alert('Item tracking is disabled under Stage → Trackers → Items.');
+      void showtimeAlert('Item tracking is disabled under Stage → Trackers → Items.', { title: 'INVENTORY' });
       return;
     }
     if (act === 'use') {
-      if (pol.castCanUse === false) { alert('Item use is disabled under Stage → Trackers → Items.'); return; }
+      if (pol.castCanUse === false) { void showtimeAlert('Item use is disabled under Stage → Trackers → Items.', { title: 'INVENTORY' }); return; }
       this._openUseDialog(id, location);
     }
     else if (act === 'edit') this._openEditDialog(id);
     else if (act === 'remove') {
-      if (pol.castCanDelete === false) { alert('Deleting items is disabled under Stage → Trackers → Items.'); return; }
-      this._remove(id);
+      if (pol.castCanDelete === false) { void showtimeAlert('Deleting items is disabled under Stage → Trackers → Items.', { title: 'INVENTORY' }); return; }
+      void this._remove(id);
     }
     else if (act === 'equip') this._openEquipDialog(id);
     else if (act === 'unequip') this._unequip(id);
@@ -512,11 +614,15 @@ export class InventoryModule extends Module {
     if (!found) return;
     if (found.item.kind === 'container' && !hasAmount(found.item)) return;
     let spent = 0;
+    let noticed = false;
     if (hasAmount(found.item)) {
       spent = spendAmount(found.item, spend).spent;
       this.saveState();
       this.bus.emit('inventory.updated');
-      if (spent > 0) this._nudgeStarFromPack(found.item, spent);
+      if (spent > 0) noticed = this._nudgeStarFromPack(found.item, spent);
+    }
+    if (!noticed) {
+      this._emitInvNotice([{ name: found.item.name, label: 'Used', toState: 'used', mark: '!' }]);
     }
     this._pendingUseId = id;
     this.bus.emit('showtime.stateChanged');
@@ -524,23 +630,37 @@ export class InventoryModule extends Module {
   }
 
   _nudgeStarFromPack(item, spent) {
-    if (!spent) return;
+    if (!spent) return false;
     const kind = careKind(item);
-    if (kind !== 'food' && kind !== 'drink') return;
+    if (kind !== 'food' && kind !== 'drink') return false;
     const star = this._starChar() || getStarMember(this.storage);
-    if (!star?.stats?.enabled) return;
+    if (!star?.stats?.enabled || !star.stats.hardMode) return false;
     let difficulty = 'normal';
     try { difficulty = this.storage.getChat('backstage', {})?.trackers?.status?.difficulty || 'normal'; } catch { /* ignore */ }
     const id = kind === 'drink' ? 'thirst' : 'hunger';
+    const def = STAT_DEFS.hard.find(d => d.id === id);
     const current = Math.max(0, Math.min(100, Number(star.stats[id] ?? 100) || 0));
     const bump = Math.min(18, 8 + Math.min(Number(spent) || 1, 3) * 3);
     const proposed = Math.min(100, current + bump);
     const val = applyDifficultyToStat(current, proposed, { difficulty, direction: 'up' });
-    if (val === current) return;
+    if (val === current) return false;
+    const from = def ? stateLabel(def, current) : '';
+    const to = def ? stateLabel(def, val) : '';
     star.stats[id] = val;
     star.updatedAt = Date.now();
     this.storage.saveChat();
     this.bus.emit('cast.updated', { character: star });
+    this.bus.emit('showtime.notice', {
+      kind: 'status',
+      items: [{
+        name: star.name || this._playerName(),
+        label: def?.label || 'Used',
+        fromState: from,
+        toState: to,
+        threshold: !!(from && to && from !== to),
+      }],
+    });
+    return true;
   }
 
   /** Target + verb picker for using/offering/forcing/giving an item to a cast member. */
@@ -629,14 +749,21 @@ export class InventoryModule extends Module {
   }
 
   /** Immediate, unconditional hand-off — no narrative confirmation needed. */
-  _giveToCast(id, location, characterId) {
+  async _giveToCast(id, location, characterId) {
     const found = this._find(id);
     if (!found) return;
     const cast = this.storage.getChat('cast', { characters: [] });
     const char = (cast.characters ?? []).find(c => c.id === characterId);
-    if (!char) { alert('That cast member is gone.'); return; }
-    if (!confirm(`Give ${found.item.name} to ${char.name}?`)) return;
-    this._transferItemToCast(found.item, found.location, char);
+    if (!char) { void showtimeAlert('That cast member is gone.', { title: 'INVENTORY' }); return; }
+    if (!await showtimeConfirm(`Give ${found.item.name} to ${char.name}?`, { title: 'GIVE BELONGING', confirmLabel: 'Give' })) return;
+    this._captureExchange(`Gave ${found.item.name} to ${char.name}.`);
+    const world = worldFromStorage(this.storage);
+    const wearable = found.item.category === 'wearable' && found.item.kind !== 'container';
+    const moved = moveItem(world, id, {
+      where: wearable ? 'worn' : 'carried',
+      ownerId: char.id,
+    }, { reason: `given to ${char.name}` });
+    if (!moved.ok) this._transferItemToCast(found.item, found.location, char);
     this.saveState();
     this.bus.emit('inventory.updated');
     this.render(this.container);
@@ -679,7 +806,7 @@ export class InventoryModule extends Module {
     if (!found) return;
     const cast = this.storage.getChat('cast', { characters: [] });
     const char = (cast.characters ?? []).find(c => c.id === characterId);
-    if (!char) { alert('That cast member is gone.'); return; }
+    if (!char) { void showtimeAlert('That cast member is gone.', { title: 'INVENTORY' }); return; }
     this.state.pending = {
       id: uid(),
       itemId: found.item.id,
@@ -693,6 +820,7 @@ export class InventoryModule extends Module {
       playerName: this._playerName(),
       proposedAt: Date.now(),
       classifying: false,
+      ready: false,
       resolved: null,
       classifyFailed: false,
     };
@@ -713,73 +841,185 @@ export class InventoryModule extends Module {
     this.render(this.container);
   }
 
-  /** Reads the cast reply that just landed and classifies accept/reject + damage via a quiet prompt. */
-  async _classifyPendingUse(pendingId) {
-    const chatToken = this._chatToken();
-    try {
-      const chat = getContext().chat ?? [];
-      let reply = '';
-      for (let i = chat.length - 1; i >= 0; i--) {
-        if (chat[i] && !chat[i].is_user && !chat[i].is_system) { reply = String(chat[i].mes || ''); break; }
-      }
-      const pending = this.state.pending;
-      if (!pending || pending.id !== pendingId) return;
-      const verbInfo = USE_VERB_MAP[pending.verb] || USE_VERB_MAP.use;
-      const prompt = `[System: Return ONLY JSON. No markdown.]
-${pending.playerName} is ${verbInfo.phrase} "${pending.itemName}"${pending.itemDesc ? ` (${pending.itemDesc})` : ''} on ${pending.targetName}.
-
-${pending.targetName}'s latest in-character reply:
-"""
-${reply.slice(0, 1200)}
-"""
-
-Classify the outcome from that reply ONLY.
-JSON schema:
-{"outcome":"accept_transfer"|"accept_consume"|"reject","damage":"none"|"damaged"|"destroyed","note":""}
-- accept_transfer: ${pending.targetName} takes/keeps the item as their own.
-- accept_consume: the item gets used up or applied on ${pending.targetName} and no longer exists afterward (e.g. a potion drunk, a bandage used).
-- reject: ${pending.targetName} refuses or ignores it — the item stays with ${pending.playerName}.
-- damage: only non-"none" if the reply implies the item broke, was damaged, or was destroyed during the exchange (independent of accept/reject).
-- note: one short clause explaining the read (<=15 words).
-JSON:`;
-      const raw = await leanQuietGenerate(prompt, { kind: 'filing' });
-      if (!this._chatTokenStillValid(chatToken)) return;
-      const cur = this.state.pending;
-      if (!cur || cur.id !== pendingId) return;
-      const parsed = parseJsonObject(raw);
-      const outcome = ['accept_transfer', 'accept_consume', 'reject'].includes(parsed?.outcome) ? parsed.outcome : 'reject';
-      const damage = ['none', 'damaged', 'destroyed'].includes(parsed?.damage) ? parsed.damage : 'none';
-      cur.classifying = false;
-      cur.resolved = { outcome, damage, note: String(parsed?.note || '').trim().slice(0, 160) };
-      cur.classifyFailed = !parsed;
-      this.saveState();
-      this.bus.emit('showtime.stateChanged');
-      if (this.container) this.render(this.container);
-    } catch (err) {
-      console.warn('[Inventory use-on classify]', err);
-      if (!this._chatTokenStillValid(chatToken)) return;
-      const cur = this.state.pending;
-      if (cur && cur.id === pendingId) {
-        cur.classifying = false;
-        cur.resolved = { outcome: 'reject', damage: 'none', note: '' };
-        cur.classifyFailed = true;
-        this.saveState();
-        if (this.container) this.render(this.container);
-      }
-    }
+  /** The reply already happened. The desk decides; this does not call the model. */
+  _markPendingReady() {
+    const pending = this.state.pending;
+    if (!pending || pending.ready || pending.resolved) return;
+    pending.ready = true;
+    this.saveState();
   }
 
-  /** Commits the (possibly user-edited) resolution and clears the pending action. */
+  _aimedAtSpeaker(pending, mes) {
+    if (!pending || !mes || mes.is_user || mes.is_system) return false;
+    const speaker = resolveChatSpeaker(this.storage, mes, getContext());
+    if (!speaker) return false;
+    if (pending.targetCharacterId && speaker.id === pending.targetCharacterId) return true;
+    const said = String(speaker.name || '').trim().toLowerCase();
+    const aimed = String(pending.targetName || '').trim().toLowerCase();
+    return !!said && said === aimed;
+  }
+
+  _receiptOn(mesId) {
+    const mes = getContext()?.chat?.[mesId];
+    return !!mes?.extra?.showtimeReceipt;
+  }
+
+  _undoOpFor(found, outcome) {
+    const item = found?.item;
+    const name = String(item?.name || '').trim();
+    if (!name) return null;
+    if (outcome === 'use') {
+      return {
+        name,
+        action: 'add',
+        where: found.location === 'static' ? 'trunk' : 'carried',
+        owner: 'star',
+        kind: item.kind,
+        category: item.category,
+        reason: 'undo handoff',
+      };
+    }
+    return {
+      name,
+      action: 'move',
+      where: item.equippedTo ? 'worn' : (found.location === 'static' ? 'trunk' : 'carried'),
+      owner: 'star',
+      reason: 'undo handoff',
+    };
+  }
+
+  /** Read take, use, or refuse only while this offer is aimed at the speaker. */
+  _readPendingHandoff(messageId) {
+    const pending = this.state.pending;
+    if (!pending || pending.ready || pending.resolved) return;
+    const chat = getContext()?.chat || [];
+    const hinted = Number(messageId);
+    const mes = Number.isFinite(hinted) ? chat[hinted] : chat[chat.length - 1];
+    if (!this._aimedAtSpeaker(pending, mes)) return;
+    const mesId = chat.indexOf(mes);
+    const outcome = readHandoffSentence(mes.mes, pending.itemName);
+    if (!outcome) {
+      pending.ready = true;
+      pending.mesId = mesId;
+      this.saveState();
+      if (this.container) this.render(this.container);
+      return;
+    }
+    this._commitHandoff(outcome, mesId);
+  }
+
+  /** Seed the receipt item op. Apply it now only if this message already has a receipt. */
+  _commitHandoff(outcome, mesId) {
+    const pending = this.state.pending;
+    if (!pending) return;
+    if (outcome === 'refuse') {
+      const name = pending.itemName;
+      this.state.pending = null;
+      this.saveState();
+      this._emitInvNotice([{ name, label: 'Offer', toState: 'rejected', mark: 'X' }]);
+      if (this.container) this.render(this.container);
+      return;
+    }
+    const found = this._find(pending.itemId);
+    const wearable = found?.item?.category === 'wearable' && found.item.kind !== 'container';
+    const op = handoffItemOp({
+      itemName: pending.itemName,
+      wearable,
+      owner: pending.targetName,
+      outcome,
+    });
+    if (!op) return;
+    const seed = {
+      op,
+      undo: this._undoOpFor(found, outcome),
+      mesId,
+      applied: false,
+      note: outcome === 'use'
+        ? `Used up ${pending.itemName}.`
+        : `Gave ${pending.itemName} to ${pending.targetName}.`,
+    };
+    this.state.pending = null;
+    if (this._receiptOn(mesId)) {
+      fileOneHandoff(this.storage, seed);
+      seed.applied = true;
+    }
+    this.state.handoffSeed = seed;
+    this.saveState();
+    this.bus.emit('inventory.updated');
+    if (this.container) this.render(this.container);
+  }
+
+  _captureExchange(note) {
+    let kits = [];
+    try {
+      const cast = this.storage.getChat('cast', { characters: [] });
+      kits = (cast.characters || []).map(c => ({
+        id: c.id,
+        props: structuredClone(c.props || []),
+        wardrobe: structuredClone(c.wardrobe || []),
+      }));
+    } catch { /* cast missing */ }
+    this.state.lastExchange = {
+      at: Date.now(),
+      note: String(note || '').slice(0, 160),
+      static: structuredClone(this.state.static || []),
+      mobile: structuredClone(this.state.mobile || []),
+      kits,
+    };
+  }
+
+  _undoExchange() {
+    const seed = this.state.handoffSeed;
+    if (seed?.applied && seed.undo) {
+      rewindOneHandoff(this.storage, seed);
+      this.state.handoffSeed = null;
+      this.saveState();
+      this.bus.emit('inventory.updated');
+      this.render(this.container);
+      return;
+    }
+    const snap = this.state.lastExchange;
+    if (!snap) return;
+    this.state.static = Array.isArray(snap.static) ? snap.static : [];
+    this.state.mobile = Array.isArray(snap.mobile) ? snap.mobile : [];
+    try {
+      const cast = this.storage.getChat('cast', { characters: [] });
+      for (const kit of snap.kits || []) {
+        const char = (cast.characters || []).find(c => c.id === kit.id);
+        if (!char) continue;
+        char.props = kit.props || [];
+        char.wardrobe = kit.wardrobe || [];
+        char.updatedAt = Date.now();
+        this.bus.emit('cast.updated', { character: char });
+      }
+    } catch { /* cast missing */ }
+    this.state.lastExchange = null;
+    this.saveState();
+    this.bus.emit('inventory.updated');
+    this.render(this.container);
+  }
+
+  /** Commits the desk's choice and keeps one Undo snapshot. */
   _applyPendingResolution(outcome, damage) {
     const pending = this.state.pending;
     if (!pending) return;
     const found = this._find(pending.itemId);
+    const moves = outcome === 'accept_transfer' || outcome === 'accept_consume'
+      || damage === 'destroyed' || damage === 'damaged';
+    if (found && moves) {
+      const note = outcome === 'accept_consume' || damage === 'destroyed'
+        ? `Used up ${pending.itemName}.`
+        : outcome === 'accept_transfer'
+          ? `Gave ${pending.itemName} to ${pending.targetName}.`
+          : `Marked ${pending.itemName} damaged.`;
+      this._captureExchange(note);
+    }
     if (found) {
       if (outcome === 'accept_transfer') {
         const cast = this.storage.getChat('cast', { characters: [] });
         const char = (cast.characters ?? []).find(c => c.id === pending.targetCharacterId);
         if (char) this._transferItemToCast(found.item, found.location, char, { damage });
-        else alert('That cast member is gone — item stays with you.');
+        else void showtimeAlert('That cast member is gone — item stays with you.', { title: 'INVENTORY' });
       } else if (outcome === 'accept_consume') {
         this.state[found.location] = this._list(found.location).filter(x => x.id !== found.item.id);
       } else if (damage === 'destroyed') {
@@ -809,7 +1049,8 @@ JSON:`;
    * cheap regex so the quiet-prompt classification only fires on plausible
    * lines, never on every single message.
    */
-  async _scanIncomingOffer() {
+  /** A tracked belonging named in an offer line. No model call. */
+  _scanIncomingOffer() {
     if (this.state.incoming) return;
     const pol = this._itemPolicy();
     if (pol.enabled === false || pol.castCanUse === false || pol.npcCanOffer === false) return;
@@ -828,90 +1069,66 @@ JSON:`;
     });
     if (!speaker || speaker.priority === 'star' || speaker.priority === 'director') return;
 
-    const chatToken = this._chatToken();
-    try {
-      const player = this._playerName();
-      const roster = [
-        ...(speaker.props ?? []).map(p => {
-          const parent = (speaker.props ?? []).find(x => x.id === p.parentId);
-          return `- ${p.name} (prop${parent ? `, in ${parent.name}` : ''})`;
-        }),
-        ...(speaker.wardrobe ?? []).map(w => `- ${w.name} (worn)`),
-      ].join('\n') || '(none tracked)';
-      const prompt = `[System: Return ONLY JSON. No markdown.]
-${speaker.name} just said this to ${player} ({{user}}):
-"""
-${text.slice(0, 1200)}
-"""
+    const low = text.toLowerCase();
+    const belongings = [
+      ...(speaker.props || []).map(item => ({ item, bucket: 'props' })),
+      ...(speaker.wardrobe || []).map(item => ({ item, bucket: 'wardrobe' })),
+    ];
+    const hit = belongings.find(({ item }) => {
+      const name = String(item?.name || '').trim();
+      return name.length >= 3 && low.includes(name.toLowerCase());
+    });
+    if (!hit) return;
 
-${speaker.name}'s currently tracked belongings:
-${roster}
-
-Decide if ${speaker.name} is offering, using, forcing, or giving a physical item/object to ${player} in that line — not a gesture, glance, or non-physical thing.
-JSON schema:
-{"detected":true|false,"verb":"offer"|"use"|"force"|"give","itemName":"","itemDesc":"","category":"consumable"|"wearable"|"usable"|"misc"}
-- detected=false if nothing physical is being handed over, used on, or forced onto ${player}.
-- itemName should exactly match one of ${speaker.name}'s tracked belongings above when it clearly is one of them; otherwise name the new item plainly.
-- category is a best guess only when itemName is new.
-JSON:`;
-      const raw = await leanQuietGenerate(prompt, { kind: 'filing' });
-      if (!this._chatTokenStillValid(chatToken)) return;
-      if (this.state.incoming) return; // superseded while we were awaiting the model
-
-      const parsed = parseJsonObject(raw);
-      if (!parsed?.detected) return;
-      const verb = USE_VERB_MAP[parsed.verb] ? parsed.verb : 'offer';
-      const itemName = String(parsed.itemName || '').trim().slice(0, 80);
-      if (!itemName) return;
-
-      const nameKey = itemName.toLowerCase();
-      const matchedProp = (speaker.props ?? []).find(p => String(p.name).trim().toLowerCase() === nameKey);
-      const matchedWear = !matchedProp ? (speaker.wardrobe ?? []).find(w => String(w.name).trim().toLowerCase() === nameKey) : null;
-      const matched = matchedProp || matchedWear;
-      const nestList = matchedProp
-        ? kitChildren(speaker.props, matchedProp.id)
-        : [];
-
-      this.state.incoming = {
-        id: uid(),
-        npcCharacterId: speaker.id,
-        npcName: speaker.name,
-        verb,
-        itemId: matched?.id || null,
-        itemBucket: matchedWear ? 'wardrobe' : (matchedProp ? 'props' : null),
-        itemName: matched?.name || itemName,
-        itemDesc: matched?.description || String(parsed.itemDesc || '').trim().slice(0, 240),
-        itemCategory: matchedWear ? 'wearable' : (CATEGORY_MAP[parsed.category] ? parsed.category : 'misc'),
-        itemCondition: matched?.condition || 'pristine',
-        itemAmount: matched ? readAmount(matched) : null,
-        itemKind: inferKitKind(matched || { name: itemName }),
-        itemNest: nestList.map(x => ({
-          name: x.name,
-          description: x.description || '',
-          condition: x.condition || 'pristine',
-          kind: inferKitKind(x),
-          amount: readAmount(x),
-        })),
-        at: Date.now(),
-      };
-      this.saveState();
-      this.bus.emit('showtime.stateChanged');
-      this._emitInvNotice([{
-        name: this.state.incoming.itemName,
-        label: 'Offer',
-        toState: 'pending',
-        mark: '?',
-      }]);
-      if (this.container) this.render(this.container);
-    } catch (err) {
-      console.warn('[Inventory incoming scan]', err);
-    }
+    const verb = /\b(forc\w*|hurls?)\b/i.test(text) ? 'force'
+      : /\b(us(?:e|es|ing)|appl\w*)\b/i.test(text) ? 'use'
+        : 'offer';
+    const matched = hit.item;
+    const nestList = hit.bucket === 'props' ? kitChildren(speaker.props, matched.id) : [];
+    this.state.incoming = {
+      id: uid(),
+      npcCharacterId: speaker.id,
+      npcName: speaker.name,
+      verb,
+      itemId: matched.id,
+      itemBucket: hit.bucket,
+      itemName: matched.name,
+      itemDesc: matched.description || '',
+      itemCategory: hit.bucket === 'wardrobe' ? 'wearable' : (matched.category || 'misc'),
+      itemCondition: matched.condition || 'pristine',
+      itemAmount: readAmount(matched),
+      itemKind: inferKitKind(matched),
+      itemNest: nestList.map(x => ({
+        name: x.name,
+        description: x.description || '',
+        condition: x.condition || 'pristine',
+        kind: inferKitKind(x),
+        amount: readAmount(x),
+      })),
+      at: Date.now(),
+    };
+    this.saveState();
+    this.bus.emit('showtime.stateChanged');
+    this._emitInvNotice([{
+      name: this.state.incoming.itemName,
+      label: 'Offer',
+      toState: 'pending',
+      mark: '?',
+    }]);
+    if (this.container) this.render(this.container);
   }
 
-  /** Commits (or discards) an NPC's offer/use/force/give onto {{user}}. */
   _applyIncomingResolution(outcome, damage) {
     const inc = this.state.incoming;
     if (!inc) return;
+    if (outcome === 'accept_transfer' || outcome === 'accept_consume' || damage === 'damaged' || damage === 'destroyed') {
+      const note = outcome === 'accept_consume' || damage === 'destroyed'
+        ? `Used up ${inc.itemName}.`
+        : outcome === 'accept_transfer'
+          ? `Took ${inc.itemName}.`
+          : `Marked ${inc.itemName} damaged.`;
+      this._captureExchange(note);
+    }
     const cast = this.storage.getChat('cast', { characters: [] });
     const npc = (cast.characters ?? []).find(c => c.id === inc.npcCharacterId);
     const removeFromNpc = () => {
@@ -1001,12 +1218,10 @@ JSON:`;
     for (const loc of ['mobile', 'static']) {
       for (const x of this._list(loc)) {
         const kind = x.kind === 'container' ? 'container' : 'item';
-        const place = loc === 'mobile' ? 'on person' : 'in trunk';
-        const parent = x.parentId ? this._list(loc).find(p => p.id === x.parentId) : null;
-        const nest = parent ? `, inside ${parent.name}` : '';
+        const place = this._placePhrase(x);
         const amt = formatAmountLine(x);
         const fill = amt ? `, ${amt}` : '';
-        rows.push(`- ${x.name} (${kind}, ${place}${nest}${fill})`);
+        rows.push(`- ${x.name} (${kind}, ${place}${fill})`);
       }
     }
     for (const line of this._worldKitLines({ scene, max: 20 })) rows.push(line);
@@ -1125,22 +1340,9 @@ JSON:`;
     if (this._invBusy) return;
     const pol = this._itemPolicy();
     if (pol.enabled === false) return;
-    let status = {};
-    try { status = this.storage.getChat('backstage', {})?.trackers?.status || {}; } catch { return; }
-    if (status.cadence === 'manual') return;
     const chat = getContext()?.chat || [];
-    const n = chat.filter(m => m && !m.is_system).length;
-    const every = status.cadence === 'per_post' ? 1 : Math.max(1, Number(status.everyN) || 4);
-    if (!this._invTrackPrimed) {
-      this._invTrackPrimed = true;
-      this._invLastCount = n;
-      return;
-    }
-    const prev = this._invLastCount || 0;
-    if (n - prev < every) return;
-    const windowRows = playMessagesSince(chat, prev);
+    const windowRows = (chat.filter(m => m && !m.is_system) || []).slice(-8);
     const windowText = windowRows.map(m => formatChatLine(m, 480)).filter(Boolean).join('\n');
-    this._invLastCount = n;
     if (!this._invCueHit(windowText)) return;
     this._invBusy = true;
     try {
@@ -1155,14 +1357,12 @@ JSON:`;
     for (const loc of ['mobile', 'static']) {
       for (const x of this._list(loc)) {
         const kind = x.kind === 'container' ? 'container' : 'item';
-        const place = loc === 'mobile' ? 'person' : 'trunk';
-        const parent = x.parentId ? this._list(loc).find(p => p.id === x.parentId) : null;
-        const nest = parent ? `, inside ${parent.name}` : '';
-        const eq = x.equippedTo?.type === 'player' ? ', equipped' : '';
+        const place = this._placePhrase(x);
+        const eq = this._itemLoc(x).where === 'worn' ? ', equipped' : '';
         const cond = x.condition && x.condition !== 'pristine' ? `, ${x.condition}` : '';
         const amt = formatAmountLine(x);
         const fill = amt ? `, ${amt}` : '';
-        rows.push(`- ${x.name} (${kind}, ${place}${nest}${cond}${eq}${fill})`);
+        rows.push(`- ${x.name} (${kind}, ${place}${cond}${eq}${fill})`);
       }
     }
     for (const line of this._worldKitLines({ scene, max: 12 })) rows.push(line);
@@ -1188,7 +1388,7 @@ Each object:
 - add: newly acquired / picked up / given to ${player}. Reuse an existing Set / lost & found name instead of minting a second copy. Do not repeat names already in belongings. A pack of chips/pills/water is ONE row with remaining/capacity/fill — never one row per piece.
 - move: existing item changed place (person vs trunk) or went inside a container (inside=container name).
 - remove: thrown away, given away, destroyed. Eating or drinking from a pack is NOT remove.
-- update: condition, equipped, remaining, capacity, unit, or fill changed; keep the same name. "ate some chips" / "half the bottle" UPDATES remaining or fill. Empty packs stay listed (fill empty, remaining 0).
+- update: condition, equipped, remaining, capacity, unit, or fill changed; keep the same name. "ate some chips" / "half the bottle" UPDATES remaining or fill. Empty packs stay listed (fill empty, remaining 0). Wearables never take remaining/capacity/fill.
 - location person = On Person; trunk = Trunk / left behind.
 - inside: items slid/pocketed/stuffed into a bag, pack, satchel, or case stay accounted for as children of that container — do not list them as loose. Add the container first if it is new.
 EXCLUDE other people's things, scenery not taken, and default body clothing unless named.
@@ -1312,12 +1512,12 @@ JSON:`;
     try {
       const transcript = this._userTranscript();
       if (!transcript.trim()) {
-        alert(`No ${this._playerName()} messages to audit yet.`);
+        void showtimeAlert(`No ${this._playerName()} messages to audit yet.`, { title: 'INVENTORY AUDIT' });
         return;
       }
       const player = this._playerName();
       const chatToken = this._chatToken();
-      const prompt = `You are filing an inventory claim for ${player} ({{user}}).\n\nRead ONLY the {{user}} messages below. Do not invent items from the persona, the scenario, or anyone else — other speakers are not provided on purpose.\n\nAlready accounted for (reuse these names; do not mint a second copy). If {{user}} picks up an on-set or lost & found object, still return that same name so it can be claimed:\n${this._inventoryRoster(transcript)}\n\n{{user}} messages:\n${clipExcerptToLines(transcript, 4000)}\n\nReturn ONLY a JSON array of objects {{user}} actually mentioned having, carrying, storing, picking up, opening, or wearing.\nINCLUDE: items and containers (bags, packs, boxes, pockets-as-bags, crates, cases).\nEXCLUDE: clothing already implied as a default body, scenery that is not taken, other people's things, and anything not in the {{user}} lines.\nIf nothing new is mentioned, return [].\n\nEach object:\n{"kind":"item"|"container","name":"...","description":"...","condition":"pristine|fine|worn|damaged|broken|ruined","category":"consumable|wearable|usable|misc","location":"person"|"trunk","inside":"","equipped":false,"remaining":null,"capacity":null,"unit":"pieces|servings|ml|g|","fill":"full|high|half|low|empty|"}\n- kind container: no category; bags/packs/pouches/boxes that hold other things. A bag of chips CAN be the pack itself (remaining/fill on that container) — do not mint one row per chip.\n- location person = carried with {{user}}; trunk = left behind / stored / not on them.\n- inside = name of a container (existing or in this same list), or "". Items placed into a bag/pack must set inside; do not mint them as loose copies.\n- equipped true only if kind is item, category wearable, and {{user}} said they are wearing it.\n- condition from the text; default pristine.\n- remaining/capacity/unit/fill: homogeneous contents (chips, water, pills). Reuse an existing pack name and set remaining/fill instead of adding copies. Empty packs stay listed.\n\nJSON:`;
+      const prompt = `You are filing an inventory claim for ${player} ({{user}}).\n\nRead ONLY the {{user}} messages below. Do not invent items from the persona, the scenario, or anyone else — other speakers are not provided on purpose.\n\nAlready accounted for (reuse these names; do not mint a second copy). If {{user}} picks up an on-set or lost & found object, still return that same name so it can be claimed:\n${this._inventoryRoster(transcript)}\n\n{{user}} messages:\n${clipExcerptToLines(transcript, 4000)}\n\nReturn ONLY a JSON array of objects {{user}} actually mentioned having, carrying, storing, picking up, opening, or wearing.\nINCLUDE: items and containers (bags, packs, boxes, pockets-as-bags, crates, cases).\nEXCLUDE: clothing already implied as a default body, scenery that is not taken, other people's things, and anything not in the {{user}} lines.\nIf nothing new is mentioned, return [].\n\nEach object:\n{"kind":"item"|"container","name":"...","description":"...","condition":"pristine|fine|worn|damaged|broken|ruined","category":"consumable|wearable|usable|misc","location":"person"|"trunk","inside":"","equipped":false,"remaining":null,"capacity":null,"unit":"pieces|servings|ml|g|","fill":"full|high|half|low|empty|"}\n- kind container: no category; bags/packs/pouches/boxes that hold other things. A bag of chips CAN be the pack itself (remaining/fill on that container) — do not mint one row per chip.\n- location person = carried with {{user}}; trunk = left behind / stored / not on them.\n- inside = name of a container (existing or in this same list), or "". Items placed into a bag/pack must set inside; do not mint them as loose copies.\n- equipped true only if kind is item, category wearable, and {{user}} said they are wearing it.\n- condition from the text; default pristine.\n- remaining/capacity/unit/fill: homogeneous contents (chips, water, pills) on consumable packs or containers. Never on wearables — clothing is not a countable pack. Reuse an existing pack name and set remaining/fill instead of adding copies. Empty packs stay listed.\n\nJSON:`;
 
       const response = String(await withShowtimeProfile(this.storage, 'audit', () =>
         leanQuietGenerate(prompt, { kind: 'filing' })) ?? '').trim();
@@ -1327,7 +1527,7 @@ JSON:`;
       if (!Array.isArray(items)) throw new Error('No JSON array in the audit reply.');
       const added = this._applyAuditItems(items);
       if (!added) {
-        alert(`Nothing new in ${this._playerName()} messages.`);
+        this._emitInvNotice([{ name: this._playerName(), label: 'Audit', toState: 'nothing new', mark: '!' }]);
         return;
       }
       this.saveState();
@@ -1341,7 +1541,7 @@ JSON:`;
       this.render(this.container);
     } catch (err) {
       console.error('[Inventory audit]', err);
-      alert(`Audit failed: ${err.message}`);
+      void showtimeAlert(`Audit failed: ${err.message}`, { title: 'INVENTORY AUDIT', danger: true });
     } finally {
       btn.disabled = false;
       btn.textContent = orig;
@@ -1507,6 +1707,38 @@ JSON:`;
     });
   }
 
+  _starOwns(item) {
+    const loc = this._itemLoc(item);
+    const owner = String(loc.ownerId || '');
+    const starId = this._starChar()?.id || '';
+    if (!owner || owner === 'star' || owner === 'player' || owner === 'you') return true;
+    return !!(starId && owner === starId);
+  }
+
+  /** Equipped, then loose On Person. Trunk and packed contents stay off this list. */
+  _onPersonLines() {
+    const lines = [];
+    const ids = new Set();
+    const push = (item) => {
+      if (!item || ids.has(item.id) || lines.length >= 8) return;
+      if (!this._starOwns(item)) return;
+      ids.add(item.id);
+      lines.push(this._condenseItem(item, 'mobile'));
+    };
+    for (const loc of ['mobile', 'static']) {
+      for (const item of this._list(loc)) {
+        if (this._itemLoc(item).where === 'worn') push(item);
+      }
+    }
+    for (const loc of ['mobile', 'static']) {
+      for (const item of this._list(loc)) {
+        const where = this._itemLoc(item).where;
+        if (where === 'carried' && !item.parentId) push(item);
+      }
+    }
+    return { lines, ids };
+  }
+
   _condenseItem(item, loc) {
     const cond = CONDITION_MAP[item.condition]?.label ?? 'Pristine';
     const cat = item.kind === 'container' ? 'Container' : (CATEGORY_MAP[item.category]?.label ?? 'Item');
@@ -1525,10 +1757,10 @@ JSON:`;
     } catch { /* ignore */ }
     const lines = [];
     const pending = this.state.pending;
-    if (pending && !pending.resolved) {
+    if (pending && !pending.ready && !pending.resolved) {
       const verbInfo = USE_VERB_MAP[pending.verb] || USE_VERB_MAP.use;
       const desc = String(pending.itemDesc || '').trim();
-      lines.push(`[Note: ${pending.playerName} is ${verbInfo.phrase} ${pending.itemName}${desc ? ` (${clipText(desc, 80)})` : ''} on ${pending.targetName}. ${pending.targetName}, respond in character and make it clear whether you accept, reject, or otherwise react.]`);
+      lines.push(`[Note: ${pending.playerName} is ${verbInfo.phrase} ${pending.itemName}${desc ? ` (${clipText(desc, 80)})` : ''} on ${pending.targetName}. ${pending.targetName}, answer in the scene with a sentence that takes the item, uses it up, or refuses it.]`);
     }
     const used = this._pendingUseId ? this._find(this._pendingUseId) : null;
     if (used) {
@@ -1537,18 +1769,19 @@ JSON:`;
       const desc = String(used.item.description ?? '').trim();
       lines.push(`[Note: ${this._playerName()} uses ${used.item.name} (${cond}${amt ? `, ${amt}` : ''})${desc ? ` — ${clipText(desc, 80)}` : ''}]`);
     }
+    const carried = this._onPersonLines();
+    if (carried.lines.length) lines.push(`[On person:\n${carried.lines.join('\n')}]`);
     const hay = this._scanText();
     const hits = [];
     if (hay.trim()) {
       for (const loc of ['mobile', 'static']) {
         for (const item of this._list(loc)) {
           if (used && item.id === used.item.id) continue;
+          if (carried.ids.has(item.id)) continue;
           if (this._itemCueHit(item, hay)) hits.push(this._condenseItem(item, loc));
         }
       }
-      if (hits.length) {
-        lines.push(`[Items at hand:\n${hits.join('\n')}]`);
-      }
+      if (hits.length) lines.push(`[Items at hand:\n${hits.join('\n')}]`);
     }
     const setNotes = this._setAccessNotes(hay, hits);
     if (setNotes) lines.push(setNotes);
@@ -1591,11 +1824,11 @@ JSON:`;
   _openAddDialog(location) {
     const pol = this._itemPolicy();
     if (pol.enabled === false) {
-      alert('Item tracking is disabled under Stage → Trackers → Items.');
+      void showtimeAlert('Item tracking is disabled under Stage → Trackers → Items.', { title: 'INVENTORY' });
       return;
     }
     if (pol.castCanCraft === false) {
-      alert('Making / adding items is disabled under Stage → Trackers → Items.');
+      void showtimeAlert('Making / adding items is disabled under Stage → Trackers → Items.', { title: 'INVENTORY' });
       return;
     }
     this._openItemDialog({ location, existing: null });
@@ -1625,7 +1858,17 @@ JSON:`;
 
     const backdrop = this._buildModal(`
       <div class="inv-modal-title">${isEdit ? 'REFIT CLAIM' : 'ITEM CLAIM'}</div>
-      <div class="inv-modal-subtitle">— property claim · ${esc(LOCS[location].title)} —</div>
+      <div class="inv-modal-subtitle">— property claim —</div>
+      <div class="inv-modal-field"><label>Name</label>
+        <input type="text" data-field="name" value="${esc(item.name)}"></div>
+      <div class="inv-modal-field"><label>Place</label>
+        <select data-field="place">
+          <option value="mobile" ${location === 'mobile' ? 'selected' : ''}>On Person</option>
+          <option value="static" ${location === 'static' ? 'selected' : ''}>Trunk</option>
+        </select>
+      </div>
+      <details class="inv-more">
+        <summary>More</summary>
       <div class="inv-modal-field" data-kind-wrap>
         <label>What is this?</label>
         <div class="inv-kind-row">
@@ -1642,8 +1885,6 @@ JSON:`;
           ).join('')}
         </div>
       </div>
-      <div class="inv-modal-field"><label>Name</label>
-        <input type="text" data-field="name" value="${esc(item.name)}"></div>
       <div class="inv-modal-field"><label>Description (optional)</label>
         <textarea data-field="description">${esc(item.description ?? '')}</textarea></div>
       <div class="inv-modal-field" data-cond-wrap>
@@ -1676,7 +1917,7 @@ JSON:`;
           ).join('')}
           <button type="button" class="inv-fill-btn" data-fill="">—</button>
         </div>
-        <div class="inv-modal-hint">How much is still in it (chips, water, pills). Empty packs stay on the list.</div>
+        <div class="inv-modal-hint">How much is still in it (chips, water, pills). Wearables cannot hold a count. Empty packs stay on the list.</div>
       </div>
       <div class="inv-modal-field" data-parent-wrap>
         <label>Inside a container (optional)</label>
@@ -1687,6 +1928,7 @@ JSON:`;
           ).join('')}
         </select>
       </div>
+      </details>
       <div class="inv-modal-actions">
         ${isEdit ? `<button class="inv-btn" data-action="move" style="margin-right:auto">→ ${esc(otherLabel)}</button>` : ''}
         <button class="inv-btn" data-action="cancel">Cancel</button>
@@ -1694,7 +1936,7 @@ JSON:`;
       </div>
     `);
 
-    let kind = isEdit ? (item.kind === 'container' ? 'container' : 'item') : null;
+    let kind = isEdit ? (item.kind === 'container' ? 'container' : 'item') : 'item';
     let category = CATEGORY_MAP[item.category] ? item.category : 'misc';
     let fillBand = readAmount(item)?.fill || '';
 
@@ -1706,13 +1948,15 @@ JSON:`;
       const isC = kind === 'container';
       backdrop.querySelector('[data-cat-wrap]').style.display = picked && !isC ? '' : 'none';
       backdrop.querySelector('[data-cond-wrap]').style.display = picked ? '' : 'none';
-      backdrop.querySelector('[data-amount-wrap]').style.display = picked ? '' : 'none';
+      backdrop.querySelector('[data-amount-wrap]').style.display =
+        picked && (isC || category !== 'wearable') ? '' : 'none';
       backdrop.querySelector('[data-parent-wrap]').style.display = picked && !isC ? '' : 'none';
     };
     const syncCat = () => {
       backdrop.querySelectorAll('.inv-cat-btn').forEach(b => {
         b.classList.toggle('on', b.dataset.cat === category);
       });
+      syncKind();
     };
     const syncFill = () => {
       backdrop.querySelectorAll('.inv-fill-btn').forEach(b => {
@@ -1722,13 +1966,16 @@ JSON:`;
       backdrop.querySelector('[data-unit-label]').style.display = unit === 'custom' ? '' : 'none';
     };
     const stampAmount = (row) => {
+      if (kind === 'item' && category === 'wearable') {
+        clearAmount(row);
+        return;
+      }
       const remaining = backdrop.querySelector('[data-field="remaining"]').value;
       const capacity = backdrop.querySelector('[data-field="capacity"]').value;
       const unit = backdrop.querySelector('[data-field="unit"]').value;
       const unitLabel = backdrop.querySelector('[data-field="unitLabel"]').value.trim();
       if (remaining === '' && capacity === '' && !unit && !fillBand) {
-        delete row.amount;
-        delete row.fill;
+        clearAmount(row);
         return;
       }
       writeAmount(row, {
@@ -1780,19 +2027,20 @@ JSON:`;
     }
 
     backdrop.querySelector('[data-action="save"]').addEventListener('click', () => {
-      if (!kind) { alert('Choose Container or Item first.'); return; }
+      if (!kind) { void showtimeAlert('Choose Container or Item first.', { title: 'ITEM CLAIM' }); return; }
       const name = backdrop.querySelector('[data-field="name"]').value.trim();
-      if (!name) { alert('Name is required.'); return; }
+      if (!name) { void showtimeAlert('Name is required.', { title: 'ITEM CLAIM' }); return; }
+      const place = backdrop.querySelector('[data-field="place"]')?.value === 'static' ? 'static' : 'mobile';
       const description = backdrop.querySelector('[data-field="description"]').value.trim();
       const condition = backdrop.querySelector('[data-field="condition"]').value;
       let parentId = backdrop.querySelector('[data-field="parentId"]').value || null;
-      if (kind === 'container') parentId = null;
+      if (kind === 'container' || place !== location) parentId = null;
 
       if (isEdit) {
         if (existing.kind === 'container' && kind === 'item') {
           const kids = this._children(location, existing.id);
           if (kids.length) {
-            alert('Empty this container before turning it into an item.');
+            void showtimeAlert('Empty this container before turning it into an item.', { title: 'ITEM CLAIM' });
             return;
           }
         }
@@ -1817,15 +2065,16 @@ JSON:`;
           name,
           description,
           parentId,
-          location,
+          location: place,
           condition,
         };
         if (kind === 'item') row.category = category;
         stampAmount(row);
-        this._list(location).push(row);
+        this._list(place).push(row);
       }
       this.saveState();
       this.bus.emit('inventory.updated');
+      if (isEdit && place !== location) this._moveTo(existing.id, place);
       backdrop.remove();
       this.render(this.container);
     });
@@ -1835,26 +2084,26 @@ JSON:`;
   _moveTo(id, dest) {
     const found = this._find(id);
     if (!found || found.location === dest) return;
-    const srcList = this._list(found.location);
-    const destList = this._list(dest);
-    const movingIds = new Set([id, ...this._descendants(found.location, id)]);
-    const batch = srcList.filter(x => movingIds.has(x.id));
-    found.item.parentId = null;
-    for (const x of batch) {
-      x.location = dest;
+    const world = worldFromStorage(this.storage);
+    const result = moveItem(world, id, {
+      where: dest === 'static' ? 'trunk' : 'carried',
+      ownerId: 'star',
+    }, { reason: dest === 'static' ? 'to trunk' : 'on person' });
+    if (!result.ok) return;
+    if (dest !== 'static') {
+      const star = this._starChar();
+      if (star?.id) exposeLinkedItem(this.storage, id, star.id);
     }
-    this.state[found.location] = srcList.filter(x => !movingIds.has(x.id));
-    destList.push(...batch);
     this.saveState();
     this.bus.emit('inventory.updated');
     this.render(this.container);
   }
 
-  _remove(id) {
+  async _remove(id) {
     const found = this._find(id);
     if (!found) return;
     const label = found.item.name || 'this belonging';
-    if (!confirm(`Remove ${label}?`)) return;
+    if (!await showtimeConfirm(`Remove ${label}?`, { title: 'REMOVE BELONGING', danger: true, confirmLabel: 'Remove' })) return;
     const drop = new Set([id, ...this._descendants(found.location, id)]);
     for (const x of this._list(found.location)) {
       if (drop.has(x.id) && x.equippedTo) {
@@ -1883,7 +2132,7 @@ JSON:`;
             `<option value="cast:${m.id}">${esc(m.name)}</option>`,
           ).join('')}
         </select>
-        <div class="inv-modal-hint">Adds this wearable to that character's wardrobe tracker. Further mechanics come later.</div>
+        <div class="inv-modal-hint">Adds this wearable to that character's wardrobe tracker.</div>
       </div>
       <div class="inv-modal-actions">
         <button class="inv-btn" data-action="cancel">Cancel</button>
@@ -1900,24 +2149,20 @@ JSON:`;
   }
 
   _equip(item, targetVal) {
-    this._unequip(item.id, { silent: true, skipRender: true });
+    const world = worldFromStorage(this.storage);
     if (targetVal === 'player') {
-      item.equippedTo = { type: 'player' };
+      moveItem(world, item.id, { where: 'worn', ownerId: 'star' }, { reason: 'equipped' });
+      const star = this._starChar();
+      if (star?.id) exposeLinkedItem(this.storage, item.id, star.id);
     } else if (targetVal.startsWith('cast:')) {
       const characterId = targetVal.slice(5);
-      const cast = this.storage.getChat('cast', { characters: [] });
-      const char = (cast.characters ?? []).find(c => c.id === characterId);
-      if (!char) { alert('That cast member is gone.'); return; }
-      (char.wardrobe ??= []).push({
-        id: uid(),
-        name: item.name,
-        description: item.description ?? '',
-        condition: item.condition || 'pristine',
-        inventoryId: item.id,
-      });
-      char.updatedAt = Date.now();
-      item.equippedTo = { type: 'cast', characterId, name: char.name };
-      this.bus.emit('cast.updated', { character: char });
+      const char = (world.characters ?? []).find(c => c.id === characterId);
+      if (!char) { void showtimeAlert('That cast member is gone.', { title: 'WARDROBE CLAIM' }); return; }
+      const moved = moveItem(world, item.id, { where: 'worn', ownerId: characterId }, { reason: `worn by ${char.name}` });
+      if (moved.ok) {
+        exposeLinkedItem(this.storage, item.id, characterId);
+        this.bus.emit('cast.updated', { character: char });
+      }
     }
     this.saveState();
     this.bus.emit('inventory.updated');
@@ -1969,43 +2214,22 @@ JSON:`;
 
   _syncStarLoadout() {
     const star = this._starChar();
-    if (!star) return;
-    const all = [...(this.state.static ?? []), ...(this.state.mobile ?? [])];
-    const equipped = all.filter(x => x.kind !== 'container' && x.equippedTo?.type === 'player');
-    const onPerson = (this.state.mobile ?? []).filter(x => !x.equippedTo);
-    star.wardrobe = this._mergeLinked(star.wardrobe, equipped);
-    star.props = this._mergeLinked(star.props, onPerson);
-    star.updatedAt = Date.now();
+    stampInventoryLocators(this.state, { ownerId: star?.id });
     this.storage.saveChat();
-    this.bus.emit('cast.updated', { character: star });
+    if (star) this.bus.emit('cast.updated', { character: star });
   }
 
-  _unequip(id, { silent = false, skipRender = false } = {}) {
-    const found = this._find(id);
-    if (!found) return;
-    const item = found.item;
-    const eq = item.equippedTo;
-    if (eq?.type === 'cast' && eq.characterId) {
-      const cast = this.storage.getChat('cast', { characters: [] });
-      const char = (cast.characters ?? []).find(c => c.id === eq.characterId);
-      if (char) {
-        char.wardrobe = (char.wardrobe ?? []).filter(w => w.inventoryId !== item.id);
-        char.updatedAt = Date.now();
-        this.bus.emit('cast.updated', { character: char });
-      }
-    }
-    item.equippedTo = null;
+  _unequip(id, { skipRender = false } = {}) {
+    const world = worldFromStorage(this.storage);
+    const hit = moveItem(world, id, { where: 'carried', ownerId: 'star' }, { reason: 'unequipped' });
+    if (!hit.ok) return;
     this.saveState();
     this.bus.emit('inventory.updated');
     if (!skipRender && this.container) this.render(this.container);
   }
 
   _buildModal(inner) {
-    const backdrop = document.createElement('div');
-    backdrop.className = 'inv-modal-backdrop';
-    backdrop.innerHTML = `<div class="inv-modal">${inner}</div>`;
-    document.body.appendChild(backdrop);
-    return backdrop;
+    return buildShowtimeModal(inner, { closeOnBackdrop: false });
   }
 }
 
